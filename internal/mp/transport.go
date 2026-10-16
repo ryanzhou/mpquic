@@ -114,6 +114,7 @@ func quicConfig(o *Options) *quic.Config {
 		MaxConnectionReceiveWindow:     uint64(o.Window) * 4,
 		MaxIncomingStreams:             16,
 		MaxIncomingUniStreams:          1 << 14,
+		EnableDatagrams:                true,
 	}
 }
 

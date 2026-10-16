@@ -85,19 +85,24 @@ func EncodeAddr(hostport string) ([]byte, error) {
 	return binary.BigEndian.AppendUint16(b, uint16(port)), nil
 }
 
+const (
+	cmdConnect      = 1
+	cmdUDPAssociate = 3
+)
+
 // socksHandshake performs the SOCKS5 greeting + request. It returns the
-// requested target in SOCKS5 address format. Only CONNECT is supported.
-func socksHandshake(c net.Conn) ([]byte, string, error) {
+// command and the requested target in SOCKS5 address format.
+func socksHandshake(c net.Conn, allowUDP bool) (byte, []byte, string, error) {
 	var b [2]byte
 	if _, err := io.ReadFull(c, b[:]); err != nil {
-		return nil, "", err
+		return 0, nil, "", err
 	}
 	if b[0] != 5 {
-		return nil, "", fmt.Errorf("not SOCKS5 (version %d)", b[0])
+		return 0, nil, "", fmt.Errorf("not SOCKS5 (version %d)", b[0])
 	}
 	methods := make([]byte, b[1])
 	if _, err := io.ReadFull(c, methods); err != nil {
-		return nil, "", err
+		return 0, nil, "", err
 	}
 	ok := false
 	for _, m := range methods {
@@ -107,25 +112,25 @@ func socksHandshake(c net.Conn) ([]byte, string, error) {
 	}
 	if !ok {
 		c.Write([]byte{5, 0xff})
-		return nil, "", errors.New("client offers no acceptable auth method")
+		return 0, nil, "", errors.New("client offers no acceptable auth method")
 	}
 	if _, err := c.Write([]byte{5, 0}); err != nil {
-		return nil, "", err
+		return 0, nil, "", err
 	}
 	var h [3]byte
 	if _, err := io.ReadFull(c, h[:]); err != nil {
-		return nil, "", err
+		return 0, nil, "", err
 	}
 	if h[0] != 5 {
-		return nil, "", errors.New("bad request version")
+		return 0, nil, "", errors.New("bad request version")
 	}
 	target, raw, err := ReadAddr(c)
 	if err != nil {
-		return nil, "", err
+		return 0, nil, "", err
 	}
-	if h[1] != 1 { // CONNECT
+	if h[1] != cmdConnect && !(h[1] == cmdUDPAssociate && allowUDP) {
 		c.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
-		return nil, "", fmt.Errorf("unsupported SOCKS command %d", h[1])
+		return 0, nil, "", fmt.Errorf("unsupported SOCKS command %d", h[1])
 	}
-	return raw, target, nil
+	return h[1], raw, target, nil
 }

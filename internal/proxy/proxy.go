@@ -19,6 +19,8 @@ type Local struct {
 	// Tunnel, if non-empty, makes every connection go to this host:port
 	// (ss-tunnel mode) instead of speaking SOCKS5.
 	Tunnel string
+	// UDP enables SOCKS5 UDP ASSOCIATE.
+	UDP *UDPLocal
 }
 
 // Serve accepts connections on ln until it is closed.
@@ -50,14 +52,18 @@ func (l *Local) handle(c net.Conn, tunnelAddr []byte) {
 	raw, target := tunnelAddr, l.Tunnel
 	if raw == nil {
 		c.SetDeadline(time.Now().Add(30 * time.Second))
-		var err error
-		raw, target, err = socksHandshake(c)
+		cmd, r, t, err := socksHandshake(c, l.UDP != nil)
 		if err != nil {
 			l.Log.Debug("socks handshake failed", "from", c.RemoteAddr().String(), "err", err)
 			c.Close()
 			return
 		}
 		c.SetDeadline(time.Time{})
+		if cmd == cmdUDPAssociate {
+			l.UDP.associate(c)
+			return
+		}
+		raw, target = r, t
 	}
 	st, err := l.Client.OpenStream()
 	if err != nil {

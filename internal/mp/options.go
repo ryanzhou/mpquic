@@ -43,6 +43,9 @@ type Options struct {
 	// SNI sent by the client (optional).
 	SNI    string
 	Logger *slog.Logger
+	// DatagramHandler receives unreliable datagrams sent by the peer with
+	// Session.SendDatagram (used for UDP relaying). Nil drops them.
+	DatagramHandler func(s *Session, b []byte)
 }
 
 func (o *Options) withDefaults() *Options {
@@ -75,7 +78,7 @@ func (o *Options) withDefaults() *Options {
 		c.SuspectTimeout = 600 * time.Millisecond
 	}
 	if c.PathDeadTimeout <= 0 {
-		c.PathDeadTimeout = 10 * time.Second
+		c.PathDeadTimeout = 6 * time.Second
 	}
 	if c.SessionTimeout <= 0 {
 		c.SessionTimeout = 5 * time.Minute

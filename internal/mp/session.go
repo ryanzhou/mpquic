@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/apernet/quic-go"
 )
 
 var errSessionClosed = errors.New("session closed")
@@ -69,6 +71,8 @@ func newSession(opt *Options, id [16]byte, isClient bool, acceptFn func(*Stream)
 		acceptFn:  acceptFn,
 		nextID:    1,
 		noPathAt:  time.Now(),
+
+		lastStatsTick: time.Now(),
 	}
 	s.log = opt.Logger.With("session", hex.EncodeToString(id[:4]))
 	if !isClient {
@@ -332,6 +336,8 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 			s.closedIDs[v[0]] = time.Now()
 		}
 		s.mu.Unlock()
+	case frDgram:
+		s.deliverDatagram(body)
 	default:
 		// unknown frames are ignored for forward compatibility
 	}
@@ -435,6 +441,37 @@ func (s *Session) tick(now time.Time) {
 		s.log.Info("stats", "streams", len(s.streams), "backlog", s.backlog, "paths", s.statsStringLocked())
 	}
 }
+
+// SendDatagram sends an unreliable datagram on the best path. Datagrams that
+// do not fit in a QUIC DATAGRAM frame are sent reliably on the control stream.
+func (s *Session) SendDatagram(b []byte) error {
+	s.mu.Lock()
+	paths := s.bestPathsLocked(1)
+	s.mu.Unlock()
+	if len(paths) == 0 {
+		return errors.New("no path available")
+	}
+	p := paths[0]
+	err := p.conn.SendDatagram(b)
+	if err == nil {
+		return nil
+	}
+	var tooLarge *quic.DatagramTooLargeError
+	if errors.As(err, &tooLarge) {
+		p.sendCtrl(appendFrame(nil, frDgram, b))
+		return nil
+	}
+	return err
+}
+
+func (s *Session) deliverDatagram(b []byte) {
+	if h := s.opt.DatagramHandler; h != nil {
+		h(s, b)
+	}
+}
+
+// Context is cancelled when the session is closed.
+func (s *Session) Context() context.Context { return s.ctx }
 
 // PathStat is a snapshot of one path, for monitoring.
 type PathStat struct {

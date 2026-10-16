@@ -182,3 +182,12 @@ func (c *Config) EffectivePassword() string {
 	}
 	return ""
 }
+
+// UDPEnabled reports whether UDP relaying is enabled (ss "mode").
+func (c *Config) UDPEnabled() bool {
+	switch c.Mode {
+	case "tcp_and_udp", "udp_only":
+		return true
+	}
+	return false
+}

@@ -40,6 +40,7 @@ const (
 	frPong  = 2 // seq
 	frAck   = 3 // n, n*(id, cum, window, nranges, nranges*(start,end))
 	frReset = 4 // id, code
+	frDgram = 5 // raw datagram too large for a QUIC DATAGRAM frame
 )
 
 // Reset codes.

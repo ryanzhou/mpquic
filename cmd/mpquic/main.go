@@ -95,6 +95,7 @@ Common options (shadowsocks-compatible):
   -m METHOD         accepted for compatibility; QUIC/TLS 1.3 always encrypts
   -t SECONDS        idle timeout of proxied connections (default 300)
   -L HOST:PORT      tunnel target (tunnel mode)
+  -u                enable UDP relay (SOCKS5 UDP ASSOCIATE; set on both ends)
   -v                verbose logging
 
 mpquic options:
@@ -126,6 +127,7 @@ type commonFlags struct {
 	verbose, noDup             bool
 	cert, key, sni, logLevel   string
 	plugin                     string
+	udp, udpOnly               bool
 }
 
 func parseCommon(name string, args []string) (*commonFlags, error) {
@@ -161,7 +163,9 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	for _, n := range []string{"a", "f", "plugin-opts", "acl", "mtu", "manager-address", "executable", "d", "protocol"} {
 		fs.StringVar(&ign, n, "", "ignored")
 	}
-	for _, n := range []string{"u", "U", "6", "fast-open", "reuse-port", "no-delay", "mptcp", "use-syslog"} {
+	fs.BoolVar(&f.udp, "u", false, "enable UDP relay")
+	fs.BoolVar(&f.udpOnly, "U", false, "enable UDP relay (UDP only is treated as TCP+UDP)")
+	for _, n := range []string{"6", "fast-open", "reuse-port", "no-delay", "mptcp", "use-syslog"} {
 		fs.BoolVar(&ignb, n, false, "ignored")
 	}
 	fs.IntVar(&igni, "n", 0, "ignored")
@@ -242,6 +246,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.logLevel != "" {
 		cfg.LogLevel = f.logLevel
+	}
+	if f.udp || f.udpOnly {
+		cfg.Mode = "tcp_and_udp"
 	}
 	if f.plugin != "" || cfg.Plugin != "" {
 		return nil, errors.New("SIP003 plugins are not supported")
@@ -328,11 +335,19 @@ func runLocal(mode string, args []string) error {
 	if err != nil {
 		return err
 	}
+	var udp *proxy.UDPLocal
+	if cfg.UDPEnabled() && mode != "tunnel" {
+		udp = proxy.NewUDPLocal(nil, log)
+		opt.DatagramHandler = udp.HandleDatagram
+	}
 	client, err := mp.NewClient(servers, opt)
 	if err != nil {
 		return err
 	}
-	l := &proxy.Local{Client: client, Log: log}
+	l := &proxy.Local{Client: client, Log: log, UDP: udp}
+	if udp != nil {
+		udp.Client = client
+	}
 	if mode == "tunnel" {
 		l.Tunnel = cfg.TunnelAddress
 	}
@@ -340,7 +355,7 @@ func runLocal(mode string, args []string) error {
 	if l.Tunnel != "" {
 		what = "tunnel to " + l.Tunnel
 	}
-	log.Info("mpquic local started", "version", version, "listen", ln.Addr().String(), "mode", what, "paths", strings.Join(servers, ","))
+	log.Info("mpquic local started", "version", version, "listen", ln.Addr().String(), "mode", what, "udp", udp != nil, "paths", strings.Join(servers, ","))
 	go func() {
 		if err := l.Serve(ln); err != nil {
 			log.Error("listener", "err", err)
@@ -374,6 +389,9 @@ func runRemote(args []string) error {
 	if len(binds) == 0 {
 		binds = []string{""}
 	}
+	if cfg.UDPEnabled() {
+		opt.DatagramHandler = proxy.NewUDPRemote(log).HandleDatagram
+	}
 	srv, err := mp.NewServer(opt, proxy.RemoteHandler(log, 10*time.Second))
 	if err != nil {
 		return err
@@ -386,7 +404,7 @@ func runRemote(args []string) error {
 		}
 		go func() { errc <- srv.ListenAndServe(addr) }()
 	}
-	log.Info("mpquic remote started", "version", version, "port", port)
+	log.Info("mpquic remote started", "version", version, "port", port, "udp", cfg.UDPEnabled())
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	select {

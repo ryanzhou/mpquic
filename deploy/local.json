@@ -1,0 +1,10 @@
+{
+  "server": ["direct:9000", "relay-a:9001", "relay-b:9002"],
+  "server_port": 8388,
+  "local_address": "0.0.0.0",
+  "local_port": 1080,
+  "password": "demo-password",
+  "method": "chacha20-ietf-poly1305",
+  "mode": "tcp_and_udp",
+  "timeout": 300
+}

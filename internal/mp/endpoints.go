@@ -85,8 +85,8 @@ func (c *Client) dialLoop(index uint64, addr string) {
 			return
 		}
 		backoff *= 2
-		if backoff > 10*time.Second {
-			backoff = 10 * time.Second
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
 		}
 	}
 }

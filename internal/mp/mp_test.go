@@ -284,3 +284,32 @@ func TestAckCodec(t *testing.T) {
 		t.Fatalf("roundtrip mismatch: %+v", out)
 	}
 }
+
+// A relay that restarts loses its flow table, so the remote sees the path's
+// packets arrive from a new source port (QUIC connection migration).
+func TestRelayRestart(t *testing.T) {
+	tb := newTestbed(t, []string{"delay=3ms,rate=40mbit", "delay=8ms,rate=40mbit"}, echoHandler,
+		func(o *Options) { o.SuspectTimeout = 300 * time.Millisecond })
+	addr := tb.relays[0].Addr().String()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		tb.relays[0].Close()
+		time.Sleep(time.Second)
+		sp, _ := linkem.ParseSpec("delay=3ms,rate=40mbit")
+		r, err := linkem.NewRelay(addr, tb.udp.LocalAddr().String(), sp, sp)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		tb.relays[0] = r
+		go r.Serve()
+	}()
+	echoRoundTrip(t, tb.cl, randBytes(10<<20))
+	time.Sleep(2 * time.Second)
+	tb.waitPaths(t, 2)
+	echoRoundTrip(t, tb.cl, randBytes(2<<20))
+	st := tb.cl.Session().Stats()
+	if len(st) != 2 {
+		t.Fatalf("expected 2 paths, got %d", len(st))
+	}
+}

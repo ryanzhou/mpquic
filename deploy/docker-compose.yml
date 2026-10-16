@@ -1,0 +1,35 @@
+# Self-contained demo/testbed: a remote, three emulated relay paths (one of
+# them a flaky "direct" path), and a local SOCKS5 endpoint on :1080.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   curl --socks5-hostname 127.0.0.1:1080 http://whoami/
+#   docker compose -f deploy/docker-compose.yml logs -f local
+services:
+  whoami:
+    image: traefik/whoami
+
+  remote:
+    build: ..
+    image: mpquic:latest
+    command: remote -p 8388 -k demo-password -u --stats 30
+
+  direct:   # emulated unreliable direct path
+    image: mpquic:latest
+    command: relay --listen :9000 --target remote:8388 --link delay=10ms,rate=40mbit,loss=0.5%,outage=30s/4s --stats 30
+
+  relay-a:
+    image: mpquic:latest
+    command: relay --listen :9001 --target remote:8388 --link delay=25ms,jitter=4ms,rate=50mbit --stats 30
+
+  relay-b:
+    image: mpquic:latest
+    command: relay --listen :9002 --target remote:8388 --link delay=60ms,rate=80mbit,loss=1% --stats 30
+
+  local:
+    image: mpquic:latest
+    command: local -c /etc/mpquic/local.json --stats 10
+    volumes:
+      - ./local.json:/etc/mpquic/local.json:ro
+    ports:
+      - "127.0.0.1:1080:1080"
+    depends_on: [remote, direct, relay-a, relay-b]

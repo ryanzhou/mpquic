@@ -98,6 +98,7 @@ func (p *Path) run() error {
 	go p.ctrlReader()
 	go p.acceptUni(ctx)
 	go p.sendLoop()
+	go p.recvDatagrams(ctx)
 	<-ctx.Done()
 	err := context.Cause(ctx)
 	p.sess.removePath(p, err)
@@ -157,6 +158,16 @@ func (p *Path) acceptUni(ctx context.Context) {
 			return
 		}
 		go p.readUni(rs)
+	}
+}
+
+func (p *Path) recvDatagrams(ctx context.Context) {
+	for {
+		b, err := p.conn.ReceiveDatagram(ctx)
+		if err != nil {
+			return
+		}
+		p.sess.deliverDatagram(b)
 	}
 }
 
