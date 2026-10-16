@@ -22,18 +22,32 @@ type Metrics struct {
 	Cwnd      uint64 // bytes
 	InFlight  uint64 // bytes
 	MinRTT    time.Duration
+	Pacing    uint64 // bytes/s
+	Mode      string
 }
 
 // Meter wraps a BBR sender and publishes its state through atomics. All
 // CongestionControl methods are invoked from the quic-go connection goroutine.
 type Meter struct {
 	s      *bbr.Sender
-	hasRTT bool
+	hasRTT atomic.Bool
 
 	bw       atomic.Uint64
 	cwnd     atomic.Uint64
 	inflight atomic.Uint64
 	minRTT   atomic.Int64
+	pacing   atomic.Uint64
+	mode     atomic.Value
+
+	appLimited atomic.Bool
+}
+
+// SetAppLimited tells the controller whether the application currently has
+// nothing to send on this connection.
+func (m *Meter) SetAppLimited(v bool) {
+	if m.appLimited.Load() != v {
+		m.appLimited.Store(v)
+	}
 }
 
 var _ congestion.CongestionControlEx = (*Meter)(nil)
@@ -59,6 +73,7 @@ func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
 		size = g
 	}
 	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, size, profile)}
+	m.s.AppLimitedHint = m.appLimited.Load
 	conn.SetCongestionControl(m)
 	return m
 }
@@ -70,18 +85,33 @@ func (m *Meter) Snapshot() Metrics {
 		Cwnd:      m.cwnd.Load(),
 		InFlight:  m.inflight.Load(),
 		MinRTT:    time.Duration(m.minRTT.Load()),
+		Pacing:    m.pacing.Load(),
+		Mode:      m.modeName(),
 	}
+}
+
+func (m *Meter) modeName() string {
+	if v, ok := m.mode.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 func (m *Meter) publish() {
+	m.mode.Store(m.s.ModeName())
 	m.bw.Store(m.s.BandwidthEstimate())
 	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))
-	if m.hasRTT {
+	if m.hasRTT.Load() {
 		m.minRTT.Store(int64(m.s.MinRTT()))
+		m.pacing.Store(m.s.PacingRateBytes())
 	}
 }
 
-func (m *Meter) SetRTTStatsProvider(p congestion.RTTStatsProvider)  { m.s.SetRTTStatsProvider(p) }
+func (m *Meter) SetRTTStatsProvider(p congestion.RTTStatsProvider) {
+	m.s.SetRTTStatsProvider(p)
+	m.hasRTT.Store(true)
+	m.publish()
+}
 func (m *Meter) TimeUntilSend(b congestion.ByteCount) monotime.Time { return m.s.TimeUntilSend(b) }
 func (m *Meter) HasPacingBudget(now monotime.Time) bool             { return m.s.HasPacingBudget(now) }
 func (m *Meter) OnPacketSent(t monotime.Time, inflight congestion.ByteCount, pn congestion.PacketNumber, n congestion.ByteCount, rtx bool) {

@@ -316,6 +316,12 @@ type bbrSender struct {
 	bytesInFlight congestion.ByteCount
 
 	debug bool
+
+	// AppLimitedHint, if set, reports whether the application currently has
+	// no data queued for this connection (added for mpquic). It makes the
+	// app-limited detection exact instead of relying on the bytes-in-flight
+	// heuristic, which breaks down once the bandwidth estimate is tiny.
+	AppLimitedHint func() bool
 }
 
 var _ congestion.CongestionControl = &bbrSender{}
@@ -462,6 +468,9 @@ func (b *bbrSender) OnPacketSent(
 		b.exitingQuiescence = true
 	}
 
+	if b.AppLimitedHint != nil && b.AppLimitedHint() {
+		b.sampler.OnAppLimited()
+	}
 	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, isRetransmittable)
 }
 
@@ -666,6 +675,24 @@ func (b *bbrSender) BandwidthEstimate() uint64 {
 	return uint64(b.bandwidthEstimate() / BytesPerSecond)
 }
 
+// ModeName returns the BBR state machine mode. Added for mpquic.
+func (b *bbrSender) ModeName() string {
+	switch b.mode {
+	case bbrModeStartup:
+		return "startup"
+	case bbrModeDrain:
+		return "drain"
+	case bbrModeProbeBw:
+		return "probe_bw"
+	case bbrModeProbeRtt:
+		return "probe_rtt"
+	}
+	return "?"
+}
+
+// PacingRateBytes returns the pacing rate in bytes/s. Added for mpquic.
+func (b *bbrSender) PacingRateBytes() uint64 { return uint64(b.PacingRate() / BytesPerSecond) }
+
 // MinRTT returns BBR's min RTT estimate. Added for mpquic.
 func (b *bbrSender) MinRTT() time.Duration { return b.getMinRtt() }
 
@@ -837,7 +864,7 @@ func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeSta
 }
 
 func (b *bbrSender) maybeAppLimited(bytesInFlight congestion.ByteCount) {
-	if bytesInFlight < b.getTargetCongestionWindow(1) {
+	if bytesInFlight < b.getTargetCongestionWindow(1) || b.AppLimitedHint != nil && b.AppLimitedHint() {
 		b.sampler.OnAppLimited()
 	}
 }

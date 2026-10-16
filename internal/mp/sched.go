@@ -1,7 +1,10 @@
 package mp
 
 import (
+	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -29,6 +32,19 @@ import (
 
 var errPathClosed = errSessionClosed
 
+// traceSched (env MPQUIC_TRACE=1) logs every scheduling decision.
+var traceSched = os.Getenv("MPQUIC_TRACE") != ""
+
+func (s *Session) trace(p *Path, c *chunk, why string, now time.Time) {
+	var b strings.Builder
+	for _, q := range s.paths {
+		fmt.Fprintf(&b, " [%s %s srtt=%v est=%.1fms rate=%.1fM busy=%v]", q.name, q.state, q.srtt.Round(time.Millisecond),
+			q.est(len(c.data), now)*1000, q.rate()*8/1e6, q.busy)
+	}
+	fmt.Fprintf(os.Stderr, "%s sched %s on %s: st=%d off=%d len=%d fin=%v backlog=%d%s\n", now.Format("15:04:05.000"),
+		why, p.name, c.st.id, c.off, len(c.data), c.fin, s.backlog, b.String())
+}
+
 func (s *Session) nextChunk(p *Path) (*chunk, []uint64, error) {
 	var timer *time.Timer
 	defer func() {
@@ -46,8 +62,14 @@ func (s *Session) nextChunk(p *Path) (*chunk, []uint64, error) {
 		ids := p.closeIDs
 		p.closeIDs = nil
 		now := time.Now()
-		c, recheck := s.pickLocked(p, now)
+		c, recheck, why := s.pickLocked(p, now)
+		if p.meter != nil {
+			p.meter.SetAppLimited(c == nil)
+		}
 		if c != nil {
+			if traceSched {
+				s.trace(p, c, why, now)
+			}
 			c.sends = append(c.sends, sendRec{p, now})
 			p.busy = true
 			p.busySince = now
@@ -83,9 +105,9 @@ func (s *Session) nextChunk(p *Path) (*chunk, []uint64, error) {
 	}
 }
 
-func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration) {
+func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration, string) {
 	if p.state != stateActive {
-		return nil, 250 * time.Millisecond
+		return nil, 250 * time.Millisecond, ""
 	}
 	// 1. reinjection queue
 	for i := 0; i < len(s.reinjectQ); {
@@ -101,7 +123,7 @@ func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration) {
 		}
 		c.queued = false
 		s.reinjectQ = append(s.reinjectQ[:i], s.reinjectQ[i+1:]...)
-		return c, 0
+		return c, 0, "reinject"
 	}
 	var recheck time.Duration
 	// 2. new data
@@ -138,21 +160,21 @@ func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration) {
 				st.inUnacked = true
 				s.unacked[st] = struct{}{}
 			}
-			return c, 0
+			return c, 0, "new"
 		}
 	}
 	// 3. opportunistic duplication
 	if len(s.unacked) > 0 {
 		if !s.opt.NoDup {
 			if c := s.dupCandidateLocked(p, now); c != nil {
-				return c, 0
+				return c, 0, "dup"
 			}
 		}
 		if recheck == 0 {
 			recheck = 10 * time.Millisecond
 		}
 	}
-	return nil, recheck
+	return nil, recheck, ""
 }
 
 // streamBacklogLocked estimates how many bytes will be sent (by round-robin)
@@ -248,7 +270,7 @@ func (s *Session) expectedArrivalLocked(c *chunk, now time.Time, overdueFactor f
 		if now.After(ackBy) {
 			continue
 		}
-		arr := r.at.Add(q.srttOrDefault()/2 + tx)
+		arr := r.at.Add(q.schedRTT()/2 + tx)
 		if !found || arr.Before(best) {
 			best, found = arr, true
 		}

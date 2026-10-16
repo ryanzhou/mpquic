@@ -55,7 +55,10 @@ type Path struct {
 	upSince      time.Time
 	srtt, rttvar time.Duration
 	minRTT       time.Duration
+	latestRTT    time.Duration
 	bw, cwnd     uint64
+	pacing       uint64
+	ccMode       string
 	lost         uint64
 	busy         bool
 	busySince    time.Time
@@ -252,11 +255,14 @@ func (p *Path) refreshStatsLocked() {
 	p.srtt = st.SmoothedRTT
 	p.rttvar = st.MeanDeviation
 	p.minRTT = st.MinRTT
+	p.latestRTT = st.LatestRTT
 	p.lost = st.BytesLost
 	if p.meter != nil {
 		m := p.meter.Snapshot()
 		p.bw = m.Bandwidth
 		p.cwnd = m.Cwnd
+		p.pacing = m.Pacing
+		p.ccMode = m.Mode
 	}
 }
 
@@ -267,8 +273,18 @@ func (p *Path) srttOrDefault() time.Duration {
 	return p.srtt
 }
 
+// schedRTT is the RTT used for scheduling: the smoothed RTT, but reacting
+// immediately when the latest sample shows that queues have drained.
+func (p *Path) schedRTT() time.Duration {
+	r := p.srttOrDefault()
+	if l := max(p.latestRTT, p.minRTT); l > 0 && l < r {
+		r = l
+	}
+	return r
+}
+
 // owd is the estimated one-way delay in seconds.
-func (p *Path) owd() float64 { return p.srttOrDefault().Seconds() / 2 }
+func (p *Path) owd() float64 { return p.schedRTT().Seconds() / 2 }
 
 // rate is the estimated sending rate in bytes/s. BBR's bottleneck estimate is
 // unreliable while the path is application-limited (e.g. it only carried
@@ -364,7 +380,7 @@ func (p *Path) tickLocked(now time.Time, active bool) bool {
 func (p *Path) statLocked() PathStat {
 	return PathStat{
 		Name: p.name, State: p.state.String(), SRTT: p.srtt, MinRTT: p.minRTT,
-		Bandwidth: p.bw, Cwnd: p.cwnd,
+		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost,
 	}
 }

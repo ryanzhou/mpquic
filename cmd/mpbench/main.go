@@ -259,7 +259,7 @@ func (b *bench) remoteStats() string {
 	var p []string
 	for _, ss := range b.srv.Stats() {
 		for _, s := range ss {
-			p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM cwnd=%dK", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, s.Cwnd>>10))
+			p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode))
 		}
 	}
 	return strings.Join(p, "; ")

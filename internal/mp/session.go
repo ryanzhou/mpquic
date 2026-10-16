@@ -222,7 +222,7 @@ func (s *Session) bestPathsLocked(n int) []*Path {
 			sus = append(sus, p)
 		}
 	}
-	sort.Slice(act, func(i, j int) bool { return act[i].srtt < act[j].srtt })
+	sort.Slice(act, func(i, j int) bool { return act[i].schedRTT() < act[j].schedRTT() })
 	sort.Slice(sus, func(i, j int) bool { return sus[i].lastPong.After(sus[j].lastPong) })
 	act = append(act, sus...)
 	if len(act) > n {
@@ -444,6 +444,8 @@ type PathStat struct {
 	MinRTT    time.Duration
 	Bandwidth uint64 // bytes/s (BBR estimate)
 	Cwnd      uint64
+	Pacing    uint64 // bytes/s
+	CCMode    string
 	SentBytes uint64
 	RecvBytes uint64
 	LostBytes uint64
