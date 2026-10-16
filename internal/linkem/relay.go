@@ -15,7 +15,7 @@ type Relay struct {
 	Timeout  time.Duration
 	Log      *slog.Logger
 
-	target *net.UDPAddr
+	target string
 	lc     *net.UDPConn
 	mu     sync.Mutex
 	flows  map[string]*flow
@@ -34,8 +34,7 @@ func NewRelay(listen, target string, fwd, rev Spec) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
-	ta, err := net.ResolveUDPAddr("udp", target)
-	if err != nil {
+	if _, _, err := net.SplitHostPort(target); err != nil {
 		return nil, err
 	}
 	lc, err := net.ListenUDP("udp", la)
@@ -47,7 +46,7 @@ func NewRelay(listen, target string, fwd, rev Spec) (*Relay, error) {
 	return &Relay{
 		Fwd: NewLink(fwd, time.Now().UnixNano()), Rev: NewLink(rev, time.Now().UnixNano()+1),
 		Timeout: 120 * time.Second, Log: slog.Default(),
-		target: ta, lc: lc, flows: make(map[string]*flow),
+		target: target, lc: lc, flows: make(map[string]*flow),
 	}, nil
 }
 
@@ -106,10 +105,13 @@ func (r *Relay) flowFor(from *net.UDPAddr) (*flow, error) {
 		f.last = time.Now()
 		return f, nil
 	}
-	up, err := net.DialUDP("udp", nil, r.target)
+	// The target is resolved per new flow, so DNS changes are followed and a
+	// temporarily unresolvable target does not take the relay down.
+	c, err := net.Dial("udp", r.target)
 	if err != nil {
 		return nil, err
 	}
+	up := c.(*net.UDPConn)
 	up.SetReadBuffer(8 << 20)
 	up.SetWriteBuffer(8 << 20)
 	f := &flow{up: up, from: from, last: time.Now()}
