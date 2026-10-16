@@ -73,9 +73,13 @@ type Stream struct {
 	peerWindow uint64
 	finQueued  bool
 	finAcked   bool
-	inRR       bool
-	inUnacked  bool
-	sendCond   *sync.Cond
+	// sackLimit: SACK information is complete only below this offset (the
+	// receiver truncates its range list); chunks above it may well have
+	// arrived and must not be presumed lost.
+	sackLimit uint64
+	inRR      bool
+	inUnacked bool
+	sendCond  *sync.Cond
 
 	// ---- receive side ----
 	recvOff       uint64   // next expected offset (incl. FIN virtual byte)
@@ -95,7 +99,7 @@ type Stream struct {
 }
 
 func newStream(s *Session, id uint64) *Stream {
-	st := &Stream{id: id, sess: s, peerWindow: initialPeerWindow, lastActive: time.Now(), created: time.Now()}
+	st := &Stream{id: id, sess: s, peerWindow: initialPeerWindow, lastActive: time.Now(), created: time.Now(), sackLimit: ^uint64(0)}
 	st.sendCond = sync.NewCond(&s.mu)
 	st.recvCond = sync.NewCond(&s.mu)
 	st.lastAdvWindow = uint64(s.opt.Window)
@@ -315,6 +319,11 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 		}
 		st.sendCond.Broadcast()
 	}
+	if len(e.ranges) >= maxAckRanges {
+		st.sackLimit = e.ranges[len(e.ranges)-1].end
+	} else {
+		st.sackLimit = ^uint64(0)
+	}
 	if len(e.ranges) > 0 {
 		ri := 0
 		for i := 0; i < st.nextUnsent && ri < len(e.ranges); i++ {
@@ -412,7 +421,7 @@ func (st *Stream) ackEntryLocked() ackEntry {
 			e.ranges[n-1].end = c.end()
 			continue
 		}
-		if len(e.ranges) >= 32 {
+		if len(e.ranges) >= maxAckRanges {
 			break
 		}
 		e.ranges = append(e.ranges, ackRange{c.off, c.end()})

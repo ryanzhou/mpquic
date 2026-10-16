@@ -260,6 +260,7 @@ const farFuture = time.Duration(1<<62 - 1)
 func (s *Session) expectedArrivalLocked(c *chunk, now time.Time, overdueFactor float64) (time.Time, bool) {
 	var best time.Time
 	found := false
+	known := c.off < c.st.sackLimit // do we have SACK information about c?
 	for _, r := range c.sends {
 		q := r.p
 		if q.state != stateActive {
@@ -267,7 +268,7 @@ func (s *Session) expectedArrivalLocked(c *chunk, now time.Time, overdueFactor f
 		}
 		tx := time.Duration(float64(len(c.data)) / q.rate() * float64(time.Second))
 		ackBy := r.at.Add(time.Duration(overdueFactor*float64(q.srttOrDefault())) + 4*q.rttvar + tx + s.opt.AckDelay + 15*time.Millisecond)
-		if now.After(ackBy) {
+		if known && now.After(ackBy) {
 			continue
 		}
 		arr := r.at.Add(q.schedRTT()/2 + tx)
@@ -303,13 +304,16 @@ func (s *Session) refillEagerLocked(now time.Time) {
 func (s *Session) dupCandidateLocked(p *Path, now time.Time) *chunk {
 	s.refillEagerLocked(now)
 	for st := range s.unacked {
-		lim := st.nextUnsent
-		if lim > 16 {
-			lim = 16
-		}
-		for i := 0; i < lim; i++ {
+		// Consider the first few not-yet-acked chunks (SACKed ones are
+		// skipped without counting), bounded to keep this cheap.
+		cand := 0
+		for i := 0; i < st.nextUnsent && i < 1024 && cand < 32; i++ {
 			c := st.sendBuf[i]
-			if c.acked || c.queued || len(c.sends) >= 3 || c.sentOn(p) {
+			if c.acked {
+				continue
+			}
+			cand++
+			if c.queued || len(c.sends) >= 3 || c.sentOn(p) {
 				continue
 			}
 			arr, ok := s.expectedArrivalLocked(c, now, 1)

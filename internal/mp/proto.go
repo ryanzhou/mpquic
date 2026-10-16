@@ -60,6 +60,9 @@ const (
 
 type ackRange struct{ start, end uint64 } // [start,end)
 
+// maxAckRanges bounds the SACK ranges per stream in one ACK.
+const maxAckRanges = 32
+
 type ackEntry struct {
 	id     uint64
 	cum    uint64 // all bytes (incl. FIN virtual byte) below cum received

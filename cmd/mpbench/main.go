@@ -41,6 +41,7 @@ var (
 	failAfter = flag.Duration("fail-after", 3*time.Second, "failover: take best path down after")
 	failFor   = flag.Duration("fail-for", 4*time.Second, "failover: outage duration")
 	streams   = flag.Int("streams", 1, "parallel streams in bulk tests")
+	ccName    = flag.String("cc", "", "congestion control (bbr, bbr-aggressive, bbr-conservative)")
 )
 
 func main() {
@@ -57,7 +58,7 @@ func main() {
 	slog.SetDefault(log)
 
 	target := startTarget()
-	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk}
+	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk, Congestion: *ccName}
 	srv, err := mp.NewServer(opt, proxy.RemoteHandler(log, 5*time.Second))
 	check(err)
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
