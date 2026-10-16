@@ -313,3 +313,28 @@ func TestRelayRestart(t *testing.T) {
 		t.Fatalf("expected 2 paths, got %d", len(st))
 	}
 }
+
+func TestECFDecision(t *testing.T) {
+	now := time.Now()
+	fast := &Path{srtt: 20 * time.Millisecond, minRTT: 20 * time.Millisecond, bw: 5 << 20}   // 10ms owd, 5MB/s
+	slow := &Path{srtt: 100 * time.Millisecond, minRTT: 100 * time.Millisecond, bw: 5 << 20} // 50ms owd, 5MB/s
+	s := &Session{paths: []*Path{fast, slow}}
+	// The fast path may always send.
+	if !s.ecfAllowLocked(fast, 1<<30, 16<<10, now) {
+		t.Fatal("fast path denied")
+	}
+	// A small backlog stays on the fast path: it drains 64KB in ~22ms < 53ms.
+	if s.ecfAllowLocked(slow, 64<<10, 16<<10, now) {
+		t.Fatal("slow path allowed for a small backlog")
+	}
+	// A bulk backlog spills over: 4MB takes ~0.8s on the fast path alone.
+	if !s.ecfAllowLocked(slow, 4<<20, 16<<10, now) {
+		t.Fatal("slow path denied for bulk backlog")
+	}
+	// A low-bandwidth "fast" path loses to a high-bandwidth one for big chunks.
+	thin := &Path{srtt: 10 * time.Millisecond, minRTT: 10 * time.Millisecond, bw: 100 << 10} // 100KB/s
+	s.paths = []*Path{thin, slow}
+	if !s.ecfAllowLocked(slow, 256<<10, 16<<10, now) {
+		t.Fatal("high-bandwidth path denied although the thin path would take seconds")
+	}
+}

@@ -357,7 +357,7 @@ func runLocal(mode string, args []string) error {
 	}
 	log.Info("mpquic local started", "version", version, "listen", ln.Addr().String(), "mode", what, "udp", udp != nil, "paths", strings.Join(servers, ","))
 	go func() {
-		if err := l.Serve(ln); err != nil {
+		if err := l.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Error("listener", "err", err)
 		}
 	}()

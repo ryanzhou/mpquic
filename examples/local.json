@@ -1,0 +1,18 @@
+{
+  "server": [
+    "203.0.113.10:8388",
+    "relay-tokyo.example.net:9000",
+    "relay-sgp.example.net:9000"
+  ],
+  "server_port": 8388,
+  "local_address": "127.0.0.1",
+  "local_port": 1080,
+  "password": "change-me-to-a-long-random-string",
+  "method": "chacha20-ietf-poly1305",
+  "mode": "tcp_and_udp",
+  "timeout": 300,
+
+  "congestion": "bbr",
+  "window": "16MB",
+  "stats_interval": 60
+}

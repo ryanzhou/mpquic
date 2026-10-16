@@ -1,0 +1,8 @@
+{
+  "server": "0.0.0.0",
+  "server_port": 8388,
+  "password": "change-me-to-a-long-random-string",
+  "method": "chacha20-ietf-poly1305",
+  "mode": "tcp_and_udp",
+  "timeout": 300
+}

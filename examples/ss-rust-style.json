@@ -1,0 +1,9 @@
+{
+  "servers": [
+    { "server": "203.0.113.10", "server_port": 8388, "password": "change-me", "method": "aes-256-gcm" },
+    { "server": "relay1.example.net", "server_port": 9000 },
+    "relay2.example.net:9000"
+  ],
+  "local_address": "127.0.0.1",
+  "local_port": 1080
+}

@@ -137,7 +137,7 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	}
 	// A reconnect for the same configured index supersedes the old path.
 	for _, q := range s.paths {
-		if q.index == p.index && q.state != stateDead && s.isClient == false {
+		if q.index == p.index && q.state != stateDead && !s.isClient {
 			q.conn.CloseWithError(errCodeStale, "superseded")
 		}
 	}
@@ -388,7 +388,7 @@ func (s *Session) ackLoop() {
 const tickInterval = 10 * time.Millisecond
 
 func (s *Session) tickLoop() {
-	t := time.NewTicker(tickInterval)
+	t := time.NewTimer(tickInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -396,15 +396,22 @@ func (s *Session) tickLoop() {
 		case <-s.ctx.Done():
 			return
 		}
-		s.tick(time.Now())
+		if s.tick(time.Now()) {
+			t.Reset(tickInterval)
+		} else {
+			t.Reset(idleTickInterval) // nothing in flight: tick slowly
+		}
 	}
 }
 
-func (s *Session) tick(now time.Time) {
+const idleTickInterval = 100 * time.Millisecond
+
+// tick runs periodic maintenance; it returns whether the session is busy.
+func (s *Session) tick(now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return
+		return false
 	}
 	active := len(s.streams) > 0
 	changed := false
@@ -440,6 +447,7 @@ func (s *Session) tick(now time.Time) {
 		s.lastStatsTick = now
 		s.log.Info("stats", "streams", len(s.streams), "backlog", s.backlog, "paths", s.statsStringLocked())
 	}
+	return len(s.streams) > 0 || len(s.reinjectQ) > 0 || len(s.unacked) > 0
 }
 
 // SendDatagram sends an unreliable datagram on the best path. Datagrams that
