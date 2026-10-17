@@ -30,6 +30,10 @@ type Config struct {
 	Plugin        string        `json:"plugin"`
 
 	// mpquic extensions
+	// Reverse swaps the QUIC roles: the local side listens (at "server" /
+	// "server_port", i.e. its own public address) and the remote dials the
+	// local through the "server" list (the local's address and relays).
+	Reverse       bool          `json:"reverse"`
 	Congestion    string        `json:"congestion"`
 	Window        Size          `json:"window"`
 	ChunkSize     Size          `json:"chunk_size"`
@@ -190,4 +194,25 @@ func (c *Config) UDPEnabled() bool {
 		return true
 	}
 	return false
+}
+
+// ListenAddrs returns the UDP addresses a QUIC listener binds: every "server"
+// entry combined with server_port (default: all interfaces).
+func (c *Config) ListenAddrs() []string {
+	port := c.ServerPort
+	if port == 0 {
+		port = 8388
+	}
+	if len(c.Server) == 0 {
+		return []string{":" + strconv.Itoa(port)}
+	}
+	var out []string
+	for _, b := range c.Server {
+		if b == "" {
+			out = append(out, ":"+strconv.Itoa(port))
+		} else {
+			out = append(out, JoinHostPort(b, port))
+		}
+	}
+	return out
 }

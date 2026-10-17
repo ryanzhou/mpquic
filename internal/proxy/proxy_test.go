@@ -23,7 +23,7 @@ type env struct {
 	udpEcho       *net.UDPAddr
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, reverse bool) *env {
 	t.Helper()
 	log := tlog()
 	// TCP echo target
@@ -49,36 +49,54 @@ func setup(t *testing.T) *env {
 			ue.WriteToUDP(b[:n], a)
 		}
 	}()
-	// remote
-	sopt := &mp.Options{Password: "x", Logger: log, DatagramHandler: NewUDPRemote(log).HandleDatagram}
-	srv, err := mp.NewServer(sopt, RemoteHandler(log, 5*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
 	pc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	go srv.Serve(pc)
-	// local
+	paths := []string{pc.LocalAddr().String(), pc.LocalAddr().String()}
 	udp := NewUDPLocal(nil, log)
-	copt := &mp.Options{Password: "x", Logger: log, DatagramHandler: udp.HandleDatagram}
-	cl, err := mp.NewClient([]string{pc.LocalAddr().String(), pc.LocalAddr().String()}, copt)
-	if err != nil {
-		t.Fatal(err)
+	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: NewUDPRemote(log).HandleDatagram,
+		StreamHandler: RemoteHandler(log, 5*time.Second)}
+	lopt := &mp.Options{Password: "x", Logger: log, DatagramHandler: udp.HandleDatagram}
+	var opener Opener
+	var stop func()
+	if !reverse {
+		// remote listens, local dials
+		srv, err := mp.NewServer(ropt, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go srv.Serve(pc)
+		cl, err := mp.NewClient(paths, lopt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opener, stop = cl, func() { cl.Close(); srv.Close() }
+	} else {
+		// local listens, remote dials back
+		lopt.SingleSession = true
+		srv, err := mp.NewServer(lopt, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go srv.Serve(pc)
+		cl, err := mp.NewClient(paths, ropt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opener, stop = srv, func() { cl.Close(); srv.Close() }
 	}
-	udp.Client = cl
+	udp.Client = opener
 	sl, _ := net.Listen("tcp", "127.0.0.1:0")
-	go (&Local{Client: cl, Log: log, UDP: udp}).Serve(sl)
+	go (&Local{Client: opener, Log: log, UDP: udp}).Serve(sl)
 	tn, _ := net.Listen("tcp", "127.0.0.1:0")
-	go (&Local{Client: cl, Log: log, Tunnel: tl.Addr().String()}).Serve(tn)
+	go (&Local{Client: opener, Log: log, Tunnel: tl.Addr().String()}).Serve(tn)
 	t.Cleanup(func() {
-		cl.Close()
-		srv.Close()
+		stop()
 		tl.Close()
 		ue.Close()
 		sl.Close()
 		tn.Close()
 	})
 	deadline := time.Now().Add(5 * time.Second)
-	for len(cl.Session().Stats()) < 2 && time.Now().Before(deadline) {
+	for (opener.Session() == nil || opener.Session().ActivePaths() < 2) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return &env{socks: sl.Addr().String(), tunnel: tn.Addr().String(), tcpEcho: tl.Addr().String(), udpEcho: ue.LocalAddr().(*net.UDPAddr)}
@@ -108,8 +126,10 @@ func socksRequest(t *testing.T, addr string, cmd byte, target string) (net.Conn,
 	return c, bound
 }
 
-func TestSocksConnect(t *testing.T) {
-	e := setup(t)
+func TestSocksConnect(t *testing.T) { both(t, testSocksConnect) }
+
+func testSocksConnect(t *testing.T, reverse bool) {
+	e := setup(t, reverse)
 	c, _ := socksRequest(t, e.socks, 1, e.tcpEcho)
 	defer c.Close()
 	msg := bytes.Repeat([]byte("hello mpquic "), 10000)
@@ -121,8 +141,10 @@ func TestSocksConnect(t *testing.T) {
 	}
 }
 
-func TestSocksConnectRefused(t *testing.T) {
-	e := setup(t)
+func TestSocksConnectRefused(t *testing.T) { both(t, testSocksConnectRefused) }
+
+func testSocksConnectRefused(t *testing.T, reverse bool) {
+	e := setup(t, reverse)
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	dead := l.Addr().String()
 	l.Close()
@@ -134,8 +156,10 @@ func TestSocksConnectRefused(t *testing.T) {
 	}
 }
 
-func TestTunnel(t *testing.T) {
-	e := setup(t)
+func TestTunnel(t *testing.T) { both(t, testTunnel) }
+
+func testTunnel(t *testing.T, reverse bool) {
+	e := setup(t, reverse)
 	c, err := net.Dial("tcp", e.tunnel)
 	if err != nil {
 		t.Fatal(err)
@@ -149,8 +173,10 @@ func TestTunnel(t *testing.T) {
 	}
 }
 
-func TestSocksUDP(t *testing.T) {
-	e := setup(t)
+func TestSocksUDP(t *testing.T) { both(t, testSocksUDP) }
+
+func testSocksUDP(t *testing.T, reverse bool) {
+	e := setup(t, reverse)
 	ctl, bound := socksRequest(t, e.socks, 3, "0.0.0.0:0")
 	defer ctl.Close()
 	port := binary.BigEndian.Uint16(bound[len(bound)-2:])
@@ -198,4 +224,9 @@ func TestAddrCodec(t *testing.T) {
 			t.Fatalf("%s -> %s (%v)", a, got, err)
 		}
 	}
+}
+
+func both(t *testing.T, f func(*testing.T, bool)) {
+	t.Run("normal", func(t *testing.T) { f(t, false) })
+	t.Run("reverse", func(t *testing.T) { f(t, true) })
 }

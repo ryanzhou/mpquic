@@ -17,8 +17,10 @@ import (
 	"mpquic/internal/cc/bbr"
 )
 
-// Client maintains one session to a remote instance over many paths (one per
-// configured server address; typically the direct address plus UDP relays).
+// Client is the QUIC dialer: it maintains one session to a listener over many
+// paths (one per configured address; typically the direct address plus UDP
+// relays). Normally the client is the proxy's local side and opens streams;
+// in reverse mode it is the remote side and accepts them (Options.StreamHandler).
 type Client struct {
 	opt     *Options
 	key     []byte
@@ -46,7 +48,7 @@ func NewClient(servers []string, opt *Options) (*Client, error) {
 		opt: o, key: deriveKey(o.Password), tlsConf: clientTLSConfig(o.SNI),
 		qconf: quicConfig(o), profile: prof, servers: servers,
 	}
-	c.sess = newSession(o, id, true, nil)
+	c.sess = newSession(o, id, true, o.StreamHandler)
 	for i, addr := range servers {
 		c.wg.Add(1)
 		go c.dialLoop(uint64(i), addr)
@@ -154,7 +156,9 @@ func (c *Client) runPath(index uint64, addr string) error {
 	return p.run()
 }
 
-// Server accepts paths from clients and groups them into sessions.
+// Server is the QUIC listener: it accepts paths and groups them into
+// sessions. Normally it is the proxy's remote side (with a stream handler);
+// in reverse mode it is the local side and opens streams via OpenStream.
 type Server struct {
 	opt      *Options
 	key      []byte
@@ -169,10 +173,14 @@ type Server struct {
 	closed    bool
 }
 
-// NewServer creates a server; handler is called (in its own goroutine) for
-// every new incoming stream.
+// NewServer creates a server; handler (or Options.StreamHandler if handler is
+// nil) is called in its own goroutine for every incoming stream. With no
+// handler, incoming streams are refused.
 func NewServer(opt *Options, handler func(*Stream)) (*Server, error) {
 	o := opt.withDefaults()
+	if handler == nil {
+		handler = o.StreamHandler
+	}
 	prof, err := cc.ParseProfile(o.Congestion)
 	if err != nil {
 		return nil, err
@@ -279,12 +287,25 @@ func (s *Server) handleConn(conn *quic.Conn) {
 		return
 	}
 	sess := s.sessions[r.h.session]
+	var stale []*Session
 	if sess == nil {
 		sess = newSession(s.opt, r.h.session, false, s.acceptFn)
+		if s.opt.SingleSession {
+			for id, old := range s.sessions {
+				if old.ActivePaths() == 0 {
+					delete(s.sessions, id)
+					stale = append(stale, old)
+				}
+			}
+		}
 		s.sessions[r.h.session] = sess
 		sess.log.Info("new session", "from", conn.RemoteAddr().String())
 	}
 	s.mu.Unlock()
+	for _, old := range stale {
+		old.log.Info("session superseded by a new session from the peer")
+		old.Close()
+	}
 	if err := writeHelloOK(ctrl, s.key, exp, r.h.session, sess.nonce); err != nil {
 		conn.CloseWithError(errCodeShutdown, "")
 		return
@@ -333,4 +354,33 @@ func (s *Server) Stats() map[string][]PathStat {
 		out[k] = x.Stats()
 	}
 	return out
+}
+
+// Session returns the best established session: the one with the most active
+// paths, preferring the newest. It returns nil if there is none.
+func (s *Server) Session() *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *Session
+	bestN := -1
+	for _, x := range s.sessions {
+		n := x.ActivePaths()
+		if n > bestN || n == bestN && best != nil && x.created.After(best.created) {
+			best, bestN = x, n
+		}
+	}
+	return best
+}
+
+// ErrNoSession is returned by Server.OpenStream before any peer connected.
+var ErrNoSession = errors.New("no peer connected")
+
+// OpenStream opens a stream on the best session (reverse mode, where the
+// listener is the side that originates proxied connections).
+func (s *Server) OpenStream() (*Stream, error) {
+	sess := s.Session()
+	if sess == nil {
+		return nil, ErrNoSession
+	}
+	return sess.OpenStream()
 }

@@ -28,7 +28,7 @@ const udpIdle = 2 * time.Minute
 
 // UDPLocal handles the local side of UDP associations.
 type UDPLocal struct {
-	Client *mp.Client
+	Client Opener
 	Log    *slog.Logger
 
 	mu     sync.Mutex
@@ -42,7 +42,7 @@ type localAssoc struct {
 	client atomic.Pointer[net.UDPAddr]
 }
 
-func NewUDPLocal(c *mp.Client, log *slog.Logger) *UDPLocal {
+func NewUDPLocal(c Opener, log *slog.Logger) *UDPLocal {
 	return &UDPLocal{Client: c, Log: log, assocs: make(map[uint64]*localAssoc)}
 }
 
@@ -116,7 +116,11 @@ func (u *UDPLocal) associate(c net.Conn) {
 		msg := make([]byte, 0, len(hdr)+n-3)
 		msg = append(msg, hdr...)
 		msg = append(msg, buf[3:n]...)
-		if err := u.Client.Session().SendDatagram(msg); err != nil {
+		sess := u.Client.Session()
+		if sess == nil {
+			continue
+		}
+		if err := sess.SendDatagram(msg); err != nil {
 			u.Log.Debug("udp send", "err", err)
 		}
 	}

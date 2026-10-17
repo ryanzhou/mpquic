@@ -1,0 +1,11 @@
+{
+  "reverse": true,
+  "server": [
+    "198.51.100.7:8388",
+    "relay-a.example.net:9000",
+    "relay-b.example.net:9000"
+  ],
+  "password": "change-me-to-a-long-random-string",
+  "mode": "tcp_and_udp",
+  "timeout": 300
+}

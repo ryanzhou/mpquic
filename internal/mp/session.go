@@ -20,12 +20,15 @@ var errSessionClosed = errors.New("session closed")
 // Session groups all paths between one local and one remote instance and
 // multiplexes streams across them.
 type Session struct {
-	opt      *Options
-	log      *slog.Logger
-	id       [16]byte
-	isClient bool
-	ctx      context.Context
-	cancel   context.CancelFunc
+	opt *Options
+	log *slog.Logger
+	id  [16]byte
+	// dialer is the QUIC role: the dialer authenticates the listener's
+	// session nonce; the listener generates it. Which side opens streams is
+	// independent: a session accepts incoming streams iff acceptFn != nil.
+	dialer bool
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu        sync.Mutex
 	paths     []*Path
@@ -45,6 +48,7 @@ type Session struct {
 	hasNonce  bool
 	acceptFn  func(*Stream)
 	noPathAt  time.Time
+	created   time.Time
 	closed    bool
 	tmpPaths  []*Path
 
@@ -55,12 +59,12 @@ type Session struct {
 	lastStatsTick time.Time
 }
 
-func newSession(opt *Options, id [16]byte, isClient bool, acceptFn func(*Stream)) *Session {
+func newSession(opt *Options, id [16]byte, dialer bool, acceptFn func(*Stream)) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		opt:       opt,
 		id:        id,
-		isClient:  isClient,
+		dialer:    dialer,
 		ctx:       ctx,
 		cancel:    cancel,
 		streams:   make(map[uint64]*Stream),
@@ -71,11 +75,12 @@ func newSession(opt *Options, id [16]byte, isClient bool, acceptFn func(*Stream)
 		acceptFn:  acceptFn,
 		nextID:    1,
 		noPathAt:  time.Now(),
+		created:   time.Now(),
 
 		lastStatsTick: time.Now(),
 	}
 	s.log = opt.Logger.With("session", hex.EncodeToString(id[:4]))
-	if !isClient {
+	if !dialer {
 		rand.Read(s.nonce[:])
 		s.hasNonce = true
 	}
@@ -84,7 +89,14 @@ func newSession(opt *Options, id [16]byte, isClient bool, acceptFn func(*Stream)
 	return s
 }
 
-// OpenStream creates a new outgoing stream (client side).
+// ActivePaths returns the number of usable paths.
+func (s *Session) ActivePaths() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeCountLocked()
+}
+
+// OpenStream creates a new outgoing stream.
 func (s *Session) OpenStream() (*Stream, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,7 +149,7 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	}
 	// A reconnect for the same configured index supersedes the old path.
 	for _, q := range s.paths {
-		if q.index == p.index && q.state != stateDead && !s.isClient {
+		if q.index == p.index && q.state != stateDead && !s.dialer {
 			q.conn.CloseWithError(errCodeStale, "superseded")
 		}
 	}
@@ -275,7 +287,7 @@ func (s *Session) onChunk(p *Path, id, off uint64, data []byte, fin bool) {
 	p.lastRecv = now
 	st := s.streams[id]
 	if st == nil {
-		if _, ok := s.closedIDs[id]; ok || s.isClient || s.acceptFn == nil {
+		if _, ok := s.closedIDs[id]; ok || s.acceptFn == nil {
 			s.ackAllIDs = append(s.ackAllIDs, id)
 			select {
 			case s.ackSig <- struct{}{}:
@@ -332,7 +344,7 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 		s.mu.Lock()
 		if st := s.streams[v[0]]; st != nil {
 			st.resetLocked(v[1], false)
-		} else if !s.isClient {
+		} else if s.acceptFn != nil {
 			s.closedIDs[v[0]] = time.Now()
 		}
 		s.mu.Unlock()
@@ -433,7 +445,7 @@ func (s *Session) tick(now time.Time) bool {
 		for _, st := range s.streams {
 			if now.Sub(st.lastActive) > s.opt.IdleTimeout {
 				st.resetLocked(ResetIdleTimeout, true)
-			} else if !s.isClient && st.recvOff == 0 && now.Sub(st.created) > 30*time.Second {
+			} else if s.acceptFn != nil && st.recvOff == 0 && now.Sub(st.created) > 30*time.Second {
 				st.resetLocked(ResetGeneric, true) // never received its beginning
 			}
 		}
@@ -484,6 +496,7 @@ func (s *Session) Context() context.Context { return s.ctx }
 // PathStat is a snapshot of one path, for monitoring.
 type PathStat struct {
 	Name      string
+	Index     int // the dialer's configured path index
 	State     string
 	SRTT      time.Duration
 	MinRTT    time.Duration

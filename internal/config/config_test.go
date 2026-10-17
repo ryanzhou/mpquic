@@ -32,3 +32,18 @@ func TestShadowsocksCompat(t *testing.T) {
 		t.Fatalf("single = %v", got)
 	}
 }
+
+func TestReverseAndListen(t *testing.T) {
+	var c Config
+	json.Unmarshal([]byte(`{"reverse": true, "server": ["0.0.0.0", "[::1]:9000", "::"], "server_port": 8388}`), &c)
+	if !c.Reverse {
+		t.Fatal("reverse not parsed")
+	}
+	if got := c.ListenAddrs(); !reflect.DeepEqual(got, []string{"0.0.0.0:8388", "[::1]:9000", "[::]:8388"}) {
+		t.Fatalf("listen = %v", got)
+	}
+	var d Config
+	if got := d.ListenAddrs(); !reflect.DeepEqual(got, []string{":8388"}) {
+		t.Fatalf("default listen = %v", got)
+	}
+}

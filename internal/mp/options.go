@@ -43,6 +43,14 @@ type Options struct {
 	// SNI sent by the client (optional).
 	SNI    string
 	Logger *slog.Logger
+	// StreamHandler, if set, accepts streams opened by the peer (it runs in
+	// its own goroutine per stream). Normally only the remote sets it; in
+	// reverse mode the remote is the QUIC dialer (Client) and still does.
+	StreamHandler func(*Stream)
+	// SingleSession (listener side): expect a single peer. When a new session
+	// is established, older sessions without active paths are closed at once
+	// (their peer evidently restarted) instead of waiting for SessionTimeout.
+	SingleSession bool
 	// DatagramHandler receives unreliable datagrams sent by the peer with
 	// Session.SendDatagram (used for UDP relaying). Nil drops them.
 	DatagramHandler func(s *Session, b []byte)

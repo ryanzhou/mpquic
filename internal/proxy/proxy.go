@@ -11,10 +11,17 @@ import (
 	"mpquic/internal/mp"
 )
 
+// Opener is the side of a multipath connection that originates proxied
+// streams: *mp.Client normally, *mp.Server in reverse mode.
+type Opener interface {
+	OpenStream() (*mp.Stream, error)
+	Session() *mp.Session // nil if no session is established
+}
+
 // Local accepts TCP connections (SOCKS5, or a fixed tunnel target) and
-// forwards them over the multipath client.
+// forwards them over the multipath connection.
 type Local struct {
-	Client *mp.Client
+	Client Opener
 	Log    *slog.Logger
 	// Tunnel, if non-empty, makes every connection go to this host:port
 	// (ss-tunnel mode) instead of speaking SOCKS5.
@@ -67,6 +74,7 @@ func (l *Local) handle(c net.Conn, tunnelAddr []byte) {
 	}
 	st, err := l.Client.OpenStream()
 	if err != nil {
+		l.Log.Debug("cannot open stream", "target", target, "err", err)
 		c.Close()
 		return
 	}

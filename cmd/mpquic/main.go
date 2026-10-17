@@ -4,6 +4,9 @@
 //	mpquic remote -s BIND_ADDR -p PORT -k PASSWORD                           (ss-server)
 //	mpquic tunnel -s ... -L TARGET:PORT ...                                  (ss-tunnel)
 //	mpquic relay  --listen :9000 --target HOST:PORT [--link SPEC]            (socat UDP + link emulation)
+//
+// Reverse mode (--reverse on both ends) swaps the QUIC roles: the local
+// listens and the remote connects back to it through the relays.
 package main
 
 import (
@@ -97,6 +100,9 @@ Common options (shadowsocks-compatible):
   -L HOST:PORT      tunnel target (tunnel mode)
   -u                enable UDP relay (SOCKS5 UDP ASSOCIATE; set on both ends)
   -v                verbose logging
+  --reverse         reverse mode (set on both ends): the local listens for QUIC
+                    (-s/-p = its bind address) and the remote dials it
+                    (-s = the local's address and relays forwarding to it)
 
 mpquic options:
   --congestion CC   bbr (default), bbr-aggressive, bbr-conservative
@@ -127,7 +133,7 @@ type commonFlags struct {
 	verbose, noDup             bool
 	cert, key, sni, logLevel   string
 	plugin                     string
-	udp, udpOnly               bool
+	udp, udpOnly, reverse      bool
 }
 
 func parseCommon(name string, args []string) (*commonFlags, error) {
@@ -163,6 +169,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	for _, n := range []string{"a", "f", "plugin-opts", "acl", "mtu", "manager-address", "executable", "d", "protocol"} {
 		fs.StringVar(&ign, n, "", "ignored")
 	}
+	fs.BoolVar(&f.reverse, "reverse", false, "reverse mode")
 	fs.BoolVar(&f.udp, "u", false, "enable UDP relay")
 	fs.BoolVar(&f.udpOnly, "U", false, "enable UDP relay (UDP only is treated as TCP+UDP)")
 	for _, n := range []string{"6", "fast-open", "reuse-port", "no-delay", "mptcp", "use-syslog"} {
@@ -247,6 +254,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	if f.logLevel != "" {
 		cfg.LogLevel = f.logLevel
 	}
+	if f.reverse {
+		cfg.Reverse = true
+	}
 	if f.udp || f.udpOnly {
 		cfg.Mode = "tcp_and_udp"
 	}
@@ -316,10 +326,6 @@ func runLocal(mode string, args []string) error {
 	if err != nil {
 		return err
 	}
-	servers := cfg.ServerAddrs()
-	if len(servers) == 0 {
-		return errors.New("at least one server address is required (-s)")
-	}
 	if mode == "tunnel" && cfg.TunnelAddress == "" {
 		return errors.New("tunnel mode requires -L host:port")
 	}
@@ -331,22 +337,50 @@ func runLocal(mode string, args []string) error {
 	if lport == 0 {
 		lport = 1080
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(laddr, strconv.Itoa(lport)))
-	if err != nil {
-		return err
-	}
 	var udp *proxy.UDPLocal
 	if cfg.UDPEnabled() && mode != "tunnel" {
 		udp = proxy.NewUDPLocal(nil, log)
 		opt.DatagramHandler = udp.HandleDatagram
 	}
-	client, err := mp.NewClient(servers, opt)
+	var opener proxy.Opener
+	var shutdown func()
+	var pathDesc string
+	if cfg.Reverse {
+		// Reverse mode: we are the QUIC listener; the remote dials us
+		// (directly and through relays that forward to our address).
+		opt.SingleSession = true
+		srv, err := mp.NewServer(opt, nil)
+		if err != nil {
+			return err
+		}
+		binds := cfg.ListenAddrs()
+		for _, a := range binds {
+			go func() {
+				if err := srv.ListenAndServe(a); err != nil {
+					log.Error("quic listener", "addr", a, "err", err)
+				}
+			}()
+		}
+		opener, shutdown, pathDesc = srv, srv.Close, "reverse, listening on "+strings.Join(binds, ",")
+	} else {
+		servers := cfg.ServerAddrs()
+		if len(servers) == 0 {
+			return errors.New("at least one server address is required (-s)")
+		}
+		client, err := mp.NewClient(servers, opt)
+		if err != nil {
+			return err
+		}
+		opener, shutdown, pathDesc = client, client.Close, strings.Join(servers, ",")
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(laddr, strconv.Itoa(lport)))
 	if err != nil {
+		shutdown()
 		return err
 	}
-	l := &proxy.Local{Client: client, Log: log, UDP: udp}
+	l := &proxy.Local{Client: opener, Log: log, UDP: udp}
 	if udp != nil {
-		udp.Client = client
+		udp.Client = opener
 	}
 	if mode == "tunnel" {
 		l.Tunnel = cfg.TunnelAddress
@@ -355,7 +389,7 @@ func runLocal(mode string, args []string) error {
 	if l.Tunnel != "" {
 		what = "tunnel to " + l.Tunnel
 	}
-	log.Info("mpquic local started", "version", version, "listen", ln.Addr().String(), "mode", what, "udp", udp != nil, "paths", strings.Join(servers, ","))
+	log.Info("mpquic local started", "version", version, "listen", ln.Addr().String(), "mode", what, "udp", udp != nil, "paths", pathDesc)
 	go func() {
 		if err := l.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Error("listener", "err", err)
@@ -363,7 +397,7 @@ func runLocal(mode string, args []string) error {
 	}()
 	waitSignal()
 	ln.Close()
-	client.Close()
+	shutdown()
 	return nil
 }
 
@@ -381,30 +415,35 @@ func runRemote(args []string) error {
 	if err != nil {
 		return err
 	}
-	port := cfg.ServerPort
-	if port == 0 {
-		port = 8388
-	}
-	binds := []string(cfg.Server)
-	if len(binds) == 0 {
-		binds = []string{""}
-	}
 	if cfg.UDPEnabled() {
 		opt.DatagramHandler = proxy.NewUDPRemote(log).HandleDatagram
 	}
-	srv, err := mp.NewServer(opt, proxy.RemoteHandler(log, 10*time.Second))
+	opt.StreamHandler = proxy.RemoteHandler(log, 10*time.Second)
+	if cfg.Reverse {
+		// Reverse mode: dial the local instance over every configured path.
+		servers := cfg.ServerAddrs()
+		if len(servers) == 0 {
+			return errors.New("reverse mode: at least one address of the local instance is required (-s)")
+		}
+		client, err := mp.NewClient(servers, opt)
+		if err != nil {
+			return err
+		}
+		log.Info("mpquic remote started", "version", version, "mode", "reverse", "paths", strings.Join(servers, ","), "udp", cfg.UDPEnabled())
+		waitSignal()
+		client.Close()
+		return nil
+	}
+	srv, err := mp.NewServer(opt, nil)
 	if err != nil {
 		return err
 	}
+	binds := cfg.ListenAddrs()
 	errc := make(chan error, len(binds))
-	for _, b := range binds {
-		addr := config.JoinHostPort(b, port)
-		if b == "" {
-			addr = ":" + strconv.Itoa(port)
-		}
-		go func() { errc <- srv.ListenAndServe(addr) }()
+	for _, a := range binds {
+		go func() { errc <- srv.ListenAndServe(a) }()
 	}
-	log.Info("mpquic remote started", "version", version, "port", port, "udp", cfg.UDPEnabled())
+	log.Info("mpquic remote started", "version", version, "listen", strings.Join(binds, ","), "udp", cfg.UDPEnabled())
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	select {

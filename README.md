@@ -49,6 +49,37 @@ mpquic local -s remote.example.com:8388 -s relay-a.example.net:9000 -s relay-b.e
 curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
+### Reverse mode (the local side has the public IP)
+
+Sometimes the *local* host is the reachable one, and the remote (the egress
+side) sits behind NAT or a firewall. Set `--reverse` on **both** ends. The
+local then listens for QUIC on its public address, in addition to serving
+SOCKS5. The relays forward to the local, and the remote connects back to the
+local directly and through every relay. Everything else stays the same:
+SOCKS clients still connect to the local, and the remote still dials the
+targets.
+
+```sh
+# local (public IP 198.51.100.7): QUIC listener on :8388 + SOCKS5 on 127.0.0.1:1080
+mpquic local --reverse -s 0.0.0.0 -p 8388 -l 1080 -k 'long-random-password' -u
+
+# relays: forward to the *local*
+socat UDP-LISTEN:9000,fork,reuseaddr UDP:198.51.100.7:8388
+
+# remote (behind NAT): dial the local directly and via each relay
+mpquic remote --reverse -s 198.51.100.7:8388 -s relay-a.example.net:9000 -s relay-b.example.net:9000 \
+              -k 'long-random-password' -u
+```
+
+In reverse mode `-s`/`-p` (`server`/`server_port`) are the local's QUIC bind
+address(es) on the local, and the list of paths on the remote; see
+`examples/reverse-*.json`. Keepalive pings hold the remote's NAT mappings
+open. Until the remote has connected, the local refuses SOCKS requests
+immediately. If the remote restarts, its new session immediately replaces
+the old one. `deploy/docker-compose.reverse.yml` is a reverse-mode testbed,
+and `mpbench --reverse` benchmarks this setup (performance matches normal
+mode).
+
 ### Docker
 
 ```sh
@@ -89,6 +120,7 @@ go test ./...
 | `mpquic local` | `ss-local` / `sslocal` | SOCKS5 server (CONNECT + UDP ASSOCIATE with `-u`) |
 | `mpquic tunnel -L host:port` | `ss-tunnel` | fixed-target TCP port forward |
 | `mpquic remote` | `ss-server` / `ssserver` | accepts paths, dials targets |
+| `mpquic local --reverse` / `remote --reverse` | – | same, but the local accepts the paths and the remote dials them |
 | `mpquic relay` | `socat UDP-LISTEN,fork UDP:…` | UDP forwarder, optional link emulation |
 
 Shadowsocks-compatible flags:
@@ -117,6 +149,7 @@ MPQUIC-specific flags (and config keys):
 | `--window` | `window` | `16MB` | per-stream reorder/flow-control window; must exceed aggregate rate × slowest RTT |
 | `--chunk` | `chunk_size` | `16KB` | scheduling unit |
 | `--stats N` | `stats_interval` | off | log per-path RTT/bandwidth/bytes every N s |
+| `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
 | `--cert/--key` | `cert`/`key` | self-signed | server TLS certificate (optional, see security notes) |
 | `--sni` | `sni` | `mpquic` | client TLS SNI |

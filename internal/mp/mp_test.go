@@ -108,7 +108,9 @@ func randBytes(n int) []byte {
 	return b
 }
 
-func echoRoundTrip(t *testing.T, cl *Client, data []byte) {
+type streamOpener interface{ OpenStream() (*Stream, error) }
+
+func echoRoundTrip(t *testing.T, cl streamOpener, data []byte) {
 	t.Helper()
 	st, err := cl.OpenStream()
 	if err != nil {
@@ -338,3 +340,67 @@ func TestECFDecision(t *testing.T) {
 		t.Fatal("high-bandwidth path denied although the thin path would take seconds")
 	}
 }
+
+// Reverse roles: the QUIC listener opens streams, the dialer accepts them.
+func TestReverseRoles(t *testing.T) {
+	log := testLogger()
+	srv, err := NewServer(&Options{Password: "pw", Logger: log, SingleSession: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	udp, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	go srv.Serve(udp)
+	defer srv.Close()
+	if _, err := srv.OpenStream(); err != ErrNoSession {
+		t.Fatalf("expected ErrNoSession, got %v", err)
+	}
+	var relays []*linkem.Relay
+	var addrs []string
+	for _, spec := range []string{"delay=5ms,rate=40mbit", "delay=15ms,rate=40mbit,loss=1%"} {
+		sp, _ := linkem.ParseSpec(spec)
+		r, _ := linkem.NewRelay("127.0.0.1:0", udp.LocalAddr().String(), sp, sp)
+		go r.Serve()
+		defer r.Close()
+		relays = append(relays, r)
+		addrs = append(addrs, r.Addr().String())
+	}
+	dial := func() *Client {
+		cl, err := NewClient(addrs, &Options{Password: "pw", Logger: log, StreamHandler: echoHandler})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cl
+	}
+	cl := dial()
+	waitActive := func(n int) *Session {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if s := srv.Session(); s != nil && s.ActivePaths() >= n {
+				return s
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("reverse paths did not come up")
+		return nil
+	}
+	first := waitActive(2)
+	opener := &serverOpener{srv}
+	echoRoundTrip(t, opener, randBytes(4<<20))
+	// The dialer (remote) restarts: its new session supersedes the old one.
+	cl.Close()
+	cl = dial()
+	defer cl.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.Session() == first && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitActive(2)
+	if srv.Session() == first {
+		t.Fatal("old session not superseded")
+	}
+	echoRoundTrip(t, opener, randBytes(1<<20))
+}
+
+type serverOpener struct{ s *Server }
+
+func (o *serverOpener) OpenStream() (*Stream, error) { return o.s.OpenStream() }

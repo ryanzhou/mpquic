@@ -42,6 +42,7 @@ var (
 	failFor   = flag.Duration("fail-for", 4*time.Second, "failover: outage duration")
 	streams   = flag.Int("streams", 1, "parallel streams in bulk tests")
 	ccName    = flag.String("cc", "", "congestion control (bbr, bbr-aggressive, bbr-conservative)")
+	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
 )
 
 func main() {
@@ -59,8 +60,20 @@ func main() {
 
 	target := startTarget()
 	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk, Congestion: *ccName}
-	srv, err := mp.NewServer(opt, proxy.RemoteHandler(log, 5*time.Second))
+	// The QUIC listener is the remote normally and the local in reverse mode;
+	// the relays always forward to the listener.
+	lopt, dopt := *opt, *opt
+	if *reverse {
+		lopt.SingleSession = true
+		dopt.StreamHandler = proxy.RemoteHandler(log, 5*time.Second)
+	} else {
+		lopt.StreamHandler = proxy.RemoteHandler(log, 5*time.Second)
+	}
+	srv, err := mp.NewServer(&lopt, nil)
 	check(err)
+	if *reverse {
+		fmt.Println("reverse mode: local listens, remote dials back via the relays")
+	}
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	check(err)
 	go srv.Serve(udp)
@@ -103,15 +116,30 @@ func main() {
 		for _, i := range run.idx {
 			addrs = append(addrs, relays[i].Addr().String())
 		}
-		cl, err := mp.NewClient(addrs, opt)
+		cl, err := mp.NewClient(addrs, &dopt)
 		check(err)
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		check(err)
-		loc := &proxy.Local{Client: cl, Log: log, Tunnel: target}
+		b := &bench{relays: relays, idx: run.idx}
+		var opener proxy.Opener = cl
+		b.local = cl.Session
+		b.remote = func() []mp.PathStat {
+			var out []mp.PathStat
+			for _, ss := range srv.Stats() {
+				out = append(out, ss...)
+			}
+			return out
+		}
+		if *reverse {
+			opener = srv
+			b.local = srv.Session
+			b.remote = cl.Session().Stats
+		}
+		loc := &proxy.Local{Client: opener, Log: log, Tunnel: target}
 		go loc.Serve(ln)
-		waitPaths(cl, len(addrs))
+		b.addr = ln.Addr().String()
+		waitPaths(b.local, len(addrs))
 		fmt.Printf("\n===== %s (%d path(s)) =====\n", run.name, len(addrs))
-		b := &bench{addr: ln.Addr().String(), cl: cl, relays: relays, idx: run.idx, srv: srv}
 		for _, t := range strings.Split(*tests, ",") {
 			switch strings.TrimSpace(t) {
 			case "latency":
@@ -149,11 +177,16 @@ func check(err error) {
 	}
 }
 
-func waitPaths(cl *mp.Client, n int) {
+func waitPaths(local func() *mp.Session, n int) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		up := 0
-		for _, s := range cl.Session().Stats() {
+		sess := local()
+		if sess == nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		for _, s := range sess.Stats() {
 			if s.State == "active" {
 				up++
 			}
@@ -250,18 +283,23 @@ func serveTarget(c net.Conn) {
 
 type bench struct {
 	addr   string
-	cl     *mp.Client
 	relays []*linkem.Relay
 	idx    []int
-	srv    *mp.Server
+	local  func() *mp.Session   // the local (SOCKS/tunnel) side's session
+	remote func() []mp.PathStat // the remote side's path stats
+}
+
+func (b *bench) localStats() []mp.PathStat {
+	if s := b.local(); s != nil {
+		return s.Stats()
+	}
+	return nil
 }
 
 func (b *bench) remoteStats() string {
 	var p []string
-	for _, ss := range b.srv.Stats() {
-		for _, s := range ss {
-			p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode))
-		}
+	for _, s := range b.remote() {
+		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode))
 	}
 	return strings.Join(p, "; ")
 }
@@ -412,7 +450,7 @@ func fmtSamples(s []float64) string {
 
 func (b *bench) pathShare() string {
 	var p []string
-	for _, s := range b.cl.Session().Stats() {
+	for _, s := range b.localStats() {
 		p = append(p, fmt.Sprintf("%s rtt=%v bw=%.0fM rx=%dMB", s.Name, s.SRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, s.RecvBytes>>20))
 	}
 	return strings.Join(p, "; ")
@@ -463,11 +501,10 @@ func (b *bench) failover() {
 	// take down the path with the lowest RTT
 	best := b.idx[0]
 	bestRTT := time.Hour
-	st := b.cl.Session().Stats()
-	for i, s := range st {
-		if s.SRTT < bestRTT && i < len(b.idx) {
+	for _, s := range b.localStats() {
+		if s.SRTT < bestRTT && s.Index < len(b.idx) {
 			bestRTT = s.SRTT
-			best = b.idx[i]
+			best = b.idx[s.Index]
 		}
 	}
 	var total atomic.Int64

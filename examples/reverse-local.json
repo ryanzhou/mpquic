@@ -1,0 +1,10 @@
+{
+  "reverse": true,
+  "server": "0.0.0.0",
+  "server_port": 8388,
+  "local_address": "127.0.0.1",
+  "local_port": 1080,
+  "password": "change-me-to-a-long-random-string",
+  "mode": "tcp_and_udp",
+  "timeout": 300
+}

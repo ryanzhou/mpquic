@@ -20,6 +20,31 @@ scheduler with two goals:
                  one session, N QUIC connections, M multipath streams
 ```
 
+## Roles and reverse mode
+
+Two roles are independent of each other:
+
+| | QUIC role | proxy role |
+|---|---|---|
+| normal `local` | dialer (`-s` = paths) | SOCKS5, opens streams |
+| normal `remote` | listener (`-s` = bind) | accepts streams, dials targets |
+| `local --reverse` | listener (`-s` = bind) | SOCKS5, opens streams |
+| `remote --reverse` | dialer (`-s` = paths: the local's address + relays) | accepts streams, dials targets |
+
+The session layer is symmetric. Scheduling, ACKs, redundancy and failure
+detection don't depend on the role, and a session accepts incoming streams
+iff it has a stream handler. Only the following depend on the QUIC role:
+
+* The **dialer** generates the session id. It re-dials failed paths and
+  checks the listener's session nonce: a changed nonce means the listener
+  lost its state, so the dialer resets its streams.
+* The **listener** groups paths by session id and expires sessions that
+  have had no paths for a while. In reverse mode (`SingleSession`), a new
+  session from the peer immediately closes older sessions without paths.
+  This way SOCKS connections that were in flight when the remote restarted
+  fail fast instead of hanging. New streams always open on the session
+  with the most active paths.
+
 ## Why one QUIC connection per path (and not one multipath-QUIC connection)
 
 Each path has its own QUIC connection, with its own TLS handshake, packet

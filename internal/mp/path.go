@@ -390,7 +390,7 @@ func (p *Path) tickLocked(now time.Time, active bool) bool {
 
 func (p *Path) statLocked() PathStat {
 	return PathStat{
-		Name: p.name, State: p.state.String(), SRTT: p.srtt, MinRTT: p.minRTT,
+		Name: p.name, Index: int(p.index), State: p.state.String(), SRTT: p.srtt, MinRTT: p.minRTT,
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost,
 	}
