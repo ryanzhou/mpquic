@@ -83,14 +83,23 @@ certificate by default). `server_nonce` identifies the server-side session
 incarnation. If it changes (server restart, or the session expired), the
 client resets its streams instead of waiting for data that no longer exists.
 
-The control stream then carries length-prefixed frames:
+The handshake also carries the protocol version (currently **2**; both ends
+must run the same version). Control frames are length-prefixed and travel as
+QUIC DATAGRAMs (falling back to the reliable control stream when a frame is
+too large or datagrams are unavailable). A reliable stream would put the
+liveness and acknowledgement signals behind every retransmission on a lossy
+path, which used to produce false "path suspect" events and late SACKs:
 
 | frame | contents | use |
 |---|---|---|
-| PING/PONG | seq | path liveness, sent every 200 ms while streams are active (1 s when idle) |
-| ACK | per stream: cumulative offset, window, ≤32 SACK ranges | data-level acknowledgement + flow control |
+| PING/PONG | seq | path liveness and ping-loss estimate; every 100 ms while streams are active (1 s when idle) |
+| ACK | per stream: cumulative offset, window, ≤200 SACK ranges (delta-encoded) | data-level acknowledgement + flow control; sent on the two best paths, re-sent every 30 ms while data is arriving |
+| PATHACK | path index, largest datagram seq, 256-bit bitmap | per-path receipt of data datagrams (loss detection on lossy paths) |
 | RESET | stream id, code | abort (dial failure, idle timeout, …) |
 | DGRAM | raw datagram | UDP payloads too large for a QUIC DATAGRAM frame |
+
+Every DATAGRAM payload starts with a type byte: 0 = proxied UDP, 1 = control
+frames, 2 = stream data (`dseq id off len|fin data`, see "Lossy paths").
 
 Stream data is carried in **unidirectional QUIC streams, one per (path,
 multipath-stream, direction)**:
@@ -129,9 +138,10 @@ outstanding. This gives end-to-end backpressure to the TCP socket.
 
 Chunks are inserted into a per-stream reorder buffer, de-duplicated by
 offset, and delivered in order. ACKs are coalesced for up to `AckDelay` (2 ms)
-and sent on the **two** lowest-latency paths, so a single lossy or dead path
-can't delay acknowledgements. Each ACK carries the cumulative point, the
-window and up to 32 SACK ranges.
+and sent as datagrams on the **two** lowest-latency paths, so a single lossy
+or dead path can't delay acknowledgements; they are refreshed every 30 ms
+while data is arriving, since a datagram can be lost. Each ACK carries the
+cumulative point, the window and up to 200 SACK ranges.
 
 ### Pull-based scheduling
 
@@ -167,9 +177,10 @@ decides what this path should send, in priority order:
 
    *Estimates.* `owd = min(SRTT, max(latest RTT, min RTT)) / 2`: it reacts
    immediately when a queue drains, and smoothly when one builds.
-   `rate = max(BBR bottleneck bandwidth, cwnd / (2·minRTT))`; the second term
-   keeps the estimate sane while BBR's own estimate is still
-   application-limited. `stall_q` charges a path whose writer has been blocked
+   `rate = max(BBR bottleneck bandwidth, cwnd / (2·minRTT))` while BBR is in
+   STARTUP or has no estimate; the second term keeps the estimate sane while
+   BBR's own estimate is still application-limited (capped at twice the
+   measured bandwidth once the path has carried a burst; see "Lossy paths"). `stall_q` charges a path whose writer has been blocked
    much longer than its rate implies, which happens with a silently dead path.
 
 3. **Opportunistic duplication (only on otherwise idle capacity).** An idle
@@ -190,7 +201,7 @@ decides what this path should send, in priority order:
    ms to 39 ms in the benchmarks.
 
    Duplicates and SACKs only ever *add* information; the receiver
-   de-duplicates. The receiver truncates its SACK list to 32 ranges, so chunks
+   de-duplicates. The receiver truncates its SACK list to 200 ranges, so chunks
    beyond the last reported range are treated as "unknown" rather than lost.
    This matters with high reordering, for example a 10 ms path plus a 300 ms
    path.
@@ -208,19 +219,82 @@ seconds. The scheduler therefore tells BBR exactly when a path's sender is
 idle (an app-limited hint), so samples from idle periods are ignored. This
 alone doubled post-idle throughput in one scenario (45 → 76 Mbit/s).
 
+### Lossy and misbehaving paths
+
+The rule is: **adding a path must never make the session worse than leaving
+it out** by more than a transient: like MPTCP after a link change, the
+session may take a moment to adapt, but it then settles at a state that is
+at least as good as without the path. No path is excluded by rule; a bad
+path is simply given only the work it can do without hurting the others.
+The mechanisms, roughly in the order data meets them:
+
+* **Loss estimate per path.** `loss = max(packet loss EWMA, ping loss /
+  2)`, where packet loss is counted by the congestion-controller wrapper
+  (quic-go only counts losses itself in its built-in controller). It drives chunk sizing (a chunk on a lossy path is small enough that
+  P(any of its packets lost) ≤ 25%), the expected loss-recovery delay that is
+  part of every delivery estimate (`lossDelay`), and the transport choice
+  below.
+* **No head-of-line blocking inside a path.** On paths with > 0.3% loss every
+  chunk gets its own QUIC stream, so one lost packet only delays that chunk.
+  At ≥ 8% loss (`MPQUIC_DGRAM_LOSS`) data is sent as unreliable DATAGRAMs
+  instead: one packet per chunk, no retransmission on the lossy path at all.
+  The receiver reports receipt per path (PATHACK); a datagram that is 3
+  sequence numbers and a reorder window behind a received one is lost and its
+  chunk is resent on the best *other* path straight away.
+* **Look-ahead placement.** A path slower than the fastest one doesn't take
+  data from the stream's front. It takes data from as far ahead as the other
+  paths will have delivered by the time its chunk arrives, pessimistically:
+  `ahead = R_total · (safe_p − est_front)`. `safe` is a path's delivery
+  estimate plus a margin: jitter, and on lossy paths the time to notice a
+  loss and resend on the best path; paths in BBR STARTUP (whose queue is
+  still growing) get one more RTT. The front is carried by the path with the
+  lowest `safe`, so a lossy path with a short RTT takes data from ahead too,
+  instead of leaving holes right at the front. Estimates include a decaying
+  record of recent queueing-delay spikes (`late`), so a relay whose
+  bandwidth collapses now and then is planned for pessimistically. The
+  inputs are smoothed so placement doesn't jitter with every RTT sample.
+  In-order delivery therefore doesn't wait for the slow path, even when one of
+  its chunks has to be rescued.
+* **Deadline rescue and RACK.** Every transmission records a pessimistic
+  arrival bound (re-evaluated with the path's current RTT, and allowing one
+  QUIC recovery round on stream sends). A chunk that the stream needs (a hole
+  at the receiver, or the front has been sent past it) and is past its bound
+  plus an ACK trip is resent on the best path that hasn't carried it. A chunk sent on a path, while a *later* chunk on the
+  same path has been acknowledged by more than a reorder window, is presumed
+  lost (RACK) when another path would beat QUIC's own retransmission.
+  Rescues are ranked by expected delivery plus a risk penalty, so a chunk
+  lost on one lossy path isn't sent over another lossy one when a clean path
+  is available. Rescues of chunks far ahead of the front wait until the
+  stream's unsent front has gone out (earliest deadline first).
+* **Insurance copies for small transfers.** A small chunk of a short or
+  interactive transfer placed on a lossy path is also queued for a copy on
+  the best other path (same token bucket as eager redundancy). Its latency is
+  then bounded by what the clean path alone would deliver.
+* **Honest rate of thin paths.** A path that only ever carried small
+  messages stays in BBR STARTUP with its initial window; once it has carried
+  a burst, it is rated at most twice its measured bandwidth instead of its
+  initial-window rate, so a 1 Mbit/s relay isn't mistaken for a fast one.
+* **BBR ProbeRTT.** BBR cuts a path's window to 4 packets for ~200 ms every
+  ~10 s. While another path can carry the traffic, a path in ProbeRTT takes
+  no new data and the chunk stuck in its sender is resent elsewhere. The ProbeRTT interval is jittered per path
+  (7.5–12.5 s), and the paths of a session take turns: a path doesn't enter
+  ProbeRTT while another one is in it.
+
 ### Path failure detection
 
-Each path is pinged every 200 ms while there are active streams. A path is
-**suspect** when its oldest ping has gone unanswered for
-`max(600 ms, 3·SRTT + 4·RTTVAR)`. A suspect path gets no new data, and every
-chunk whose only transmissions were on suspect or dead paths is queued for
-reinjection. Within a bulk transfer, overdue reinjection usually recovers
-even before suspicion: in the benchmarks a download stalled at most ~100–150
-ms when the best path was cut. A path that answers again becomes active. A
-path that stays suspect for 6 s is closed, and the local re-dials it with
-exponential backoff (0.5 → 5 s) using a new UDP socket, so a stale relay or
-NAT mapping is replaced. Relay restarts without loss of state are handled by
-QUIC connection migration.
+Pings travel as unreliable datagrams, every 100 ms while streams are active.
+A path is **suspect** when no ping has been answered for
+`max(600 ms, 3·SRTT + 4·RTTVAR)`, stretched by the measured ping loss so that
+a healthy lossy path is falsely suspected with probability < 10⁻⁴. A suspect
+path gets no new data, and every chunk whose only transmissions were on
+suspect or dead paths is queued for reinjection. Within a bulk transfer,
+deadline rescue usually recovers even before suspicion: in the benchmarks a
+download stalled at most ~100–150 ms when the best path was cut. A path that
+answers again becomes active. A path that stays
+suspect for 6 s is closed, and the local re-dials it with exponential backoff
+(0.5 → 5 s) using a new UDP socket, so a stale relay or NAT mapping is
+replaced. Relay restarts without loss of state are handled by QUIC connection
+migration.
 
 ## Differences from MPTCP
 
@@ -229,7 +303,8 @@ QUIC connection migration.
 | scheduler | min-RTT with free cwnd | N-path ECF water-filling per stream (latency for small flows, aggregation for bulk) |
 | HOL / tail | reinject + halve the slow subflow's cwnd | duplicate onto idle faster paths; no penalisation |
 | small flows on lossy best path | wait for retransmission | eager redundant copy on 2nd path |
-| path failure | RTO-driven, seconds | ping-based, ~0.6 s, plus overdue reinjection (~2 RTT) |
+| lossy / slow subflow | penalise, still head-of-line blocks | look-ahead placement, per-chunk streams or datagrams, deadline rescue |
+| path failure | RTO-driven, seconds | datagram pings, ~0.6 s, plus deadline rescue (~1 RTT) |
 | per-connection HOL | all data on a subflow is one byte stream | one QUIC stream per (path, connection) |
 | CC | coupled (LIA/OLIA) Reno | uncoupled BBR per path (relays are assumed to be independent bottlenecks) |
 | middleboxes | must pass TCP options | plain UDP; relays are stateless forwarders |

@@ -24,6 +24,9 @@ type Metrics struct {
 	MinRTT    time.Duration
 	Pacing    uint64 // bytes/s
 	Mode      string
+	// packets sent / declared lost so far (quic-go only counts losses
+	// itself when its built-in controller is used)
+	PacketsSent, PacketsLost uint64
 }
 
 // Meter wraps a BBR sender and publishes its state through atomics. All
@@ -40,6 +43,38 @@ type Meter struct {
 	mode     atomic.Value
 
 	appLimited atomic.Bool
+	probeGate  atomic.Pointer[ProbeGate]
+	sentPkts   atomic.Uint64
+	lostPkts   atomic.Uint64
+}
+
+// ProbeGate serialises BBR PROBE_RTT among the connections sharing it (the
+// paths of one session): while one path has cut its window to 4 packets, the
+// others keep carrying the traffic.
+type ProbeGate struct {
+	holder atomic.Pointer[Meter]
+}
+
+func (g *ProbeGate) enter(m *Meter) bool {
+	return g.holder.CompareAndSwap(nil, m) || g.holder.Load() == m
+}
+
+// Release frees the gate if m holds it (e.g. when m's path is closed).
+func (g *ProbeGate) Release(m *Meter) { g.holder.CompareAndSwap(m, nil) }
+
+// SetProbeGate makes m take part in g.
+func (m *Meter) SetProbeGate(g *ProbeGate) { m.probeGate.Store(g) }
+
+func (m *Meter) gate(enter bool) bool {
+	g := m.probeGate.Load()
+	if g == nil {
+		return true
+	}
+	if enter {
+		return g.enter(m)
+	}
+	g.Release(m)
+	return true
 }
 
 // SetAppLimited tells the controller whether the application currently has
@@ -83,6 +118,7 @@ func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
 	}
 	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, size, profile)}
 	m.s.AppLimitedHint = m.appLimited.Load
+	m.s.ProbeRTTGate = m.gate
 	conn.SetCongestionControl(m)
 	return m
 }
@@ -96,6 +132,9 @@ func (m *Meter) Snapshot() Metrics {
 		MinRTT:    time.Duration(m.minRTT.Load()),
 		Pacing:    m.pacing.Load(),
 		Mode:      m.modeName(),
+
+		PacketsSent: m.sentPkts.Load(),
+		PacketsLost: m.lostPkts.Load(),
 	}
 }
 
@@ -126,6 +165,7 @@ func (m *Meter) HasPacingBudget(now monotime.Time) bool             { return m.s
 func (m *Meter) OnPacketSent(t monotime.Time, inflight congestion.ByteCount, pn congestion.PacketNumber, n congestion.ByteCount, rtx bool) {
 	m.s.OnPacketSent(t, inflight, pn, n, rtx)
 	m.inflight.Store(uint64(inflight + n))
+	m.sentPkts.Add(1)
 }
 func (m *Meter) CanSend(b congestion.ByteCount) bool { return m.s.CanSend(b) }
 func (m *Meter) MaybeExitSlowStart()                 { m.s.MaybeExitSlowStart() }
@@ -143,6 +183,9 @@ func (m *Meter) OnCongestionEventEx(prior congestion.ByteCount, t monotime.Time,
 	}
 	for _, p := range lost {
 		l += p.BytesLost
+	}
+	if len(lost) > 0 {
+		m.lostPkts.Add(uint64(len(lost)))
 	}
 	if prior > a+l {
 		m.inflight.Store(uint64(prior - a - l))

@@ -201,6 +201,10 @@ type bbrSender struct {
 	minRtt time.Duration
 	// The time at which the current value of |min_rtt_| was assigned.
 	minRttTimestamp monotime.Time
+	// minRttExpiryJittered: mpquic randomizes the ProbeRTT interval per
+	// connection (7.5-12.5 s) so that the paths of a session, which start
+	// together, do not all enter PROBE_RTT at the same moment.
+	minRttExpiryJittered time.Duration
 
 	// The maximum allowed number of bytes in flight.
 	congestionWindow congestion.ByteCount
@@ -322,6 +326,11 @@ type bbrSender struct {
 	// app-limited detection exact instead of relying on the bytes-in-flight
 	// heuristic, which breaks down once the bandwidth estimate is tiny.
 	AppLimitedHint func() bool
+	// ProbeRTTGate, if set, is asked before entering PROBE_RTT (enter=true;
+	// false defers the probe to a later ACK) and told when PROBE_RTT ends
+	// (enter=false). mpquic uses it so that only one path of a session
+	// probes at a time.
+	ProbeRTTGate func(enter bool) bool
 }
 
 var _ congestion.CongestionControl = &bbrSender{}
@@ -749,7 +758,18 @@ func (b *bbrSender) probeRttCongestionWindow() congestion.ByteCount {
 
 func (b *bbrSender) maybeUpdateMinRtt(now monotime.Time, sampleMinRtt time.Duration) bool {
 	// Do not expire min_rtt if none was ever available.
-	minRttExpired := b.minRtt != 0 && now.After(b.minRttTimestamp.Add(minRttExpiry))
+	if b.minRttExpiryJittered == 0 {
+		b.minRttExpiryJittered = time.Duration(float64(minRttExpiry) * (0.75 + 0.5*rand.Float64()))
+	}
+	minRttExpired := b.minRtt != 0 && now.After(b.minRttTimestamp.Add(b.minRttExpiryJittered))
+	if minRttExpired && b.mode != bbrModeProbeRtt && b.ProbeRTTGate != nil && !b.ProbeRTTGate(true) {
+		minRttExpired = false // another path is probing; retry on a later ACK
+		if sampleMinRtt < b.minRtt {
+			b.minRtt = sampleMinRtt // fresh minimum: no probe needed
+			b.minRttTimestamp = now
+		}
+		return false
+	}
 	if minRttExpired || sampleMinRtt < b.minRtt || b.minRtt == 0 {
 		b.minRtt = sampleMinRtt
 		b.minRttTimestamp = now
@@ -923,6 +943,9 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, mi
 			}
 			if now.Sub(b.exitProbeRttAt) >= 0 && b.probeRttRoundPassed {
 				b.minRttTimestamp = now
+				if b.ProbeRTTGate != nil {
+					b.ProbeRTTGate(false)
+				}
 				if b.debug {
 					b.debugPrint("MinRTT: %s", b.getMinRtt())
 				}

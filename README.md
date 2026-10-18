@@ -222,6 +222,13 @@ scripts/bench-matrix.sh        # the scenarios in docs/BENCHMARKS.md
 MPQUIC_TRACE=1 mpbench ...     # log every scheduling decision
 ```
 
+## Upgrading
+
+The wire protocol has a version number that both ends check during the
+handshake. Version 2 sends the control plane (pings, ACKs) as QUIC datagrams
+and adds datagram-carried data on very lossy paths. Upgrade the local and the
+remote together: a version-1 peer is rejected.
+
 ## Security notes
 
 * The transport is QUIC with TLS 1.3. Both peers prove knowledge of the

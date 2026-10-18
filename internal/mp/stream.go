@@ -26,19 +26,23 @@ func (e *ResetError) Error() string {
 var ErrWriteClosed = errors.New("write on closed stream")
 
 type sendRec struct {
-	p  *Path
-	at time.Time
+	p      *Path
+	at     time.Time
+	dgram  bool      // sent as an unreliable datagram (no QUIC retransmission)
+	dueBy  time.Time // pessimistic expected arrival; later than that = rescue
+	failed bool      // the send did not happen (e.g. datagram too large)
 }
 
 // chunk is an immutable (once sent) piece of an mstream.
 type chunk struct {
-	st     *Stream
-	off    uint64
-	data   []byte
-	fin    bool
-	sends  []sendRec
-	acked  bool
-	queued bool // in the reinjection queue
+	st       *Stream
+	off      uint64
+	data     []byte
+	fin      bool
+	sends    []sendRec
+	acked    bool
+	queued   bool // in the reinjection queue
+	queuedAt time.Time
 }
 
 func (c *chunk) end() uint64 {
@@ -47,6 +51,29 @@ func (c *chunk) end() uint64 {
 		e++
 	}
 	return e
+}
+
+// markAcked records that c was received. If c was sent exactly once, the
+// receipt is attributed to that path: every chunk sent on the same path
+// noticeably earlier and still unacknowledged has then most likely been lost
+// (RACK-style loss detection, see expectedArrivalLocked).
+func (c *chunk) markAcked() {
+	if c.acked {
+		return
+	}
+	c.acked = true
+	if len(c.sends) == 1 {
+		r := c.sends[0]
+		if r.at.After(r.p.ackedSentMax) {
+			r.p.ackedSentMax = r.at
+		}
+	}
+}
+
+// neededLocked: in-order delivery is, or is about to be, waiting for c (it
+// is a hole at the receiver, or the stream's front has been sent past it).
+func (c *chunk) neededLocked() bool {
+	return c.end() <= c.st.sackHigh || c.off+uint64(len(c.data)) <= c.st.sq.frontOff()
 }
 
 func (c *chunk) sentOn(p *Path) bool {
@@ -65,9 +92,12 @@ type Stream struct {
 	sess *Session
 
 	// ---- send side (guarded by sess.mu) ----
-	sendBuf    []*chunk // unacked chunks in offset order
-	nextUnsent int      // index in sendBuf of first never-sent chunk
-	unsent     int64    // bytes in sendBuf[nextUnsent:]
+	sendBuf []*chunk // sent, unacknowledged chunks in offset order
+	// Unsent data is a byte queue; chunks are carved from it when a path
+	// picks it, sized for that path (small on lossy paths) and possibly from
+	// further ahead (slow paths, see lookaheadLocked).
+	sq         sendQueue
+	unsent     int64 // uncarved bytes (+1 for a pending FIN)
 	writeOff   uint64
 	ackedOff   uint64 // data bytes cumulatively acked
 	peerWindow uint64
@@ -77,13 +107,18 @@ type Stream struct {
 	// receiver truncates its range list); chunks above it may well have
 	// arrived and must not be presumed lost.
 	sackLimit uint64
+	// sackHigh: highest offset the peer has reported receiving; a chunk
+	// ending below it is a hole that blocks in-order delivery.
+	sackHigh  uint64
 	inRR      bool
 	inUnacked bool
 	sendCond  *sync.Cond
 
 	// ---- receive side ----
-	recvOff       uint64   // next expected offset (incl. FIN virtual byte)
-	ooo           []*chunk // out-of-order chunks, sorted by off, all > recvOff
+	recvOff       uint64            // next expected offset (incl. FIN virtual byte)
+	ooo           map[uint64]*chunk // out-of-order chunks by offset (all > recvOff)
+	oooRanges     []ackRange        // merged intervals covered by ooo, sorted
+	oooBytes      int64
 	ready         [][]byte
 	readyBytes    int64
 	consumed      uint64
@@ -97,15 +132,19 @@ type Stream struct {
 	recvFin    bool
 	recvCond   *sync.Cond
 
-	err        error
-	appClosed  bool
-	finalized  bool
-	lastActive time.Time
-	created    time.Time
+	err           error
+	appClosed     bool
+	finalized     bool
+	lastActive    time.Time
+	lastRecvAt    time.Time
+	lastDeliverAt time.Time
+	lastHOLLog    time.Time
+	created       time.Time
 }
 
 func newStream(s *Session, id uint64) *Stream {
 	st := &Stream{id: id, sess: s, peerWindow: initialPeerWindow, lastActive: time.Now(), created: time.Now(), sackLimit: ^uint64(0)}
+	st.ooo = make(map[uint64]*chunk)
 	st.sendCond = sync.NewCond(&s.mu)
 	st.recvCond = sync.NewCond(&s.mu)
 	st.recvWindow = min(uint64(initialPeerWindow), uint64(s.opt.Window))
@@ -135,35 +174,12 @@ func (st *Stream) Write(p []byte) (int, error) {
 			return n, ErrWriteClosed
 		}
 		room := st.sendLimit() - int64(st.writeOff-st.ackedOff)
-		sz := len(p)
-		if int64(sz) > room {
-			sz = int(room)
-		}
-		// Coalesce into the last chunk if it was never sent.
-		if l := len(st.sendBuf); l > st.nextUnsent {
-			last := st.sendBuf[l-1]
-			if len(last.sends) == 0 && !last.fin && len(last.data) < cs {
-				add := cs - len(last.data)
-				if add > sz {
-					add = sz
-				}
-				last.data = append(last.data, p[:add]...)
-				st.appendAccounting(add)
-				p = p[add:]
-				n += add
-				continue
-			}
-		}
-		if sz > cs {
-			sz = cs
-		}
-		buf := make([]byte, sz, cs)
-		copy(buf, p[:sz])
-		c := &chunk{st: st, off: st.writeOff, data: buf}
-		st.sendBuf = append(st.sendBuf, c)
-		st.appendAccounting(sz)
-		p = p[sz:]
-		n += sz
+		sz := min(int64(len(p)), room)
+		k := int(sz)
+		st.sq.push(p[:k], cs)
+		st.appendAccounting(k)
+		p = p[k:]
+		n += k
 	}
 	st.lastActive = time.Now()
 	s.wakeAll()
@@ -188,6 +204,44 @@ func (st *Stream) appendAccounting(n int) {
 	st.sess.enqueueRR(st)
 }
 
+// pendingData is the number of uncarved data bytes (excluding a pending FIN).
+func (st *Stream) pendingData() int64 { return st.sq.avail() }
+
+// insertSentLocked keeps sendBuf sorted by offset (carved-ahead chunks may
+// precede later front chunks).
+func (st *Stream) insertSentLocked(c *chunk) {
+	i := len(st.sendBuf)
+	for i > 0 && st.sendBuf[i-1].off > c.off {
+		i--
+	}
+	st.sendBuf = append(st.sendBuf, nil)
+	copy(st.sendBuf[i+1:], st.sendBuf[i:])
+	st.sendBuf[i] = c
+}
+
+// carveLocked carves up to n bytes from the front (plus FIN if it follows).
+func (st *Stream) carveLocked(n int) *chunk {
+	off, data, fin := st.sq.carveFront(n)
+	c := &chunk{st: st, off: off, data: data, fin: fin}
+	sz := int64(len(data))
+	if fin {
+		sz++
+	}
+	st.unsent -= sz
+	st.sess.backlog -= sz
+	st.insertSentLocked(c)
+	return c
+}
+
+// carveAheadLocked carves n bytes at off, ahead of the front.
+func (st *Stream) carveAheadLocked(off uint64, n int) *chunk {
+	c := &chunk{st: st, off: off, data: st.sq.carveAt(off, n)}
+	st.unsent -= int64(n)
+	st.sess.backlog -= int64(n)
+	st.insertSentLocked(c)
+	return c
+}
+
 // CloseWrite sends FIN after all queued data.
 func (st *Stream) CloseWrite() error {
 	s := st.sess
@@ -204,11 +258,7 @@ func (st *Stream) closeWriteLocked() error {
 		return nil
 	}
 	st.finQueued = true
-	if l := len(st.sendBuf); l > st.nextUnsent && len(st.sendBuf[l-1].sends) == 0 {
-		st.sendBuf[l-1].fin = true
-	} else {
-		st.sendBuf = append(st.sendBuf, &chunk{st: st, off: st.writeOff, fin: true})
-	}
+	st.sq.finPending = true
 	st.unsent++
 	st.sess.backlog++
 	st.sess.enqueueRR(st)
@@ -293,10 +343,12 @@ func (st *Stream) resetLocked(code uint64, notify bool) {
 		c.acked = true
 	}
 	st.sendBuf = nil
-	st.nextUnsent = 0
+	st.sq = sendQueue{}
 	st.ready = nil
 	st.readyBytes = 0
-	st.ooo = nil
+	st.ooo = make(map[uint64]*chunk)
+	st.oooRanges = nil
+	st.oooBytes = 0
 	if st.inUnacked {
 		delete(s.unacked, st)
 		st.inUnacked = false
@@ -320,15 +372,7 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 	popped := 0
 	for popped < len(st.sendBuf) && st.sendBuf[popped].end() <= cum {
 		c := st.sendBuf[popped]
-		c.acked = true
-		if popped >= st.nextUnsent { // acked before sent (ackAll)
-			n := int64(len(c.data))
-			if c.fin {
-				n++
-			}
-			st.unsent -= n
-			s.backlog -= n
-		}
+		c.markAcked()
 		st.ackedOff = c.off + uint64(len(c.data))
 		if c.fin {
 			st.finAcked = true
@@ -340,11 +384,21 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 			st.sendBuf[i] = nil
 		}
 		st.sendBuf = st.sendBuf[popped:]
-		st.nextUnsent -= popped
-		if st.nextUnsent < 0 {
-			st.nextUnsent = 0
-		}
 		st.sendCond.Broadcast()
+	}
+	if cum >= ackAll && st.unsent > 0 { // peer has everything / forgot the stream
+		s.backlog -= st.unsent
+		st.unsent = 0
+		if st.sq.finPending {
+			st.finAcked = true
+		}
+		st.sq = sendQueue{}
+	}
+	if cum < ackAll {
+		st.sackHigh = max(st.sackHigh, cum)
+		if n := len(e.ranges); n > 0 {
+			st.sackHigh = max(st.sackHigh, e.ranges[n-1].end)
+		}
 	}
 	if len(e.ranges) >= maxAckRanges {
 		st.sackLimit = e.ranges[len(e.ranges)-1].end
@@ -353,13 +407,13 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 	}
 	if len(e.ranges) > 0 {
 		ri := 0
-		for i := 0; i < st.nextUnsent && ri < len(e.ranges); i++ {
+		for i := 0; i < len(st.sendBuf) && ri < len(e.ranges); i++ {
 			c := st.sendBuf[i]
 			for ri < len(e.ranges) && e.ranges[ri].end < c.end() {
 				ri++
 			}
 			if ri < len(e.ranges) && c.off >= e.ranges[ri].start && c.end() <= e.ranges[ri].end {
-				c.acked = true
+				c.markAcked()
 			}
 		}
 	}
@@ -368,7 +422,7 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 		st.resetLocked(ResetGeneric, false)
 		return
 	}
-	if st.nextUnsent == 0 && st.inUnacked {
+	if len(st.sendBuf) == 0 && st.inUnacked {
 		delete(s.unacked, st)
 		st.inUnacked = false
 	}
@@ -382,6 +436,7 @@ func (st *Stream) onChunkLocked(off uint64, data []byte, fin bool) {
 		return
 	}
 	c := &chunk{off: off, data: data, fin: fin}
+	st.lastRecvAt = time.Now()
 	end := c.end()
 	s.markAckLocked(st)
 	if end <= st.recvOff {
@@ -393,31 +448,71 @@ func (st *Stream) onChunkLocked(off uint64, data []byte, fin bool) {
 	}
 	if c.off == st.recvOff {
 		st.deliverLocked(c)
-		for len(st.ooo) > 0 && st.ooo[0].off <= st.recvOff {
-			n := st.ooo[0]
-			st.ooo[0] = nil
-			st.ooo = st.ooo[1:]
-			if n.end() <= st.recvOff {
-				continue
+		for {
+			n := st.ooo[st.recvOff]
+			if n == nil {
+				break
 			}
-			if n.off < st.recvOff {
-				n.data = n.data[st.recvOff-n.off:]
-				n.off = st.recvOff
-			}
+			delete(st.ooo, n.off)
+			st.oooBytes -= int64(len(n.data))
 			st.deliverLocked(n)
 		}
+		st.trimRangesLocked()
 		return
 	}
-	i := sort.Search(len(st.ooo), func(i int) bool { return st.ooo[i].off >= c.off })
-	if i < len(st.ooo) && st.ooo[i].off == c.off {
+	if st.ooo[c.off] != nil {
 		return // duplicate
 	}
-	st.ooo = append(st.ooo, nil)
-	copy(st.ooo[i+1:], st.ooo[i:])
-	st.ooo[i] = c
+	st.ooo[c.off] = c
+	st.oooBytes += int64(len(c.data))
+	st.addRangeLocked(c.off, c.end())
+	// Reordering across paths pins part of the window behind holes. If the
+	// undeliverable data fills half the window, the window (not the
+	// consumer) is the bottleneck: grow it.
+	if w := st.sess.opt.Window; st.recvWindow < uint64(w) && uint64(st.oooBytes+st.readyBytes) > st.recvWindow/2 {
+		st.recvWindow = min(2*st.recvWindow, uint64(w))
+		st.sess.markAckLocked(st)
+	}
+}
+
+// addRangeLocked merges [start,end) into the sorted interval list oooRanges.
+func (st *Stream) addRangeLocked(start, end uint64) {
+	r := st.oooRanges
+	i := sort.Search(len(r), func(i int) bool { return r[i].end >= start })
+	if i == len(r) || r[i].start > end { // disjoint: insert
+		r = append(r, ackRange{})
+		copy(r[i+1:], r[i:])
+		r[i] = ackRange{start, end}
+		st.oooRanges = r
+		return
+	}
+	// overlaps or touches r[i]; extend and absorb following ranges
+	r[i].start = min(r[i].start, start)
+	r[i].end = max(r[i].end, end)
+	j := i + 1
+	for j < len(r) && r[j].start <= r[i].end {
+		r[i].end = max(r[i].end, r[j].end)
+		j++
+	}
+	st.oooRanges = append(r[:i+1], r[j:]...)
+}
+
+// trimRangesLocked drops interval data that has been delivered.
+func (st *Stream) trimRangesLocked() {
+	r := st.oooRanges
+	k := 0
+	for k < len(r) && r[k].end <= st.recvOff {
+		k++
+	}
+	r = r[k:]
+	if len(r) > 0 && r[0].start < st.recvOff {
+		r[0].start = st.recvOff
+	}
+	st.oooRanges = r
 }
 
 func (st *Stream) deliverLocked(c *chunk) {
+	st.lastDeliverAt = time.Now()
 	if len(c.data) > 0 {
 		if !st.appClosed {
 			st.ready = append(st.ready, c.data)
@@ -443,15 +538,9 @@ func (st *Stream) ackEntryLocked() ackEntry {
 		e.cum = ackAll
 	}
 	st.lastAdvWindow = e.window
-	for _, c := range st.ooo {
-		if n := len(e.ranges); n > 0 && e.ranges[n-1].end == c.off {
-			e.ranges[n-1].end = c.end()
-			continue
-		}
-		if len(e.ranges) >= maxAckRanges {
-			break
-		}
-		e.ranges = append(e.ranges, ackRange{c.off, c.end()})
+	if e.cum < ackAll {
+		n := min(len(st.oooRanges), maxAckRanges)
+		e.ranges = append([]ackRange(nil), st.oooRanges[:n]...)
 	}
 	return e
 }

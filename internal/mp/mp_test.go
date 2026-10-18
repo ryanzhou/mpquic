@@ -256,24 +256,24 @@ func TestWaterfill(t *testing.T) {
 	}
 	now := time.Now()
 	// one path: owd 10ms, 1MB/s -> 1MB drains at 1.01s
-	got := waterfill([]*Path{mk(20*time.Millisecond, 1<<20)}, 1<<20, now)
+	got := waterfill([]*Path{mk(20*time.Millisecond, 1<<20)}, 1<<20, 16<<10, now)
 	if got < 1.009 || got > 1.011 {
 		t.Fatalf("waterfill single = %v", got)
 	}
 	// two equal paths share the backlog
-	got = waterfill([]*Path{mk(20*time.Millisecond, 1<<20), mk(20*time.Millisecond, 1<<20)}, 1<<20, now)
+	got = waterfill([]*Path{mk(20*time.Millisecond, 1<<20), mk(20*time.Millisecond, 1<<20)}, 1<<20, 16<<10, now)
 	if got < 0.509 || got > 0.511 {
 		t.Fatalf("waterfill double = %v", got)
 	}
 	// a path that starts after the backlog is drained does not contribute
-	got = waterfill([]*Path{mk(20*time.Millisecond, 1<<20), mk(10*time.Second, 1<<20)}, 1<<20, now)
+	got = waterfill([]*Path{mk(20*time.Millisecond, 1<<20), mk(10*time.Second, 1<<20)}, 1<<20, 16<<10, now)
 	if got < 1.009 || got > 1.011 {
 		t.Fatalf("waterfill late path = %v", got)
 	}
 }
 
 func TestAckCodec(t *testing.T) {
-	in := []ackEntry{{id: 1, cum: 100, window: 5000}, {id: 1 << 40, cum: ackAll, window: 0, ranges: []ackRange{{200, 300}, {400, 1 << 33}}}}
+	in := []ackEntry{{id: 1, cum: 100, window: 5000}, {id: 1 << 40, cum: 150, window: 0, ranges: []ackRange{{200, 300}, {400, 1 << 33}}}, {id: 7, cum: ackAll}}
 	typ, body, err := readFrame(bufio.NewReader(bytes.NewReader(encodeAck(in))))
 	if err != nil || typ != frAck {
 		t.Fatal(err)
@@ -282,7 +282,7 @@ func TestAckCodec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 2 || out[1].id != in[1].id || out[1].cum != ackAll || len(out[1].ranges) != 2 || out[1].ranges[1].end != 1<<33 {
+	if len(out) != 3 || out[1].id != in[1].id || out[1].cum != 150 || len(out[1].ranges) != 2 || out[1].ranges[0] != (ackRange{200, 300}) || out[1].ranges[1].end != 1<<33 || out[2].cum != ackAll {
 		t.Fatalf("roundtrip mismatch: %+v", out)
 	}
 }
@@ -404,3 +404,43 @@ func TestReverseRoles(t *testing.T) {
 type serverOpener struct{ s *Server }
 
 func (o *serverOpener) OpenStream() (*Stream, error) { return o.s.OpenStream() }
+
+// A path that only ever carried small messages stays in BBR STARTUP with its
+// initial window; once it carried a burst, its rate must follow the measured
+// bandwidth rather than the (optimistic) window-based floor.
+func TestRateThinPathInStartup(t *testing.T) {
+	p := &Path{srtt: 20 * time.Millisecond, minRTT: 20 * time.Millisecond, cwnd: 32 * 1200, bw: 2 << 10, ccMode: "startup"} // bw from pings
+	floor := float64(p.cwnd) / (2 * p.minRTT.Seconds())
+	if got := p.rate(); got != floor {
+		t.Fatalf("fresh path: rate %.0f, want window floor %.0f", got, floor)
+	}
+	p.bw = 100 << 10 // 100 KB/s measured after a burst
+	p.burstSeen = true
+	if got := p.rate(); got > 2*float64(p.bw) {
+		t.Fatalf("thin path: rate %.0f exceeds 2x measured %d", got, p.bw)
+	}
+	p.ccMode = "probe_bw"
+	if got := p.rate(); got != float64(p.bw) {
+		t.Fatalf("probe_bw: rate %.0f, want %d", got, p.bw)
+	}
+}
+
+// A ProbeRTT path sits out only if another path can carry the traffic; the
+// last working path must never be benched.
+func TestBenchedNeedsAlternative(t *testing.T) {
+	s := &Session{}
+	a := &Path{sess: s, state: stateActive, ccMode: "probe_rtt"}
+	s.paths = []*Path{a}
+	if a.benchedLocked() {
+		t.Fatal("only path benched")
+	}
+	b := &Path{sess: s, state: stateActive, ccMode: "probe_rtt"}
+	s.paths = append(s.paths, b)
+	if a.benchedLocked() || b.benchedLocked() {
+		t.Fatal("benched although the alternative is itself probing")
+	}
+	b.ccMode = "probe_bw"
+	if !a.benchedLocked() || b.benchedLocked() {
+		t.Fatal("probing path not benched although a good one exists")
+	}
+}

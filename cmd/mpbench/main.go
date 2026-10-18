@@ -44,6 +44,7 @@ var (
 	streams   = flag.Int("streams", 1, "parallel streams in bulk tests")
 	ccName    = flag.String("cc", "", "congestion control (bbr, bbr-aggressive, bbr-conservative)")
 	cpuprof   = flag.String("cpuprofile", "", "write a CPU profile")
+	subset    = flag.String("subset", "", "also run with only these path indexes (e.g. 0,1) as a baseline")
 	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
 )
 
@@ -114,6 +115,15 @@ func main() {
 		all[i] = i
 	}
 	runs = append(runs, cfgRun{"multipath", all})
+	if *subset != "" {
+		var idx []int
+		for _, f := range strings.Split(*subset, ",") {
+			var i int
+			fmt.Sscan(strings.TrimSpace(f), &i)
+			idx = append(idx, i)
+		}
+		runs = append(runs, cfgRun{"subset" + strings.ReplaceAll(*subset, ",", "+"), idx})
+	}
 	if *single && len(relays) > 1 {
 		for i := range relays {
 			runs = append(runs, cfgRun{fmt.Sprintf("path%d-only", i), []int{i}})
@@ -414,12 +424,29 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 	base := counter.Load()
 	start := time.Now()
 	var samples []float64
-	last := base
-	for time.Since(start) < dur {
-		time.Sleep(500 * time.Millisecond)
+	var fine []float64 // 100 ms buckets after the 2 s warm-up, for jitter
+	last, lastFine := base, base
+	var maxStall time.Duration
+	lastProgress := time.Now()
+	progressAt := base
+	for i := 1; time.Since(start) < dur; i++ {
+		time.Sleep(10 * time.Millisecond)
 		cur := counter.Load()
-		samples = append(samples, mbps(cur-last, 500*time.Millisecond))
-		last = cur
+		if cur != progressAt {
+			progressAt, lastProgress = cur, time.Now()
+		} else if g := time.Since(lastProgress); g > maxStall && time.Since(start) > 2*time.Second {
+			maxStall = g
+		}
+		if i%10 == 0 {
+			if time.Since(start) > 2*time.Second {
+				fine = append(fine, mbps(cur-lastFine, 100*time.Millisecond))
+			}
+			lastFine = cur
+		}
+		if i%50 == 0 {
+			samples = append(samples, mbps(cur-last, 500*time.Millisecond))
+			last = cur
+		}
 	}
 	got := counter.Load() - base
 	el := time.Since(start)
@@ -443,6 +470,14 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		name = "upload"
 	}
 	fmt.Printf("bulk     %s x%d: avg=%.1f Mbit/s steady=%.1f Mbit/s  [%s]\n", name, n, mbps(got, el), ss, b.pathShare())
+	if len(fine) > 0 && os.Getenv("MPBENCH_FINE") != "" {
+		fmt.Printf("         100ms: %s\n", fmtSamples(fine))
+	}
+	if len(fine) > 0 {
+		sort.Float64s(fine)
+		fmt.Printf("jitter   %s per-100ms: p10=%.1f p50=%.1f min=%.1f Mbit/s, longest stall=%v\n", name,
+			fine[len(fine)/10], fine[len(fine)/2], fine[0], maxStall.Round(time.Millisecond))
+	}
 	if *verbose {
 		fmt.Printf("         timeline: %s\n", fmtSamples(samples))
 	}

@@ -13,12 +13,16 @@ import (
 	"sync"
 	"time"
 
+	"mpquic/internal/cc"
+
 	"github.com/apernet/quic-go"
 )
 
 var errSessionClosed = errors.New("session closed")
 
 var debugWindows = os.Getenv("MPQUIC_DEBUG_WINDOWS") != ""
+
+const holDebugThreshold = 50 * time.Millisecond
 
 // Session groups all paths between one local and one remote instance and
 // multiplexes streams across them.
@@ -43,6 +47,7 @@ type Session struct {
 	rrIdx     int
 	unacked   map[*Stream]struct{}
 	reinjectQ []*chunk
+	probeGate cc.ProbeGate // one path at a time in BBR PROBE_RTT
 	backlog   int64
 	ackDirty  map[*Stream]struct{}
 	ackAllIDs []uint64
@@ -59,6 +64,7 @@ type Session struct {
 	eagerLast   time.Time
 
 	lastSlowTick  time.Time
+	lastReAck     time.Time
 	lastStatsTick time.Time
 }
 
@@ -173,6 +179,9 @@ func (s *Session) removePath(p *Path, err error) {
 		return
 	}
 	p.state = stateDead
+	if p.meter != nil {
+		s.probeGate.Release(p.meter)
+	}
 	for i, q := range s.paths {
 		if q == p {
 			s.paths = append(s.paths[:i], s.paths[i+1:]...)
@@ -182,6 +191,7 @@ func (s *Session) removePath(p *Path, err error) {
 	if len(s.paths) == 0 {
 		s.noPathAt = time.Now()
 	}
+	s.updateBenchedLocked()
 	s.requeueLocked(time.Now())
 	s.wakeAllLocked()
 	s.log.Info("path down", "path", p.name, "err", errString(err), "count", s.activeCountLocked())
@@ -217,6 +227,20 @@ func (s *Session) activeCountLocked() int {
 }
 
 func (s *Session) wakeAll() { s.wakeAllLocked() }
+
+// updateBenchedLocked recomputes which paths sit out (see Path.benchedLocked).
+func (s *Session) updateBenchedLocked() {
+	changed := false
+	for _, p := range s.paths {
+		if b := p.benchedLocked(); b != p.benched {
+			p.benched = b
+			changed = true
+		}
+	}
+	if changed {
+		s.wakeAllLocked()
+	}
+}
 
 func (s *Session) wakeAllLocked() {
 	for _, p := range s.paths {
@@ -262,6 +286,26 @@ func (s *Session) bestPathsLocked(n int) []*Path {
 	return act
 }
 
+// ackPathsLocked picks the paths that carry ACKs: the two with the lowest
+// expected delivery time of a small datagram (accounting for loss).
+func (s *Session) ackPathsLocked() []*Path {
+	now := time.Now()
+	var act []*Path
+	for _, p := range s.paths {
+		if p.usable() {
+			act = append(act, p)
+		}
+	}
+	if len(act) == 0 {
+		return s.bestPathsLocked(2)
+	}
+	sort.Slice(act, func(i, j int) bool { return act[i].est(64, now) < act[j].est(64, now) })
+	if len(act) > 2 {
+		act = act[:2]
+	}
+	return act
+}
+
 func (s *Session) sendCtrlBest(b []byte, n int) {
 	for _, p := range s.bestPathsLocked(n) {
 		p.sendCtrl(b)
@@ -289,6 +333,18 @@ func (s *Session) maybeFinalizeLocked(st *Stream) {
 		default:
 		}
 	}
+}
+
+// onDgramChunk handles a data chunk received as a datagram.
+func (s *Session) onDgramChunk(p *Path, dseq, id, off uint64, data []byte, fin bool) {
+	s.mu.Lock()
+	p.rxMarkLocked(dseq, time.Now())
+	select {
+	case s.ackSig <- struct{}{}:
+	default:
+	}
+	s.mu.Unlock()
+	s.onChunk(p, id, off, data, fin)
 }
 
 // onChunk is called by path readers for every received data chunk.
@@ -325,7 +381,7 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 		if err != nil {
 			return err
 		}
-		p.sendCtrl(encodeU64s(frPong, v[0]))
+		p.sendDgram(append([]byte{dgCtrl}, encodeU64s(frPong, v[0])...))
 		s.mu.Lock()
 		p.lastRecv = time.Now()
 		s.mu.Unlock()
@@ -365,6 +421,24 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 		s.mu.Unlock()
 	case frDgram:
 		s.deliverDatagram(body)
+	case frPathAck:
+		r := &byteReader{b: body}
+		idx, err := r.varint()
+		if err != nil {
+			return err
+		}
+		largest, err := r.varint()
+		if err != nil || len(body)-r.i < pathAckBits/8 {
+			return errors.New("bad pathack")
+		}
+		bm := body[r.i : r.i+pathAckBits/8]
+		s.mu.Lock()
+		for _, q := range s.paths {
+			if q.index == idx && q.state != stateDead {
+				s.onPathAckLocked(q, largest, bm, time.Now())
+			}
+		}
+		s.mu.Unlock()
 	default:
 		// unknown frames are ignored for forward compatibility
 	}
@@ -396,23 +470,33 @@ func (s *Session) ackLoop() {
 			entries = append(entries, ackEntry{id: id, cum: ackAll})
 		}
 		s.ackAllIDs = s.ackAllIDs[:0]
-		paths := s.bestPathsLocked(2)
-		s.mu.Unlock()
-		for len(entries) > 0 {
-			n := len(entries)
-			if n > 128 {
-				n = 128
+		var pathAcks [][]byte
+		for _, p := range s.paths {
+			if p.rxDirty {
+				p.rxDirty = false
+				pathAcks = append(pathAcks, append([]byte{dgCtrl}, p.pathAckFrameLocked()...))
 			}
-			f := encodeAck(entries[:n])
-			entries = entries[n:]
+		}
+		paths := s.ackPathsLocked()
+		s.mu.Unlock()
+		for _, d := range pathAcks {
 			for _, p := range paths {
-				p.sendCtrl(f)
+				p.sendDgram(d)
+			}
+		}
+		// ACKs are unreliable datagrams (no head-of-line blocking behind lost
+		// packets), sent redundantly on two paths and refreshed periodically.
+		for _, d := range encodeAckDatagrams(entries) {
+			for _, p := range paths {
+				p.sendDgram(d)
 			}
 		}
 	}
 }
 
 const tickInterval = 10 * time.Millisecond
+
+const reAckInterval = 30 * time.Millisecond
 
 func (s *Session) tickLoop() {
 	t := time.NewTimer(tickInterval)
@@ -443,9 +527,37 @@ func (s *Session) tick(now time.Time) bool {
 	active := len(s.streams) > 0
 	changed := false
 	for _, p := range s.paths {
+		prevMode := p.ccMode
 		p.refreshStatsLocked()
+		if debugWindows && p.ccMode != prevMode {
+			fmt.Fprintf(os.Stderr, "%s CCMODE %s %s -> %s\n", now.Format("15:04:05.000"), p.name, prevMode, p.ccMode)
+		}
 		if p.tickLocked(now, active) {
 			changed = true
+		}
+	}
+	s.updateBenchedLocked()
+	if debugWindows {
+		for _, st := range s.streams {
+			if len(st.oooRanges) > 0 && now.Sub(st.lastDeliverAt) > holDebugThreshold && now.Sub(st.lastHOLLog) > 100*time.Millisecond {
+				st.lastHOLLog = now
+				fmt.Fprintf(os.Stderr, "%s HOL st=%d missing off=%d (next ooo off=%d) for %v\n", now.Format("15:04:05.000"), st.id, st.recvOff, st.oooRanges[0].start, now.Sub(st.lastDeliverAt).Round(time.Millisecond))
+			}
+		}
+	}
+	if now.Sub(s.lastReAck) >= reAckInterval {
+		// Refresh ACKs of streams that recently received data: ACK datagrams
+		// may be lost, and the sender's reinjection relies on timely SACKs.
+		s.lastReAck = now
+		for _, st := range s.streams {
+			if len(st.ooo) > 0 || now.Sub(st.lastRecvAt) < 500*time.Millisecond {
+				s.markAckLocked(st)
+			}
+		}
+		for _, p := range s.paths {
+			if now.Sub(p.rxAt) < 500*time.Millisecond {
+				p.rxDirty = true
+			}
 		}
 	}
 	if s.reinjectOverdueLocked(now) {
@@ -493,7 +605,7 @@ func (s *Session) SendDatagram(b []byte) error {
 		return errors.New("no path available")
 	}
 	p := paths[0]
-	err := p.conn.SendDatagram(b)
+	err := p.conn.SendDatagram(append([]byte{dgUDP}, b...))
 	if err == nil {
 		return nil
 	}
@@ -528,6 +640,7 @@ type PathStat struct {
 	SentBytes uint64
 	RecvBytes uint64
 	LostBytes uint64
+	Loss      float64 // estimated packet loss rate
 }
 
 // Stats returns per-path statistics.
