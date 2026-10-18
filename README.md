@@ -24,7 +24,9 @@ QUIC/TLS 1.3, and peers authenticate each other with the shared password.
 ```
 
 Read [docs/DESIGN.md](docs/DESIGN.md) for the protocol and the scheduling
-algorithm, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for measurements.
+algorithm, [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for multipath measurements,
+and [docs/CONGESTION.md](docs/CONGESTION.md) for single-stream / congestion
+control results (for example, reachable throughput at 150 ms RTT).
 
 ## Quick start
 
@@ -145,8 +147,8 @@ MPQUIC-specific flags (and config keys):
 
 | flag | config key | default | |
 |---|---|---|---|
-| `--congestion` | `congestion` | `bbr` | `bbr`, `bbr-aggressive`, `bbr-conservative` |
-| `--window` | `window` | `16MB` | per-stream reorder/flow-control window; must exceed aggregate rate × slowest RTT |
+| `--congestion` | `congestion` | `bbr` | `bbr`, `bbr-aggressive`, `bbr-conservative`, `cubic` (quic-go built-in, for comparison) |
+| `--window` | `window` | `64MB` | maximum per-stream window (auto-tuned from 4 MB); one stream's rate ≤ window / slowest RTT |
 | `--chunk` | `chunk_size` | `16KB` | scheduling unit |
 | `--stats N` | `stats_interval` | off | log per-path RTT/bandwidth/bytes every N s |
 | `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |

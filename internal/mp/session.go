@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 )
 
 var errSessionClosed = errors.New("session closed")
+
+var debugWindows = os.Getenv("MPQUIC_DEBUG_WINDOWS") != ""
 
 // Session groups all paths between one local and one remote instance and
 // multiplexes streams across them.
@@ -189,6 +192,18 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// maxRTTLocked is the largest scheduling RTT among usable paths (the span
+// over which data of one stream can be in flight / reordered).
+func (s *Session) maxRTTLocked() time.Duration {
+	r := 50 * time.Millisecond
+	for _, p := range s.paths {
+		if p.state == stateActive {
+			r = max(r, p.srttOrDefault())
+		}
+	}
+	return r
 }
 
 func (s *Session) activeCountLocked() int {
@@ -442,6 +457,12 @@ func (s *Session) tick(now time.Time) bool {
 	}
 	if now.Sub(s.lastSlowTick) >= time.Second {
 		s.lastSlowTick = now
+		if debugWindows {
+			for _, st := range s.streams {
+				fmt.Fprintf(os.Stderr, "WIN dialer=%v st=%d recvWin=%dMB inflightSpan=%dMB peerWin-acked=%dMB unsent=%dMB ooo=%d ready=%dKB\n",
+					s.dialer, st.id, st.recvWindow>>20, (st.writeOff-st.ackedOff)>>20, (st.peerWindow-st.ackedOff)>>20, st.unsent>>20, len(st.ooo), st.readyBytes>>10)
+			}
+		}
 		for _, st := range s.streams {
 			if now.Sub(st.lastActive) > s.opt.IdleTimeout {
 				st.resetLocked(ResetIdleTimeout, true)

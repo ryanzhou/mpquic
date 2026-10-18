@@ -59,16 +59,20 @@ type Path struct {
 	bw, cwnd     uint64
 	pacing       uint64
 	ccMode       string
-	lost         uint64
-	busy         bool
-	busySince    time.Time
-	busyLen      int
-	pings        []pingRec
-	pingSeq      uint64
-	lastPing     time.Time
-	lastPong     time.Time
-	lastRecv     time.Time
-	closeIDs     []uint64
+	// measured send rate (fallback when the controller exposes no estimate)
+	measRate  float64
+	measAt    time.Time
+	measBytes uint64
+	lost      uint64
+	busy      bool
+	busySince time.Time
+	busyLen   int
+	pings     []pingRec
+	pingSeq   uint64
+	lastPing  time.Time
+	lastPong  time.Time
+	lastRecv  time.Time
+	closeIDs  []uint64
 
 	sentBytes atomic.Uint64
 	recvBytes atomic.Uint64
@@ -268,6 +272,14 @@ func (p *Path) refreshStatsLocked() {
 	p.minRTT = st.MinRTT
 	p.latestRTT = st.LatestRTT
 	p.lost = st.BytesLost
+	if now := time.Now(); now.Sub(p.measAt) >= 100*time.Millisecond {
+		b := p.sentBytes.Load()
+		if !p.measAt.IsZero() {
+			inst := float64(b-p.measBytes) / now.Sub(p.measAt).Seconds()
+			p.measRate = max(inst, p.measRate*0.95)
+		}
+		p.measAt, p.measBytes = now, b
+	}
 	if p.meter != nil {
 		m := p.meter.Snapshot()
 		p.bw = m.Bandwidth
@@ -309,6 +321,10 @@ func (p *Path) rate() float64 {
 	}
 	if c := float64(p.cwnd) / (2 * mr.Seconds()); c > r {
 		r = c
+	}
+	if p.meter == nil && p.bw == 0 {
+		// controller without a bandwidth estimate (cubic): measured rate
+		r = max(p.measRate, float64(32*1200)/mr.Seconds())
 	}
 	if r < 16<<10 {
 		r = 16 << 10

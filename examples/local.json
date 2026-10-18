@@ -13,6 +13,6 @@
   "timeout": 300,
 
   "congestion": "bbr",
-  "window": "16MB",
+  "window": "64MB",
   "stats_interval": 60
 }

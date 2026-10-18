@@ -105,8 +105,8 @@ Common options (shadowsocks-compatible):
                     (-s = the local's address and relays forwarding to it)
 
 mpquic options:
-  --congestion CC   bbr (default), bbr-aggressive, bbr-conservative
-  --window SIZE     per-stream window / reorder buffer (default 16MB)
+  --congestion CC   bbr (default), bbr-aggressive, bbr-conservative, cubic
+  --window SIZE     max per-stream window, auto-tuned from 4MB (default 64MB)
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths

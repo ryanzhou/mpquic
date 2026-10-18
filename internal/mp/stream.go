@@ -88,8 +88,14 @@ type Stream struct {
 	readyBytes    int64
 	consumed      uint64
 	lastAdvWindow uint64
-	recvFin       bool
-	recvCond      *sync.Cond
+	// receive-window auto-tuning (like QUIC flow control): recvWindow starts
+	// at initialPeerWindow (8 MB) and doubles, up to Options.Window, whenever a full
+	// window is consumed within a few RTTs (i.e. the window is the bottleneck).
+	recvWindow uint64
+	epochStart uint64
+	epochTime  time.Time
+	recvFin    bool
+	recvCond   *sync.Cond
 
 	err        error
 	appClosed  bool
@@ -102,7 +108,9 @@ func newStream(s *Session, id uint64) *Stream {
 	st := &Stream{id: id, sess: s, peerWindow: initialPeerWindow, lastActive: time.Now(), created: time.Now(), sackLimit: ^uint64(0)}
 	st.sendCond = sync.NewCond(&s.mu)
 	st.recvCond = sync.NewCond(&s.mu)
-	st.lastAdvWindow = uint64(s.opt.Window)
+	st.recvWindow = min(uint64(initialPeerWindow), uint64(s.opt.Window))
+	st.lastAdvWindow = st.recvWindow
+	st.epochTime = st.created
 	return st
 }
 
@@ -117,7 +125,7 @@ func (st *Stream) Write(p []byte) (int, error) {
 	n := 0
 	cs := s.opt.ChunkSize
 	for len(p) > 0 {
-		for st.err == nil && !st.finQueued && int64(st.writeOff-st.ackedOff) >= s.opt.Window {
+		for st.err == nil && !st.finQueued && int64(st.writeOff-st.ackedOff) >= st.sendLimit() {
 			st.sendCond.Wait()
 		}
 		if st.err != nil {
@@ -126,7 +134,7 @@ func (st *Stream) Write(p []byte) (int, error) {
 		if st.finQueued {
 			return n, ErrWriteClosed
 		}
-		room := s.opt.Window - int64(st.writeOff-st.ackedOff)
+		room := st.sendLimit() - int64(st.writeOff-st.ackedOff)
 		sz := len(p)
 		if int64(sz) > room {
 			sz = int(room)
@@ -160,6 +168,17 @@ func (st *Stream) Write(p []byte) (int, error) {
 	st.lastActive = time.Now()
 	s.wakeAll()
 	return n, nil
+}
+
+// sendLimit bounds unacknowledged + unsent data: what the peer currently
+// allows (at least the initial window), capped by Options.Window. This keeps
+// a slow consumer from making us buffer a large window locally.
+func (st *Stream) sendLimit() int64 {
+	l := int64(initialPeerWindow)
+	if st.peerWindow > st.ackedOff {
+		l = max(l, int64(st.peerWindow-st.ackedOff))
+	}
+	return min(l, st.sess.opt.Window)
 }
 
 func (st *Stream) appendAccounting(n int) {
@@ -224,8 +243,15 @@ func (st *Stream) Read(p []byte) (int, error) {
 	}
 	st.readyBytes -= int64(n)
 	st.consumed += uint64(n)
-	st.lastActive = time.Now()
-	if st.consumed+uint64(s.opt.Window)-st.lastAdvWindow >= uint64(s.opt.Window)/4 {
+	now := time.Now()
+	st.lastActive = now
+	if st.consumed-st.epochStart >= st.recvWindow {
+		if st.recvWindow < uint64(s.opt.Window) && now.Sub(st.epochTime) < 4*s.maxRTTLocked() {
+			st.recvWindow = min(2*st.recvWindow, uint64(s.opt.Window))
+		}
+		st.epochStart, st.epochTime = st.consumed, now
+	}
+	if st.consumed+st.recvWindow-st.lastAdvWindow >= st.recvWindow/4 {
 		s.markAckLocked(st)
 	}
 	return n, nil
@@ -288,6 +314,7 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 	s := st.sess
 	if e.window > st.peerWindow {
 		st.peerWindow = e.window
+		st.sendCond.Broadcast()
 	}
 	cum := e.cum
 	popped := 0
@@ -411,7 +438,7 @@ func (st *Stream) deliverLocked(c *chunk) {
 }
 
 func (st *Stream) ackEntryLocked() ackEntry {
-	e := ackEntry{id: st.id, cum: st.recvOff, window: st.consumed + uint64(st.sess.opt.Window)}
+	e := ackEntry{id: st.id, cum: st.recvOff, window: st.consumed + st.recvWindow}
 	if st.err != nil || st.finalized {
 		e.cum = ackAll
 	}

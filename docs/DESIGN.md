@@ -240,12 +240,17 @@ a bottleneck, they will together take more than one flow's fair share there.
 
 ## Tuning
 
-* `window` (default 16 MB) must exceed (aggregate rate) × (slowest path RTT,
-  including its queue). With 8 MB on a 5 ms + 150 ms × 100 Mbit/s pair,
-  throughput oscillated. 16 MB and above reached ~95% of capacity.
+* `window` (default 64 MB) is the *maximum* per-stream window. Each stream
+  starts at 4 MB and doubles whenever a full window is consumed within 4× the
+  slowest path's RTT, i.e. when the window is what limits the stream. The
+  sender buffers no more than the peer currently allows, so a slow consumer
+  keeps its window, and the memory it pins, small. A stream's rate is
+  bounded by window / (slowest path RTT including queueing): 64 MB is
+  ~1.3 Gbit/s at 150 ms (see docs/CONGESTION.md).
 * `chunk_size` (16 KB) is the scheduling granularity.
 * `congestion`: `bbr` (default), `bbr-aggressive` (faster startup),
-  `bbr-conservative` (less queueing).
+  `bbr-conservative` (less queueing), `cubic` (quic-go's built-in loss-based
+  controller, for comparison only: it collapses under random loss).
 * `no_dup`: disables duplication if the relay traffic is metered.
 
 ## Limitations / future work

@@ -8,9 +8,10 @@ import (
 // Options configure both ends of a multipath session.
 type Options struct {
 	Password string
-	// Window is the per-stream flow-control / reorder window in bytes. It must
-	// exceed the aggregate bandwidth-delay product of all paths plus the
-	// delay skew between the fastest and slowest path.
+	// Window is the maximum per-stream flow-control / reorder window in
+	// bytes. Each stream starts at 8 MB and auto-tunes up to Window when the
+	// window limits throughput. A single stream's rate is bounded by about
+	// Window / (slowest path RTT).
 	Window int64
 	// ChunkSize is the maximum scheduling unit (bytes). Smaller chunks give
 	// finer-grained scheduling at the cost of per-chunk overhead.
@@ -59,7 +60,7 @@ type Options struct {
 func (o *Options) withDefaults() *Options {
 	c := *o
 	if c.Window <= 0 {
-		c.Window = 16 << 20
+		c.Window = 64 << 20
 	}
 	if c.Window < 256<<10 {
 		c.Window = 256 << 10
@@ -101,4 +102,4 @@ func (o *Options) withDefaults() *Options {
 }
 
 // initialPeerWindow is the window assumed before the first ACK arrives.
-const initialPeerWindow = 4 << 20
+const initialPeerWindow = 8 << 20

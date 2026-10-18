@@ -62,12 +62,21 @@ func ParseProfile(s string) (bbr.Profile, error) {
 		return bbr.ProfileAggressive, nil
 	case "bbr-conservative", "conservative":
 		return bbr.ProfileConservative, nil
+	case "cubic", "reno", "newreno":
+		return ProfileCubic, nil
 	}
-	return "", fmt.Errorf("unsupported congestion control %q (want bbr, bbr-aggressive, bbr-conservative)", s)
+	return "", fmt.Errorf("unsupported congestion control %q (want bbr, bbr-aggressive, bbr-conservative, cubic)", s)
 }
 
+// ProfileCubic keeps quic-go's built-in CUBIC controller (for comparison).
+const ProfileCubic bbr.Profile = "cubic"
+
 // Install replaces the connection's congestion controller with a metered BBR.
+// It returns nil (keeping quic-go's built-in CUBIC) for ProfileCubic.
 func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
+	if profile == ProfileCubic {
+		return nil
+	}
 	size := conn.InitialPacketSize()
 	if g := bbr.GetInitialPacketSize(conn.RemoteAddr()); g < size {
 		size = g

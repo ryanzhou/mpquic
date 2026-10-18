@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -42,12 +43,19 @@ var (
 	failFor   = flag.Duration("fail-for", 4*time.Second, "failover: outage duration")
 	streams   = flag.Int("streams", 1, "parallel streams in bulk tests")
 	ccName    = flag.String("cc", "", "congestion control (bbr, bbr-aggressive, bbr-conservative)")
+	cpuprof   = flag.String("cpuprofile", "", "write a CPU profile")
 	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
 )
 
 func main() {
 	flag.Var(&paths, "path", "link spec of one path (both directions); 'fwd|rev' for asymmetric")
 	flag.Parse()
+	if *cpuprof != "" {
+		f, err := os.Create(*cpuprof)
+		check(err)
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	if len(paths) == 0 {
 		paths = multi{"delay=10ms,rate=40mbit", "delay=30ms,rate=40mbit"}
 	}
@@ -299,7 +307,7 @@ func (b *bench) localStats() []mp.PathStat {
 func (b *bench) remoteStats() string {
 	var p []string
 	for _, s := range b.remote() {
-		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode))
+		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s sent=%dMB lost=%dMB", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode, s.SentBytes>>20, s.LostBytes>>20))
 	}
 	return strings.Join(p, "; ")
 }
