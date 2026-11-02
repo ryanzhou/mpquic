@@ -8,7 +8,11 @@ permissions:
   contents: write
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   binaries:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +24,8 @@ jobs:
           cache: true
       - name: Build
         run: |
+          # Windows version info from the tag (e.g. v1.2.3 -> 1.2.3)
+          make winres VERSION=${GITHUB_REF_NAME}
           make dist VERSION=${GITHUB_REF_NAME}
           cd dist && sha256sum * > SHA256SUMS
       - uses: softprops/action-gh-release@v2

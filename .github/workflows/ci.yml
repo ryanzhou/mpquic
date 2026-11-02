@@ -5,6 +5,7 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  workflow_call: # the release workflow runs CI before publishing
 
 permissions:
   contents: read
@@ -22,6 +23,12 @@ jobs:
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: vet
         run: go vet ./...
+      - name: vet (windows)
+        run: GOOS=windows go vet ./...
+      - name: Windows resources are up to date
+        run: |
+          make winres VERSION=dev
+          git diff --exit-code -- cmd/mpquic/ || (echo "run 'make winres' and commit the .syso files" && exit 1)
       - name: test (race)
         run: go test -race -count=1 -timeout 10m ./...
       - name: cross-compile
@@ -30,4 +37,31 @@ jobs:
         with:
           name: mpquic-binaries
           path: dist/
+          retention-days: 7
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # for git describe
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: test
+        run: go test -count=1 -timeout 15m ./...
+      - name: build
+        shell: bash
+        run: |
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty)" \
+            -o mpquic.exe ./cmd/mpquic
+      - name: service, CLI and GUI smoke test
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1 -Exe ./mpquic.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpquic-windows-amd64
+          path: mpquic.exe
           retention-days: 7

@@ -1,0 +1,33 @@
+{
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": ["icon256.png", "icon48.png", "icon32.png", "icon16.png"]
+    }
+  },
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": "mpquic.manifest"
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "0.0.0.0",
+          "product_version": "0.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "CompanyName": "MPQUIC",
+            "FileDescription": "MPQUIC multipath QUIC proxy",
+            "FileVersion": "0.0.0.0",
+            "InternalName": "mpquic",
+            "OriginalFilename": "mpquic.exe",
+            "ProductName": "MPQUIC",
+            "ProductVersion": "0.0.0.0"
+          }
+        }
+      }
+    }
+  }
+}

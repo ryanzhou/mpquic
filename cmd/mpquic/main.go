@@ -10,23 +10,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
+	"mpquic/internal/app"
 	"mpquic/internal/config"
-	"mpquic/internal/linkem"
-	"mpquic/internal/mp"
-	"mpquic/internal/proxy"
 )
 
 var version = "dev"
@@ -37,15 +32,21 @@ func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 
 func main() {
+	app.Version = version
 	mode, args := detectMode(os.Args)
+	if mode == "" && launchedFromExplorer() {
+		mode = "gui"
+	}
 	var err error
 	switch mode {
-	case "local", "tunnel":
-		err = runLocal(mode, args)
+	case "local", "tunnel", "relay":
+		err = runRole(mode, args)
 	case "remote", "server":
-		err = runRemote(args)
-	case "relay":
-		err = runRelay(args)
+		err = runRole("remote", args)
+	case "service":
+		err = runService(args)
+	case "gui":
+		err = runGUI(args)
 	case "version", "-V", "--version":
 		fmt.Println("mpquic", version)
 	case "help", "-h", "--help", "":
@@ -86,6 +87,9 @@ Usage:
   mpquic tunnel [options]   port forwarder to a fixed target (-L), like ss-tunnel
   mpquic remote [options]   server that forwards to targets (like ss-server)
   mpquic relay  [options]   UDP relay with optional link emulation (like socat)
+  mpquic service COMMAND    Windows service: install, uninstall, start, stop,
+                            restart, status (see "mpquic service help")
+  mpquic gui                Windows configurator (also opened by double-click)
   mpquic version
 
 Common options (shadowsocks-compatible):
@@ -266,195 +270,37 @@ func (f *commonFlags) load() (*config.Config, error) {
 	return cfg, nil
 }
 
-func newLogger(cfg *config.Config) *slog.Logger {
-	lvl := slog.LevelInfo
-	if cfg.Verbose {
-		lvl = slog.LevelDebug
-	}
-	switch strings.ToLower(cfg.LogLevel) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	}
-	l := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
-	slog.SetDefault(l)
-	return l
+// signalContext is cancelled by Ctrl-C / SIGTERM (on Windows, also by
+// closing the console window).
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
-func options(cfg *config.Config, log *slog.Logger) (*mp.Options, error) {
-	if cfg.EffectivePassword() == "" {
-		return nil, errors.New("password is required (-k or \"password\")")
+// parseRole builds the config of a role from its command-line arguments
+// (exactly as "mpquic ROLE ARGS..." would).
+func parseRole(role string, args []string) (*config.Config, error) {
+	if role == "relay" {
+		return parseRelay(args)
 	}
-	if cfg.Method != "" {
-		log.Debug("encryption method is ignored; QUIC (TLS 1.3) encrypts all traffic", "method", cfg.Method)
+	f, err := parseCommon(role, args)
+	if err != nil {
+		return nil, err
 	}
-	return &mp.Options{
-		Password:      cfg.EffectivePassword(),
-		Window:        int64(cfg.Window),
-		ChunkSize:     int(cfg.ChunkSize),
-		Congestion:    cfg.Congestion,
-		IdleTimeout:   time.Duration(cfg.Timeout) * time.Second,
-		StatsInterval: time.Duration(cfg.StatsInterval) * time.Second,
-		NoDup:         cfg.NoDup,
-		CertFile:      cfg.Cert,
-		KeyFile:       cfg.Key,
-		SNI:           cfg.SNI,
-		Logger:        log,
-	}, nil
+	return f.load()
 }
 
-func waitSignal() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	<-ch
+func runRole(role string, args []string) error {
+	cfg, err := parseRole(role, args)
+	if err != nil {
+		return err
+	}
+	log := app.NewLogger(cfg, os.Stderr)
+	ctx, stop := signalContext()
+	defer stop()
+	return app.Run(ctx, role, cfg, log)
 }
 
-func runLocal(mode string, args []string) error {
-	f, err := parseCommon(mode, args)
-	if err != nil {
-		return err
-	}
-	cfg, err := f.load()
-	if err != nil {
-		return err
-	}
-	log := newLogger(cfg)
-	opt, err := options(cfg, log)
-	if err != nil {
-		return err
-	}
-	if mode == "tunnel" && cfg.TunnelAddress == "" {
-		return errors.New("tunnel mode requires -L host:port")
-	}
-	laddr := cfg.LocalAddress
-	if laddr == "" {
-		laddr = "127.0.0.1"
-	}
-	lport := cfg.LocalPort
-	if lport == 0 {
-		lport = 1080
-	}
-	var udp *proxy.UDPLocal
-	if cfg.UDPEnabled() && mode != "tunnel" {
-		udp = proxy.NewUDPLocal(nil, log)
-		opt.DatagramHandler = udp.HandleDatagram
-	}
-	var opener proxy.Opener
-	var shutdown func()
-	var pathDesc string
-	if cfg.Reverse {
-		// Reverse mode: we are the QUIC listener; the remote dials us
-		// (directly and through relays that forward to our address).
-		opt.SingleSession = true
-		srv, err := mp.NewServer(opt, nil)
-		if err != nil {
-			return err
-		}
-		binds := cfg.ListenAddrs()
-		for _, a := range binds {
-			go func() {
-				if err := srv.ListenAndServe(a); err != nil {
-					log.Error("quic listener", "addr", a, "err", err)
-				}
-			}()
-		}
-		opener, shutdown, pathDesc = srv, srv.Close, "reverse, listening on "+strings.Join(binds, ",")
-	} else {
-		servers := cfg.ServerAddrs()
-		if len(servers) == 0 {
-			return errors.New("at least one server address is required (-s)")
-		}
-		client, err := mp.NewClient(servers, opt)
-		if err != nil {
-			return err
-		}
-		opener, shutdown, pathDesc = client, client.Close, strings.Join(servers, ",")
-	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(laddr, strconv.Itoa(lport)))
-	if err != nil {
-		shutdown()
-		return err
-	}
-	l := &proxy.Local{Client: opener, Log: log, UDP: udp}
-	if udp != nil {
-		udp.Client = opener
-	}
-	if mode == "tunnel" {
-		l.Tunnel = cfg.TunnelAddress
-	}
-	what := "socks5"
-	if l.Tunnel != "" {
-		what = "tunnel to " + l.Tunnel
-	}
-	log.Info("mpquic local started", "version", version, "listen", ln.Addr().String(), "mode", what, "udp", udp != nil, "paths", pathDesc)
-	go func() {
-		if err := l.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Error("listener", "err", err)
-		}
-	}()
-	waitSignal()
-	ln.Close()
-	shutdown()
-	return nil
-}
-
-func runRemote(args []string) error {
-	f, err := parseCommon("remote", args)
-	if err != nil {
-		return err
-	}
-	cfg, err := f.load()
-	if err != nil {
-		return err
-	}
-	log := newLogger(cfg)
-	opt, err := options(cfg, log)
-	if err != nil {
-		return err
-	}
-	if cfg.UDPEnabled() {
-		opt.DatagramHandler = proxy.NewUDPRemote(log).HandleDatagram
-	}
-	opt.StreamHandler = proxy.RemoteHandler(log, 10*time.Second)
-	if cfg.Reverse {
-		// Reverse mode: dial the local instance over every configured path.
-		servers := cfg.ServerAddrs()
-		if len(servers) == 0 {
-			return errors.New("reverse mode: at least one address of the local instance is required (-s)")
-		}
-		client, err := mp.NewClient(servers, opt)
-		if err != nil {
-			return err
-		}
-		log.Info("mpquic remote started", "version", version, "mode", "reverse", "paths", strings.Join(servers, ","), "udp", cfg.UDPEnabled())
-		waitSignal()
-		client.Close()
-		return nil
-	}
-	srv, err := mp.NewServer(opt, nil)
-	if err != nil {
-		return err
-	}
-	binds := cfg.ListenAddrs()
-	errc := make(chan error, len(binds))
-	for _, a := range binds {
-		go func() { errc <- srv.ListenAndServe(a) }()
-	}
-	log.Info("mpquic remote started", "version", version, "listen", strings.Join(binds, ","), "udp", cfg.UDPEnabled())
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case err = <-errc:
-	case <-sig:
-	}
-	srv.Close()
-	return err
-}
-
-func runRelay(args []string) error {
+func parseRelay(args []string) (*config.Config, error) {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
 	fs.Usage = usage
 	var cfgFile, link, fwd, rev string
@@ -470,72 +316,28 @@ func runRelay(args []string) error {
 	fs.BoolVar(&verbose, "v", false, "verbose")
 	fs.IntVar(&statsSec, "stats", 0, "log counters every N seconds")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return nil, err
+	}
+	if fs.NArg() > 0 {
+		return nil, fmt.Errorf("unexpected arguments: %v", fs.Args())
 	}
 	cfg := &config.Config{Verbose: verbose}
 	if cfgFile != "" {
 		c, err := config.Load(cfgFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		cfg = c
 		cfg.Verbose = cfg.Verbose || verbose
 	}
-	log := newLogger(cfg)
+	if statsSec != 0 {
+		cfg.StatsInterval = statsSec
+	}
 	if len(listens) != len(targets) {
-		return errors.New("--listen and --target must be given the same number of times")
+		return nil, errors.New("--listen and --target must be given the same number of times")
 	}
 	for i := range listens {
 		cfg.Relays = append(cfg.Relays, config.RelayConfig{Listen: listens[i], Target: targets[i], Link: link, Fwd: fwd, Rev: rev})
 	}
-	if len(cfg.Relays) == 0 {
-		return errors.New("no relays configured (--listen/--target or \"relays\" in config)")
-	}
-	var relays []*linkem.Relay
-	errc := make(chan error, len(cfg.Relays))
-	for _, rc := range cfg.Relays {
-		fs, rs := rc.Fwd, rc.Rev
-		if fs == "" {
-			fs = rc.Link
-		}
-		if rs == "" {
-			rs = rc.Link
-		}
-		fspec, err := linkem.ParseSpec(fs)
-		if err != nil {
-			return err
-		}
-		rspec, err := linkem.ParseSpec(rs)
-		if err != nil {
-			return err
-		}
-		r, err := linkem.NewRelay(rc.Listen, rc.Target, fspec, rspec)
-		if err != nil {
-			return err
-		}
-		r.Log = log
-		relays = append(relays, r)
-		log.Info("relay", "listen", r.Addr().String(), "target", rc.Target, "fwd", fspec.String(), "rev", rspec.String())
-		go func() { errc <- r.Serve() }()
-	}
-	if statsSec > 0 {
-		go func() {
-			for range time.Tick(time.Duration(statsSec) * time.Second) {
-				for _, r := range relays {
-					log.Info("relay stats", "listen", r.Addr().String(), "fwd_pass", r.Fwd.Passed, "fwd_drop", r.Fwd.Dropped, "rev_pass", r.Rev.Passed, "rev_drop", r.Rev.Dropped)
-				}
-			}
-		}()
-	}
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	var err error
-	select {
-	case err = <-errc:
-	case <-sig:
-	}
-	for _, r := range relays {
-		r.Close()
-	}
-	return err
+	return cfg, nil
 }

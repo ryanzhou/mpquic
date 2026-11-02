@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -14,55 +15,58 @@ import (
 // Config mirrors shadowsocks-libev / shadowsocks-rust JSON keys, plus a few
 // mpquic-specific ones.
 type Config struct {
-	Server        StringList    `json:"server"`
-	ServerPort    int           `json:"server_port"`
-	Servers       []ServerEntry `json:"servers"`
-	LocalAddress  string        `json:"local_address"`
-	LocalPort     int           `json:"local_port"`
-	Password      string        `json:"password"`
-	Method        string        `json:"method"`
-	Timeout       int           `json:"timeout"`
-	TunnelAddress string        `json:"tunnel_address"`
-	Mode          string        `json:"mode"`
-	FastOpen      bool          `json:"fast_open"`
-	NoDelay       bool          `json:"no_delay"`
-	ReusePort     bool          `json:"reuse_port"`
-	Plugin        string        `json:"plugin"`
+	Server        StringList    `json:"server,omitempty"`
+	ServerPort    int           `json:"server_port,omitempty"`
+	Servers       []ServerEntry `json:"servers,omitempty"`
+	LocalAddress  string        `json:"local_address,omitempty"`
+	LocalPort     int           `json:"local_port,omitempty"`
+	Password      string        `json:"password,omitempty"`
+	Method        string        `json:"method,omitempty"`
+	Timeout       int           `json:"timeout,omitempty"`
+	TunnelAddress string        `json:"tunnel_address,omitempty"`
+	Mode          string        `json:"mode,omitempty"`
+	FastOpen      bool          `json:"fast_open,omitempty"`
+	NoDelay       bool          `json:"no_delay,omitempty"`
+	ReusePort     bool          `json:"reuse_port,omitempty"`
+	Plugin        string        `json:"plugin,omitempty"`
 
 	// mpquic extensions
+	// Role selects what a service runs: local, tunnel, remote or relay. The
+	// command line ignores it (the mode is the first argument there).
+	Role string `json:"role,omitempty"`
 	// Reverse swaps the QUIC roles: the local side listens (at "server" /
 	// "server_port", i.e. its own public address) and the remote dials the
 	// local through the "server" list (the local's address and relays).
-	Reverse       bool          `json:"reverse"`
-	Congestion    string        `json:"congestion"`
-	Window        Size          `json:"window"`
-	ChunkSize     Size          `json:"chunk_size"`
-	StatsInterval int           `json:"stats_interval"`
-	Verbose       bool          `json:"verbose"`
-	LogLevel      string        `json:"log_level"`
-	Cert          string        `json:"cert"`
-	Key           string        `json:"key"`
-	SNI           string        `json:"sni"`
-	NoDup         bool          `json:"no_dup"`
-	Relays        []RelayConfig `json:"relays"`
+	Reverse       bool          `json:"reverse,omitempty"`
+	Congestion    string        `json:"congestion,omitempty"`
+	Window        Size          `json:"window,omitempty"`
+	ChunkSize     Size          `json:"chunk_size,omitempty"`
+	StatsInterval int           `json:"stats_interval,omitempty"`
+	Verbose       bool          `json:"verbose,omitempty"`
+	LogLevel      string        `json:"log_level,omitempty"`
+	Cert          string        `json:"cert,omitempty"`
+	Key           string        `json:"key,omitempty"`
+	SNI           string        `json:"sni,omitempty"`
+	NoDup         bool          `json:"no_dup,omitempty"`
+	Relays        []RelayConfig `json:"relays,omitempty"`
 }
 
 // RelayConfig configures one UDP relay (relay mode).
 type RelayConfig struct {
 	Listen string `json:"listen"`
 	Target string `json:"target"`
-	Link   string `json:"link"` // applied to both directions
-	Fwd    string `json:"fwd"`  // client -> target (overrides link)
-	Rev    string `json:"rev"`  // target -> client (overrides link)
+	Link   string `json:"link,omitempty"` // applied to both directions
+	Fwd    string `json:"fwd,omitempty"`  // client -> target (overrides link)
+	Rev    string `json:"rev,omitempty"`  // target -> client (overrides link)
 }
 
 // ServerEntry is either "host", "host:port", or a shadowsocks-rust style
 // object {"server": ..., "server_port": ..., "password": ..., "method": ...}.
 type ServerEntry struct {
 	Server     string `json:"server"`
-	ServerPort int    `json:"server_port"`
-	Password   string `json:"password"`
-	Method     string `json:"method"`
+	ServerPort int    `json:"server_port,omitempty"`
+	Password   string `json:"password,omitempty"`
+	Method     string `json:"method,omitempty"`
 }
 
 func (e *ServerEntry) UnmarshalJSON(b []byte) error {
@@ -110,6 +114,27 @@ func (s *Size) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// MarshalJSON writes round sizes as strings ("64MB") and others as numbers.
+func (s Size) MarshalJSON() ([]byte, error) {
+	if str := FormatSize(int64(s)); strings.HasSuffix(str, "B") {
+		return json.Marshal(str)
+	}
+	return json.Marshal(int64(s))
+}
+
+// FormatSize is the inverse of ParseSize: 64<<20 -> "64MB", 1000 -> "1000".
+func FormatSize(n int64) string {
+	for _, u := range []struct {
+		shift  uint
+		suffix string
+	}{{30, "GB"}, {20, "MB"}, {10, "KB"}} {
+		if n != 0 && n%(1<<u.shift) == 0 {
+			return strconv.FormatInt(n>>u.shift, 10) + u.suffix
+		}
+	}
+	return strconv.FormatInt(n, 10)
+}
+
 // ParseSize parses "16MB", "512k", "1048576".
 func ParseSize(str string) (int64, error) {
 	l := strings.ToLower(strings.TrimSpace(str))
@@ -142,6 +167,40 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %v", path, err)
 	}
 	return c, nil
+}
+
+// Save writes the config as indented JSON. The file is replaced atomically
+// (written to a temporary file next to it, then renamed).
+func (c *Config) Save(path string) error {
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".mpquic-*.json")
+	if err != nil {
+		return err
+	}
+	_, err = tmp.Write(b)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), path)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+	}
+	return err
+}
+
+// Clone returns a deep copy of the config.
+func (c *Config) Clone() *Config {
+	n := *c
+	n.Server = append(StringList(nil), c.Server...)
+	n.Servers = append([]ServerEntry(nil), c.Servers...)
+	n.Relays = append([]RelayConfig(nil), c.Relays...)
+	return &n
 }
 
 // JoinHostPort combines a "host" or "host:port" entry with a default port.
