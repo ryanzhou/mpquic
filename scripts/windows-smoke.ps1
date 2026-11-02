@@ -38,15 +38,27 @@ function Start-Mpquic([string[]]$ArgList, [string]$Name) {
 function Fetch([string]$Url, [string]$Socks = '') {
     $curlArgs = @('-sS', '--max-time', '5', $Url)
     if ($Socks) { $curlArgs = @('--socks5-hostname', $Socks) + $curlArgs }
+    $curlErr = Join-Path $Tmp 'curl.err'
+    $body = ''
     for ($i = 1; $i -le 30; $i++) {
-        $body = & curl.exe @curlArgs 2>$null
+        $body = & curl.exe @curlArgs 2> $curlErr
         if ($LASTEXITCODE -eq 0 -and "$body".Trim() -eq 'mpquic-smoke-ok') {
             Write-Host "  fetched $Url via $(if ($Socks) { $Socks } else { 'direct' }) (attempt $i)"
             return
         }
         Start-Sleep -Seconds 1
     }
-    throw "cannot fetch $Url via $Socks"
+    $why = (Get-Content -Raw -ErrorAction SilentlyContinue $curlErr)
+    if (-not $why) { $why = "unexpected body: '$body'" }
+    throw "cannot fetch $Url via $(if ($Socks) { $Socks } else { 'direct' }): curl exit $LASTEXITCODE, $("$why".Trim())"
+}
+
+# Free-Port returns a currently unused local TCP port. Fixed ports can fall
+# into Windows' excluded (Hyper-V/WinNAT reserved) port ranges on runners.
+function Free-Port {
+    $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $l.Start()
+    try { return $l.LocalEndpoint.Port } finally { $l.Stop() }
 }
 
 function Status([string]$Name) {
@@ -71,12 +83,21 @@ try {
     # Target web server.
     $www = Join-Path $Tmp 'www'
     New-Item -ItemType Directory -Force $www | Out-Null
-    Set-Content -NoNewline (Join-Path $www 'hello.txt') 'mpquic-smoke-ok'
+    # Named parameters: with -NoNewline first, the positional Path and Value get swapped.
+    Set-Content -Path (Join-Path $www "hello.txt") -Value "mpquic-smoke-ok" -NoNewline
     $python = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $python) { $python = (Get-Command python3).Source }
-    $script:Procs += Start-Process -FilePath $python -ArgumentList '-m', 'http.server', '18080', '--bind', '127.0.0.1' `
-        -WorkingDirectory $www -PassThru -WindowStyle Hidden
-    Fetch 'http://127.0.0.1:18080/hello.txt'
+    Write-Host "> $python --version: $(& $python --version 2>&1)"
+    $WebPort = Free-Port
+    $Web = "127.0.0.1:$WebPort"
+    $Url = "http://$Web/hello.txt"
+    $WebProc = Start-Process -FilePath $python -ArgumentList '-u', '-m', 'http.server', $WebPort, '--bind', '127.0.0.1' `
+        -WorkingDirectory $www -PassThru -NoNewWindow `
+        -RedirectStandardOutput (Join-Path $Tmp 'http.out') -RedirectStandardError (Join-Path $Tmp 'http.err')
+    $script:Procs += $WebProc
+    Start-Sleep -Seconds 1
+    if ($WebProc.HasExited) { throw "python http.server exited with code $($WebProc.ExitCode)" }
+    Fetch $Url
 
     Write-Host '=== services'
     mpq service install --name mpq-remote remote -s 127.0.0.1 -p 18388 -k $Password -u
@@ -84,8 +105,8 @@ try {
     mpq service install --name mpq-local local -s 127.0.0.1:18388 -s 127.0.0.1:19000 -l 11080 -k $Password -u --stats 5
     mpq service install --name mpq-local2 local -s 127.0.0.1:19000 -l 11081 -k $Password
     foreach ($n in 'mpq-remote', 'mpq-relay', 'mpq-local', 'mpq-local2') { Expect-Status $n 'running' }
-    Fetch 'http://127.0.0.1:18080/hello.txt' '127.0.0.1:11080'
-    Fetch 'http://127.0.0.1:18080/hello.txt' '127.0.0.1:11081'   # relay path only
+    Fetch $Url '127.0.0.1:11080'
+    Fetch $Url '127.0.0.1:11081'   # relay path only
 
     # The service config is admin/LOCAL SERVICE only; the remote gets a firewall rule.
     $acl = (icacls (Join-Path $Data 'mpq-local.json')) -join "`n"
@@ -97,10 +118,10 @@ try {
     Expect-Status mpq-local 'stopped'
     mpq service start --name mpq-local
     mpq service restart --name mpq-remote
-    Fetch 'http://127.0.0.1:18080/hello.txt' '127.0.0.1:11080'
+    Fetch $Url '127.0.0.1:11080'
     mpq service install --name mpq-local   # reinstall from the stored config
     Expect-Status mpq-local 'running'
-    Fetch 'http://127.0.0.1:18080/hello.txt' '127.0.0.1:11080'
+    Fetch $Url '127.0.0.1:11080'
 
     # A service that cannot start (its UDP port is taken) reports the failure.
     & $Exe service install --name mpq-bad remote -s 127.0.0.1 -p 18388 -k $Password
@@ -112,8 +133,8 @@ try {
     Start-Mpquic @('remote', '-s', '127.0.0.1', '-p', '18389', '-k', $Password, '-u') 'fg-remote' | Out-Null
     Start-Mpquic @('relay', '--listen', '127.0.0.1:19001', '--target', '127.0.0.1:18389') 'fg-relay' | Out-Null
     Start-Mpquic @('local', '-s', '127.0.0.1:18389', '-s', '127.0.0.1:19001', '-l', '11090', '-k', $Password, '-u') 'fg-local' | Out-Null
-    Start-Mpquic @('tunnel', '-s', '127.0.0.1:19001', '-l', '11091', '-L', '127.0.0.1:18080', '-k', $Password) 'fg-tunnel' | Out-Null
-    Fetch 'http://127.0.0.1:18080/hello.txt' '127.0.0.1:11090'
+    Start-Mpquic @('tunnel', '-s', '127.0.0.1:19001', '-l', '11091', '-L', $Web, '-k', $Password) 'fg-tunnel' | Out-Null
+    Fetch $Url '127.0.0.1:11090'
     Fetch 'http://127.0.0.1:11091/hello.txt'
 
     Write-Host '=== gui'
