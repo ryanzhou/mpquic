@@ -110,6 +110,10 @@ func (u *UDPLocal) associate(c net.Conn) {
 		if n < 4 || buf[2] != 0 { // fragmentation not supported
 			continue
 		}
+		al := addrLen(buf[3:n])
+		if al < 0 {
+			continue
+		}
 		if ca := a.client.Load(); ca == nil || !ca.IP.Equal(from.IP) || ca.Port != from.Port {
 			a.client.Store(from)
 		}
@@ -120,7 +124,7 @@ func (u *UDPLocal) associate(c net.Conn) {
 		if sess == nil {
 			continue
 		}
-		if err := sess.SendDatagram(msg); err != nil {
+		if err := sess.SendDatagram(msg, len(hdr)+al); err != nil {
 			u.Log.Debug("udp send", "err", err)
 		}
 	}
@@ -210,7 +214,7 @@ func (u *UDPRemote) readLoop(s *mp.Session, id uint64, a *remoteAssoc) {
 		msg = append(msg, hdr...)
 		msg = append(msg, addr...)
 		msg = append(msg, buf[:n]...)
-		if err := s.SendDatagram(msg); err != nil && s.Context().Err() != nil {
+		if err := s.SendDatagram(msg, len(hdr)+len(addr)); err != nil && s.Context().Err() != nil {
 			return
 		}
 	}

@@ -37,6 +37,11 @@ type Options struct {
 	// NoDup disables opportunistic duplication of in-flight data onto idle
 	// faster paths (it is on by default; it only uses otherwise idle capacity).
 	NoDup bool
+	// MTU, if > 0, is the path MTU (IP packet size) of every path: QUIC
+	// packets get a fixed size that fits it (UDP payload = MTU - 28 for IPv4
+	// paths, - 48 for IPv6; 1200..1452) and path MTU discovery is off.
+	// 0 starts at 1200-byte packets and discovers each path's MTU.
+	MTU int
 	// StatsInterval logs per-path statistics periodically if > 0.
 	StatsInterval time.Duration
 	// TLS certificate for the server (optional; self-signed if empty).

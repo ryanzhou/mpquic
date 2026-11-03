@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -30,6 +31,8 @@ type Client struct {
 	sess    *Session
 	servers []string
 	wg      sync.WaitGroup
+
+	mtuWarned atomic.Bool
 }
 
 // NewClient creates a client and starts dialing all servers.
@@ -112,7 +115,12 @@ func (c *Client) runPath(index uint64, addr string) error {
 
 	ctx, cancel := context.WithTimeout(c.sess.ctx, c.opt.HandshakeTimeout)
 	defer cancel()
-	conn, err := tr.Dial(ctx, raddr, c.tlsConf, c.qconf)
+	qconf, tooSmall := pathQUICConfig(c.qconf, c.opt, raddr)
+	if tooSmall && !c.mtuWarned.Swap(true) {
+		c.opt.Logger.Warn("mtu is too small for QUIC on this path", "path", addr, "mtu", c.opt.MTU,
+			"min", minPacketSize+(c.opt.MTU-packetSizeFor(c.opt.MTU, raddr)))
+	}
+	conn, err := tr.Dial(ctx, raddr, c.tlsConf, qconf)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -192,6 +200,17 @@ func NewServer(opt *Options, handler func(*Stream)) (*Server, error) {
 	s := &Server{
 		opt: o, key: deriveKey(o.Password), tlsConf: tc, qconf: quicConfig(o),
 		profile: prof, acceptFn: handler, sessions: make(map[[16]byte]*Session),
+	}
+	if o.MTU > 0 {
+		// The packet size depends on the client's address family.
+		base := quicConfig(o)
+		s.qconf.GetConfigForClient = func(info *quic.ClientInfo) (*quic.Config, error) {
+			qc, tooSmall := pathQUICConfig(base, o, info.RemoteAddr)
+			if tooSmall {
+				o.Logger.Debug("mtu is too small for QUIC on this path", "peer", info.RemoteAddr.String(), "mtu", o.MTU)
+			}
+			return qc, nil
+		}
 	}
 	go s.reaper()
 	return s, nil

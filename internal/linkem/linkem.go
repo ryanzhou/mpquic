@@ -32,6 +32,7 @@ type Spec struct {
 	Dup          float64       // duplication probability
 	OutageEvery  time.Duration // periodic outage period
 	OutageFor    time.Duration // outage duration
+	MTU          int           // path MTU: drop packets whose IPv4 size (UDP payload + 28) exceeds it
 }
 
 func (s Spec) String() string {
@@ -68,6 +69,9 @@ func (s Spec) String() string {
 	if s.OutageEvery > 0 {
 		add("outage", s.OutageEvery.String()+"/"+s.OutageFor.String())
 	}
+	if s.MTU > 0 {
+		add("mtu", strconv.Itoa(s.MTU))
+	}
 	if len(p) == 0 {
 		return "none"
 	}
@@ -78,7 +82,7 @@ func fmtRate(r float64) string { return fmt.Sprintf("%gmbit", r*8/1e6) }
 
 // ParseSpec parses "delay=50ms,jitter=5ms,loss=1%,burst=3,rate=20mbit,
 // queue=50ms,police=10mbit,reorder=1%,reorder_delay=10ms,dup=0.1%,
-// outage=30s/2s,rate2=5mbit,flap=10s". Empty string means no impairment.
+// outage=30s/2s,rate2=5mbit,flap=10s,mtu=1280". Empty string means no impairment.
 func ParseSpec(str string) (Spec, error) {
 	var s Spec
 	str = strings.TrimSpace(str)
@@ -110,6 +114,8 @@ func ParseSpec(str string) (Spec, error) {
 			s.Rate2, err = parseRate(v)
 		case "flap":
 			s.Flap, err = time.ParseDuration(v)
+		case "mtu":
+			s.MTU, err = strconv.Atoi(v)
 		case "queue":
 			s.Queue, err = time.ParseDuration(v)
 		case "police":
@@ -327,6 +333,12 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 			l.mu.Unlock()
 			return
 		}
+	}
+	if s.MTU > 0 && len(b)+28 > s.MTU {
+		// too big for the path, and the sender set DF (as QUIC does)
+		l.Dropped++
+		l.mu.Unlock()
+		return
 	}
 	size := float64(len(b) + 28) // IP+UDP header
 	if s.Police > 0 {

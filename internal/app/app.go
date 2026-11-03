@@ -112,6 +112,10 @@ func Validate(role string, cfg *config.Config) error {
 	if cfg.Window < 0 || cfg.ChunkSize < 0 || cfg.Timeout < 0 || cfg.StatsInterval < 0 {
 		return errors.New("window, chunk size, timeout and stats interval must not be negative")
 	}
+	if cfg.MTU != 0 && (cfg.MTU < 1228 || cfg.MTU > 65535) {
+		// QUIC needs 1200-byte UDP payloads: 1228-byte IPv4 / 1248-byte IPv6 packets
+		return fmt.Errorf("mtu %d: must be between 1228 and 65535 (QUIC needs paths that carry 1200-byte UDP payloads), or 0 to discover it", cfg.MTU)
+	}
 	switch r {
 	case "local", "tunnel":
 		if !cfg.Reverse && len(cfg.ServerAddrs()) == 0 {
@@ -171,6 +175,7 @@ func options(cfg *config.Config, log *slog.Logger) *mp.Options {
 		IdleTimeout:   time.Duration(cfg.Timeout) * time.Second,
 		StatsInterval: time.Duration(cfg.StatsInterval) * time.Second,
 		NoDup:         cfg.NoDup,
+		MTU:           cfg.MTU,
 		CertFile:      cfg.Cert,
 		KeyFile:       cfg.Key,
 		SNI:           cfg.SNI,

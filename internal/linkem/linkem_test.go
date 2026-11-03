@@ -9,14 +9,14 @@ import (
 )
 
 func TestParseSpec(t *testing.T) {
-	s, err := ParseSpec("delay=40ms,jitter=5ms,loss=1%,burst=3,rate=20mbit,queue=80ms,police=10mbit,reorder=0.5,dup=0.1%,outage=30s/2s,rate2=5mbit,flap=10s")
+	s, err := ParseSpec("delay=40ms,jitter=5ms,loss=1%,burst=3,rate=20mbit,queue=80ms,police=10mbit,reorder=0.5,dup=0.1%,outage=30s/2s,rate2=5mbit,flap=10s,mtu=1280")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.Delay != 40*time.Millisecond || s.Jitter != 5*time.Millisecond || s.Loss != 0.01 || s.Burst != 3 ||
 		s.Rate != 20e6/8 || s.Queue != 80*time.Millisecond || s.Police != 10e6/8 || s.Reorder != 0.5 ||
 		math.Abs(s.Dup-0.001) > 1e-12 || s.OutageEvery != 30*time.Second || s.OutageFor != 2*time.Second ||
-		s.Rate2 != 5e6/8 || s.Flap != 10*time.Second {
+		s.Rate2 != 5e6/8 || s.Flap != 10*time.Second || s.MTU != 1280 {
 		t.Fatalf("parsed %+v", s)
 	}
 	for _, bad := range []string{"delay", "foo=1", "loss=200%", "outage=5s"} {
@@ -66,6 +66,16 @@ func TestDelay(t *testing.T) {
 	got, first, _ := run(t, "delay=50ms", 10, 100, 0)
 	if got != 10 || first < 50*time.Millisecond || first > 70*time.Millisecond {
 		t.Fatalf("got %d first %v", got, first)
+	}
+}
+
+func TestMTU(t *testing.T) {
+	// 1252 + 28 = 1280 passes, 1253 + 28 does not
+	if got, _, _ := run(t, "mtu=1280", 5, 1252, 0); got != 5 {
+		t.Fatalf("1252-byte payloads: delivered %d/5", got)
+	}
+	if got, _, _ := run(t, "mtu=1280", 5, 1253, 0); got != 0 {
+		t.Fatalf("1253-byte payloads: delivered %d/5", got)
 	}
 }
 

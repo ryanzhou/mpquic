@@ -68,6 +68,7 @@ type ui struct {
 	pathsTE, relaysTE, logTE               *walk.TextEdit
 	portLE, pwLE, laddrLE, lportLE         *walk.LineEdit
 	tunnelLE, windowLE, chunkLE, timeoutLE *walk.LineEdit
+	mtuLE                                  *walk.LineEdit
 	statsLE, certLE, keyLE, sniLE          *walk.LineEdit
 	tabs                                   *walk.TabWidget
 	applyPB, startPB, stopPB, restartPB    *walk.PushButton
@@ -234,6 +235,8 @@ func (u *ui) create() error {
 						LineEdit{AssignTo: &u.chunkLE, CueBanner: "16KB", ColumnSpan: 2},
 						Label{Text: "Idle timeout (s):", TextAlignment: AlignFar},
 						LineEdit{AssignTo: &u.timeoutLE, CueBanner: "300", ColumnSpan: 2},
+						Label{Text: "Path MTU:", TextAlignment: AlignFar},
+						LineEdit{AssignTo: &u.mtuLE, CueBanner: "auto (e.g. 1280 for a 1280-byte tunnel)", ColumnSpan: 2},
 						Label{},
 						CheckBox{AssignTo: &u.noDupCB, Text: "Disable redundant copies on idle paths", ColumnSpan: 2},
 						Label{Text: "TLS certificate:", TextAlignment: AlignFar},
@@ -326,6 +329,7 @@ func (u *ui) setForm(f Form) {
 	u.windowLE.SetText(f.Window)
 	u.chunkLE.SetText(f.Chunk)
 	u.timeoutLE.SetText(f.Timeout)
+	u.mtuLE.SetText(f.MTU)
 	u.statsLE.SetText(f.Stats)
 	u.noDupCB.SetChecked(f.NoDup)
 	u.certLE.SetText(f.Cert)
@@ -364,6 +368,7 @@ func (u *ui) readForm() Form {
 		Window:     strings.TrimSpace(u.windowLE.Text()),
 		Chunk:      strings.TrimSpace(u.chunkLE.Text()),
 		Timeout:    strings.TrimSpace(u.timeoutLE.Text()),
+		MTU:        strings.TrimSpace(u.mtuLE.Text()),
 		Stats:      strings.TrimSpace(u.statsLE.Text()),
 		NoDup:      u.noDupCB.Checked(),
 		Cert:       strings.TrimSpace(u.certLE.Text()),

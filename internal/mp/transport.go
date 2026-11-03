@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"net"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -115,7 +116,50 @@ func quicConfig(o *Options) *quic.Config {
 		MaxIncomingStreams:             16,
 		MaxIncomingUniStreams:          1 << 14,
 		EnableDatagrams:                true,
+		// Start small so that paths with a reduced MTU (1280-byte tunnels
+		// such as Tailscale or IPv6-in-IPv4, PPPoE, IPsec) connect at all:
+		// quic-go sends with the don't-fragment bit and pads the first
+		// packet to this size. Path MTU discovery then grows it.
+		InitialPacketSize: minPacketSize,
 	}
+}
+
+// QUIC packet sizes (UDP payload).
+const (
+	// minPacketSize is the smallest UDP payload QUIC works with (RFC 9000):
+	// a path must carry 1228-byte IPv4 / 1248-byte IPv6 packets.
+	minPacketSize = 1200
+	// maxPacketSize is quic-go's largest packet (1500-byte IPv6 packets).
+	maxPacketSize = 1452
+)
+
+// packetSizeFor returns the UDP payload that fits in an IP packet of mtu bytes
+// to addr (28 bytes of IPv4+UDP headers, 48 for IPv6).
+func packetSizeFor(mtu int, addr net.Addr) int {
+	hdr := 28
+	if ua, ok := addr.(*net.UDPAddr); ok && ua.IP.To4() == nil {
+		hdr = 48
+	}
+	return mtu - hdr
+}
+
+// pathQUICConfig returns the QUIC config of a path to/from addr. With
+// o.MTU set, packets have a fixed size that fits it and path MTU discovery
+// is off. tooSmall reports an MTU below what QUIC needs (the path is then
+// tried with the minimum size, which will not get through).
+func pathQUICConfig(base *quic.Config, o *Options, addr net.Addr) (c *quic.Config, tooSmall bool) {
+	if o.MTU <= 0 {
+		return base, false
+	}
+	c = base.Clone()
+	c.GetConfigForClient = nil
+	size := packetSizeFor(o.MTU, addr)
+	if size < minPacketSize {
+		size, tooSmall = minPacketSize, true
+	}
+	c.InitialPacketSize = uint16(min(size, maxPacketSize))
+	c.DisablePathMTUDiscovery = true
+	return c, tooSmall
 }
 
 type hello struct {

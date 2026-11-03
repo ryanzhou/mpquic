@@ -71,24 +71,25 @@ load dropped from ~2× the best path's RTT to +4–14 ms.
 
 `internal/cc/bbr/sim_test.go` drives the sender through a deterministic
 bottleneck model (time-varying rate, drop-tail buffer, random loss, ACK
-aggregation, competing BBR, Reno and unresponsive flows). Stock BBRv1 →
+aggregation, outages, competing BBR, Reno and unresponsive flows; QUIC-like
+loss detection: 3-packet threshold and probe timeouts). Stock BBRv1 →
 mpquic, 3 runs:
 
 | scenario | before | after |
 |---|---|---|
-| 20 Mbit/s, 50 ms, 500 ms buffer: median queue | 9–12 ms | 3–4 ms |
-| 40 → 5 Mbit/s for 6 s, 2 s buffer: time with > 50 ms queue | 5.7–5.8 s | 1.2–1.5 s |
-| 40 → 28 Mbit/s: time with > 25 ms queue | 1.7–5.5 s | 0.4–0.5 s |
-| 40 ↔ 5 Mbit/s every 3 s, 50 ms: utilization, median queue | 97–98%, 170–260 ms | 93–94%, 16 ms |
-| 40 ↔ 5 Mbit/s every 8 s, 50 ms | 87–91%, 21–51 ms | 96–97%, 15 ms |
-| 50 ↔ 10 Mbit/s every 5 s, 30 ms | 88–90%, 31 ms | 96–97%, 9 ms |
-| 100 ↔ 20 Mbit/s every 3 s, 150 ms | 94–99%, 205–365 ms | 89–92%, 150 ms |
-| 40 ↔ 2 Mbit/s every 3 s, 20 ms, 3% loss | 91–98%, 29–170 ms | 89–95%, 9–11 ms |
-| unresponsive traffic takes 60% for 7 s: time with > 100 ms queue | 2.6–2.8 s | 0.6–0.7 s |
-| two BBR flows, 1 s buffer: split, median queue | 44/56 to 47/51, 55–57 ms | 37/61 to 63/36, 21–30 ms |
-| vs. Reno, 50 ms buffer: BBR share | 91–92% | 34–42% |
-| vs. Reno, 1–3 s buffer: BBR share | 15–25% | 20–24% |
-| ACK aggregation 40 ms on a 5 ms path: utilization | 98% | 97% |
+| 20 Mbit/s, 50 ms, 500 ms buffer: median queue | 8–11 ms | 3–5 ms |
+| 40 → 5 Mbit/s for 6 s, 2 s buffer: time with > 50 ms queue | 5.7–6 s | 1.2–1.5 s |
+| 40 → 28 Mbit/s: time with > 25 ms queue | 1.7–6.3 s | 0.5 s |
+| 40 ↔ 5 Mbit/s every 3 s, 50 ms: utilization, median queue | 97–98%, 170–260 ms | 92–94%, 16 ms |
+| 40 ↔ 5 Mbit/s every 8 s, 50 ms | 85–90%, 51–54 ms | 96%, 15 ms |
+| 50 ↔ 10 Mbit/s every 5 s, 30 ms | 85–89%, 19–32 ms | 95–98%, 9 ms |
+| 100 ↔ 20 Mbit/s every 3 s, 150 ms | 94%, 350–365 ms | 85–87%, 150 ms |
+| 40 ↔ 2 Mbit/s every 3 s, 20 ms, 3% loss | 94–100%, 75–170 ms | 95–97%, 11 ms |
+| unresponsive traffic takes 60% for 7 s: time with > 100 ms queue | 2.5–2.6 s | 0.6 s |
+| two BBR flows, 1 s buffer: split, median queue | 45/53 to 52/46, 55–59 ms | 38/61 to 39/60, 29–32 ms |
+| vs. Reno, 50 ms buffer: BBR share | 91–92% | 33–35% |
+| vs. Reno, 1–3 s buffer: BBR share | 19–35% | 13–27% |
+| ACK aggregation 40 ms on a 5 ms path: utilization | 97–98% | 97% |
 
 BBRv1 no longer crowds out loss-based flows in shallow buffers; in deep
 buffers it keeps the minority share it always had (the queue is the other

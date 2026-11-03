@@ -46,6 +46,7 @@ var (
 	cpuprof   = flag.String("cpuprofile", "", "write a CPU profile")
 	subset    = flag.String("subset", "", "also run with only these path indexes (e.g. 0,1) as a baseline")
 	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
+	mtu       = flag.Int("mtu", 0, "fixed path MTU (0: discover)")
 )
 
 func main() {
@@ -68,7 +69,7 @@ func main() {
 	slog.SetDefault(log)
 
 	target := startTarget()
-	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk, Congestion: *ccName}
+	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk, Congestion: *ccName, MTU: *mtu}
 	// The QUIC listener is the remote normally and the local in reverse mode;
 	// the relays always forward to the listener.
 	lopt, dopt := *opt, *opt

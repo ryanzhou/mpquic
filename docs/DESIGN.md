@@ -121,7 +121,49 @@ SOCKS5 format. That means there's no separate "open" message. The local
 replies to the SOCKS client immediately, and the request bytes follow the
 address with zero extra round trips. UDP ASSOCIATE payloads travel as QUIC
 DATAGRAM frames (`assoc_id ‖ socks_addr ‖ payload`) on the lowest-latency
-path.
+path that can carry them (see "Packet sizes" for the limits).
+
+### Packet sizes (MTU)
+
+QUIC packets are sent with the IP don't-fragment bit and never fragmented.
+Each path starts at 1200-byte packets (UDP payload; the minimum QUIC allows,
+so any path that carries 1228-byte IPv4 / 1248-byte IPv6 packets connects,
+including 1280-byte tunnels such as Tailscale, ZeroTier or IPv6-in-IPv4).
+quic-go's path MTU discovery then raises it, up to 1452 bytes (a 1500-byte
+IPv6 or 1480-byte IPv4 packet); it converges within ~8 s, ending up to 20
+bytes below the real limit. The packet size barely matters for throughput:
+per-packet overhead is ~4% at 1452 bytes and ~5% at 1252.
+
+Discovery only ever raises the size (it restarts when a relay's address
+changes). If a path's MTU drops mid-connection, e.g. a route change onto a
+smaller tunnel, full-size packets vanish while small pings still pass. For
+paths like that, `mtu` fixes the packet size: MTU − 28 for IPv4 paths, − 48
+for IPv6, between 1200 and 1452, with discovery off.
+
+TCP is not encapsulated: it ends at the local and is re-chunked into QUIC
+packets, so the client's MSS is irrelevant and nothing needs MSS clamping;
+the remote's connections to targets use the remote host's own MSS.
+
+Proxied UDP has to fit in one QUIC packet to travel as a DATAGRAM. quic-go
+allows packet size − 37 bytes, minus the type byte, the association id (1–2
+bytes) and the SOCKS address (7 bytes IPv4, 19 IPv6, 4 + name for domains).
+For an IPv4 target (and a 1-byte id) that leaves 1200 − 37 − 1 − 8 = 1154
+bytes of UDP payload at the start, ~1390–1406 on a 1500-byte path after
+discovery, and `mtu − 74` with `mtu` set (1206 at 1280). A datagram that no
+path can carry:
+
+* is **dropped** if its payload is at most 1472 bytes (what a 1500-byte
+  network carries) and the paths' MTU is known (fixed, or 10 s / 40 RTTs
+  after the path came up). This is what a network with a smaller MTU does,
+  and protocols that discover the MTU themselves (QUIC inside the tunnel,
+  i.e. HTTP/3) settle at a size that fits. Sending these reliably made the
+  inner discovery succeed, so all full-size inner packets went over a
+  reliable stream: retransmissions inside retransmissions and head-of-line
+  blocking. Drops are logged (at most every 30 s) and counted in the stats
+  (`udp_too_large`); set the client's MTU ≤ the logged maximum + 28.
+* is sent **reliably** on the best path's control stream otherwise: bigger
+  datagrams (e.g. large DNS responses, which an IP network would fragment)
+  and anything while discovery may still raise the limit.
 
 ## Session layer
 
@@ -240,7 +282,10 @@ docs/CONGESTION.md for measurements.
   `max(minRTT/2, 10 ms)` *and* the delivery rate stays below ¾ of the
   estimate, the estimate is replaced by the measured delivery rate and the
   queue is drained. The long interval spans ACK-aggregation bursts (Wi-Fi,
-  cellular), which otherwise look like rate drops. The max filter itself still
+  cellular), which otherwise look like rate drops. Delivery samples marked
+  app-limited count too while the application has data: BBR marks them
+  whenever bytes in flight dip below the BDP (e.g. in loss recovery), and
+  after a rate drop that mark lasts a whole queue-inflated round trip. The max filter itself still
   counts real round trips: a wall-clock window made BBR starve against
   loss-based flows filling a deep buffer, where the inflated RTT really is the
   feedback loop. Resets are counted per path and shown in the
@@ -386,6 +431,8 @@ a bottleneck, they will together take more than one flow's fair share there.
 * A path that recovers from a long blackout waits for QUIC's exponentially
   backed-off probe timer. That takes ~1–2 s after the path heals, during
   which the other paths carry the traffic.
-* UDP datagrams are sent on the best path only, with no redundancy.
+* UDP datagrams are sent on the best path that can carry them, with no
+  redundancy.
+* A path MTU that drops mid-connection is not detected (set `mtu`).
 * SIP003 plugins and SOCKS username/password authentication aren't
   supported.

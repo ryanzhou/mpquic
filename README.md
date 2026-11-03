@@ -200,6 +200,7 @@ MPQUIC-specific flags (and config keys):
 | `--stats N` | `stats_interval` | off | log per-path RTT/bandwidth/bytes every N s |
 | `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
+| `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see docs/DESIGN.md, "Packet sizes") |
 | `--cert/--key` | `cert`/`key` | self-signed | server TLS certificate (optional, see security notes) |
 | `--sni` | `sni` | `mpquic` | client TLS SNI |
 
@@ -254,6 +255,7 @@ mpquic relay --listen :9000 --target 127.0.0.1:8388 \
 | `dup` | duplication probability |
 | `outage=EVERY/FOR` | periodic blackouts |
 | `rate2`, `flap` | alternate between `rate` and `rate2` every `flap` |
+| `mtu` | path MTU: drop packets larger than this (IPv4 size, UDP payload + 28) |
 
 ## Benchmarking
 

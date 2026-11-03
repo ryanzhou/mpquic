@@ -116,11 +116,10 @@ func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
 	if profile == ProfileCubic {
 		return nil
 	}
-	size := conn.InitialPacketSize()
-	if g := bbr.GetInitialPacketSize(conn.RemoteAddr()); g < size {
-		size = g
-	}
-	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, size, profile)}
+	// Seed with the connection's own initial packet size (see quic-go's
+	// Conn.InitialPacketSize): it is what quic-go sends until path MTU
+	// discovery reports more, and all it sends with a fixed MTU.
+	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize(), profile)}
 	m.s.AppLimitedHint = m.appLimited.Load
 	m.s.ProbeRTTGate = m.gate
 	conn.SetCongestionControl(m)

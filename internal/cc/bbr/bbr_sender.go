@@ -905,7 +905,13 @@ func (b *bbrSender) checkStaleBandwidth(now monotime.Time, rtt time.Duration, bw
 	if rtt != infRTT {
 		b.staleMinRTT = min(b.staleMinRTT, rtt)
 	}
-	if !appLimited {
+	// A sample sent while marked app-limited still measures the bottleneck
+	// if the application had data: the mark often comes from bytes in
+	// flight dipping below the BDP (loss recovery), and after a rate drop it
+	// sticks for a whole queue-inflated round trip, hiding exactly the
+	// samples that show the drop. Samples of a really idle sender (exact
+	// hint) are left out: their low rate says nothing about the bottleneck.
+	if !appLimited || b.AppLimitedHint == nil || !b.AppLimitedHint() {
 		b.staleMaxBw = max(b.staleMaxBw, bw)
 	}
 	b.staleSamples++

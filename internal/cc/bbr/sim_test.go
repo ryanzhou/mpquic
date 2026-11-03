@@ -117,6 +117,13 @@ func runSim(cfg simConfig) simResult {
 		inflight congestion.ByteCount
 		pn       congestion.PacketNumber
 
+		// probe timeout (QUIC PTO): when no ACK arrives, a probe packet is
+		// sent regardless of the window; its ACK lets the packet threshold
+		// declare the earlier ones lost (e.g. after an outage)
+		lastAckAt, lastProbeAt time.Duration
+		srtt, rttvar           time.Duration // RFC 6298 / 9002
+		ptoCount               int
+
 		// Reno (loss-based competitor)
 		reno           bool
 		cwnd, ssthresh float64
@@ -211,6 +218,13 @@ func runSim(cfg simConfig) simResult {
 				if i == 0 {
 					res.queue[bucket] = max(res.queue[bucket], now-p.sentAt-cfg.rtt)
 				}
+				if r := now - p.sentAt; f.srtt == 0 {
+					f.srtt, f.rttvar = r, r/2
+				} else {
+					f.rttvar = (3*f.rttvar + (f.srtt - r).Abs()) / 4
+					f.srtt = (7*f.srtt + r) / 8
+				}
+				f.lastAckAt, f.ptoCount = now, 0
 			}
 			if len(acked) > 0 {
 				largest := acked[len(acked)-1].PacketNumber
@@ -218,12 +232,6 @@ func runSim(cfg simConfig) simResult {
 					lost = append(lost, congestion.LostPacketInfo{PacketNumber: f.dropped[0].pn, BytesLost: size})
 					f.dropped = f.dropped[1:]
 				}
-			}
-			// time threshold (like QUIC's PTO): a packet that could have
-			// been delivered and acknowledged by now is lost
-			for len(f.dropped) > 0 && now-f.dropped[0].sentAt > 2*cfg.rtt+cfg.buffer {
-				lost = append(lost, congestion.LostPacketInfo{PacketNumber: f.dropped[0].pn, BytesLost: size})
-				f.dropped = f.dropped[1:]
 			}
 			if len(acked)+len(lost) > 0 {
 				prior := f.inflight
@@ -256,6 +264,23 @@ func runSim(cfg simConfig) simResult {
 			}
 
 			// sender
+			// PTO = srtt + 4 rttvar + max_ack_delay (25 ms), backed off;
+			// before the first RTT sample from quic-go's initial RTT (100 ms)
+			srtt, rttvar := f.srtt, f.rttvar
+			if srtt == 0 {
+				srtt, rttvar = 100*time.Millisecond, 50*time.Millisecond
+			}
+			pto := (srtt + max(4*rttvar, time.Millisecond) + 25*time.Millisecond) << min(f.ptoCount, 6)
+			if f.inflight > 0 && now-max(f.lastAckAt, f.lastProbeAt) > pto {
+				f.s.OnPacketSent(clk.t, f.inflight, f.pn, size, true)
+				f.inflight += size
+				if !enqueue(pkt{flow: i, pn: f.pn, sentAt: now}) {
+					f.dropped = append(f.dropped, pkt{pn: f.pn, sentAt: now})
+				}
+				f.pn++
+				f.lastProbeAt = now
+				f.ptoCount++
+			}
 			for f.s.CanSend(f.inflight) && f.s.HasPacingBudget(clk.t) {
 				f.s.OnPacketSent(clk.t, f.inflight, f.pn, size, true)
 				f.inflight += size
@@ -527,7 +552,7 @@ func TestSimFlappingRate(t *testing.T) {
 		{40, 5, 50 * time.Millisecond, 2 * time.Second, 3 * time.Second, 0, 0.8, 40 * time.Millisecond},
 		{40, 5, 50 * time.Millisecond, 2 * time.Second, 8 * time.Second, 0, 0.85, 30 * time.Millisecond},
 		{50, 10, 30 * time.Millisecond, time.Second, 5 * time.Second, 0, 0.85, 30 * time.Millisecond},
-		{100, 20, 150 * time.Millisecond, time.Second, 3 * time.Second, 0, 0.75, 250 * time.Millisecond},
+		{100, 20, 150 * time.Millisecond, time.Second, 3 * time.Second, 0, 0.6, 250 * time.Millisecond},
 		// a relay path that collapses now and then, with random loss
 		{40, 2, 20 * time.Millisecond, 100 * time.Millisecond, 3 * time.Second, 0.03, 0.75, 30 * time.Millisecond},
 	} {

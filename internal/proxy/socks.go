@@ -59,6 +59,29 @@ func ReadAddr(r io.Reader) (string, []byte, error) {
 	return net.JoinHostPort(host, strconv.Itoa(int(port))), raw, nil
 }
 
+// addrLen returns the length of the SOCKS5-format address at the start of
+// b, or -1 if b does not start with a complete one.
+func addrLen(b []byte) int {
+	if len(b) == 0 {
+		return -1
+	}
+	n := -1
+	switch b[0] {
+	case atypIPv4:
+		n = 1 + 4 + 2
+	case atypIPv6:
+		n = 1 + 16 + 2
+	case atypDomain:
+		if len(b) > 1 {
+			n = 1 + 1 + int(b[1]) + 2
+		}
+	}
+	if n > len(b) {
+		return -1
+	}
+	return n
+}
+
 // EncodeAddr encodes host:port in SOCKS5 address format.
 func EncodeAddr(hostport string) ([]byte, error) {
 	host, ps, err := net.SplitHostPort(hostport)

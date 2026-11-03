@@ -31,6 +31,7 @@ type Form struct {
 	Window     string
 	Chunk      string
 	Timeout    string
+	MTU        string
 	Stats      string
 	NoDup      bool
 	Cert, Key  string
@@ -90,6 +91,7 @@ func FormFromConfig(c *config.Config) Form {
 		Window:     size(c.Window),
 		Chunk:      size(c.ChunkSize),
 		Timeout:    itoa(c.Timeout),
+		MTU:        itoa(c.MTU),
 		Stats:      itoa(c.StatsInterval),
 		NoDup:      c.NoDup,
 		Cert:       c.Cert,
@@ -184,6 +186,7 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		sz("Window", f.Window, &c.Window)
 		sz("Chunk size", f.Chunk, &c.ChunkSize)
 		num("Idle timeout", f.Timeout, &c.Timeout)
+		num("Path MTU", f.MTU, &c.MTU)
 		c.NoDup = f.NoDup
 		c.Cert = strings.TrimSpace(f.Cert)
 		c.Key = strings.TrimSpace(f.Key)

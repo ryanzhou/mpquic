@@ -23,6 +23,7 @@ func TestValidate(t *testing.T) {
 		{"ss-local", config.Config{Reverse: true, Password: "p"}},
 		{"tunnel", config.Config{Server: config.StringList{"a"}, Password: "p", TunnelAddress: "h:22"}},
 		{"server", config.Config{Password: "p", Congestion: "cubic"}},
+		{"server", config.Config{Password: "p", MTU: 1280}},
 		{"remote", config.Config{Reverse: true, Servers: []config.ServerEntry{{Server: "a", Password: "p"}}}},
 		{"relay", config.Config{Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:1", Link: "delay=10ms"}}}},
 	}
@@ -46,6 +47,7 @@ func TestValidate(t *testing.T) {
 		{"remote", config.Config{Password: "p", ServerPort: 70000}, "out of range"},
 		{"remote", config.Config{Password: "p", Cert: "c.pem"}, "together"},
 		{"remote", config.Config{Password: "p", Plugin: "v2ray"}, "plugin"},
+		{"remote", config.Config{Password: "p", MTU: 1200}, "mtu"},
 		{"relay", config.Config{}, "no relays"},
 		{"relay", config.Config{Relays: []config.RelayConfig{{Listen: "9000", Target: "h:1"}}}, "listen"},
 		{"relay", config.Config{Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:1", Rev: "bogus=1"}}}, "relay 1"},

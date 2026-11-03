@@ -48,6 +48,7 @@ type Config struct {
 	Key           string        `json:"key,omitempty"`
 	SNI           string        `json:"sni,omitempty"`
 	NoDup         bool          `json:"no_dup,omitempty"`
+	MTU           int           `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
 	Relays        []RelayConfig `json:"relays,omitempty"`
 }
 

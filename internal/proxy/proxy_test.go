@@ -25,6 +25,11 @@ type env struct {
 
 func setup(t *testing.T, reverse bool) *env {
 	t.Helper()
+	return setupMTU(t, reverse, 0)
+}
+
+func setupMTU(t *testing.T, reverse bool, mtu int) *env {
+	t.Helper()
 	log := tlog()
 	// TCP echo target
 	tl, _ := net.Listen("tcp", "127.0.0.1:0")
@@ -53,8 +58,8 @@ func setup(t *testing.T, reverse bool) *env {
 	paths := []string{pc.LocalAddr().String(), pc.LocalAddr().String()}
 	udp := NewUDPLocal(nil, log)
 	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: NewUDPRemote(log).HandleDatagram,
-		StreamHandler: RemoteHandler(log, 5*time.Second)}
-	lopt := &mp.Options{Password: "x", Logger: log, DatagramHandler: udp.HandleDatagram}
+		StreamHandler: RemoteHandler(log, 5*time.Second), MTU: mtu}
+	lopt := &mp.Options{Password: "x", Logger: log, DatagramHandler: udp.HandleDatagram, MTU: mtu}
 	var opener Opener
 	var stop func()
 	if !reverse {
@@ -177,6 +182,38 @@ func TestSocksUDP(t *testing.T) { both(t, testSocksUDP) }
 
 func testSocksUDP(t *testing.T, reverse bool) {
 	e := setup(t, reverse)
+	for _, size := range []int{10, 1000, 4000} { // 4000 exceeds a QUIC datagram: control-stream fallback
+		if !udpEcho(t, e, size, 5, time.Second) {
+			t.Fatalf("no UDP echo for size %d", size)
+		}
+	}
+}
+
+// With a 1280-byte path MTU, a QUIC DATAGRAM carries 1280-28-37 = 1215
+// bytes: the type byte, the association id (1 byte) and the IPv4 address (7)
+// leave 1206 for the UDP payload. Bigger payloads up to 1472 bytes are dropped
+// as a network with that MTU would; even bigger ones are sent reliably.
+func TestSocksUDPOversize(t *testing.T) { both(t, testSocksUDPOversize) }
+
+func testSocksUDPOversize(t *testing.T, reverse bool) {
+	e := setupMTU(t, reverse, 1280)
+	for _, c := range []struct {
+		size int
+		ok   bool
+	}{{1206, true}, {1207, false}, {1472, false}, {4000, true}} {
+		tries, wait := 5, time.Second
+		if !c.ok {
+			tries, wait = 2, 300*time.Millisecond
+		}
+		if got := udpEcho(t, e, c.size, tries, wait); got != c.ok {
+			t.Errorf("payload %d: echoed %v, want %v", c.size, got, c.ok)
+		}
+	}
+}
+
+// udpEcho sends a size-byte payload to the UDP echo target through SOCKS and
+// reports whether it came back.
+func udpEcho(t *testing.T, e *env, size, tries int, wait time.Duration) bool {
 	ctl, bound := socksRequest(t, e.socks, 3, "0.0.0.0:0")
 	defer ctl.Close()
 	port := binary.BigEndian.Uint16(bound[len(bound)-2:])
@@ -184,13 +221,13 @@ func testSocksUDP(t *testing.T, reverse bool) {
 	uc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	defer uc.Close()
 	target, _ := EncodeAddr(e.udpEcho.String())
-	for _, size := range []int{10, 1000, 4000} { // 4000 exceeds a QUIC datagram: control-stream fallback
+	{
 		payload := bytes.Repeat([]byte{byte(size)}, size)
 		pkt := append(append([]byte{0, 0, 0}, target...), payload...)
 		ok := false
-		for try := 0; try < 5 && !ok; try++ {
+		for try := 0; try < tries && !ok; try++ {
 			uc.WriteToUDP(pkt, relay)
-			uc.SetReadDeadline(time.Now().Add(time.Second))
+			uc.SetReadDeadline(time.Now().Add(wait))
 			b := make([]byte, 65536)
 			n, _, err := uc.ReadFromUDP(b)
 			if err != nil {
@@ -207,9 +244,7 @@ func testSocksUDP(t *testing.T, reverse bool) {
 			got, _ := io.ReadAll(r)
 			ok = bytes.Equal(got, payload)
 		}
-		if !ok {
-			t.Fatalf("no UDP echo for size %d", size)
-		}
+		return ok
 	}
 }
 
@@ -222,6 +257,12 @@ func TestAddrCodec(t *testing.T) {
 		got, raw, err := ReadAddr(bytes.NewReader(b))
 		if err != nil || got != a || !bytes.Equal(raw, b) {
 			t.Fatalf("%s -> %s (%v)", a, got, err)
+		}
+		if n := addrLen(append(b, 1, 2, 3)); n != len(b) {
+			t.Fatalf("addrLen(%s) = %d, want %d", a, n, len(b))
+		}
+		if n := addrLen(b[:len(b)-1]); n != -1 {
+			t.Fatalf("addrLen(truncated %s) = %d", a, n)
 		}
 	}
 }

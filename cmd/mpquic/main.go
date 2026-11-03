@@ -114,6 +114,9 @@ mpquic options:
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths
+  --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
+                    size, no MTU discovery (default: start at 1200-byte
+                    packets and discover each path's MTU)
   --cert/--key FILE TLS certificate for the server (optional)
   --sni NAME        TLS server name sent by the client
 
@@ -121,7 +124,7 @@ Relay options:
   --listen ADDR --target HOST:PORT [--link SPEC] [--fwd SPEC] [--rev SPEC]
   SPEC: delay=40ms,jitter=5ms,loss=1%,burst=3,rate=20mbit,queue=80ms,
         police=10mbit,reorder=1%,reorder_delay=10ms,dup=0.1%,outage=30s/2s,
-        rate2=5mbit,flap=10s
+        rate2=5mbit,flap=10s,mtu=1280
 `)
 }
 
@@ -133,7 +136,7 @@ type commonFlags struct {
 	localAddr, password        string
 	method, tunnel, congestion string
 	window, chunk              string
-	stats                      int
+	stats, mtu                 int
 	verbose, noDup             bool
 	cert, key, sni, logLevel   string
 	plugin                     string
@@ -160,6 +163,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.StringVar(&f.window, "window", "", "stream window")
 	fs.StringVar(&f.chunk, "chunk", "", "chunk size")
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
+	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
 	fs.StringVar(&f.cert, "cert", "", "TLS certificate")
 	fs.StringVar(&f.key, "key", "", "TLS key")
@@ -170,7 +174,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	var ign string
 	var ignb bool
 	var igni int
-	for _, n := range []string{"a", "f", "plugin-opts", "acl", "mtu", "manager-address", "executable", "d", "protocol"} {
+	for _, n := range []string{"a", "f", "plugin-opts", "acl", "manager-address", "executable", "d", "protocol"} {
 		fs.StringVar(&ign, n, "", "ignored")
 	}
 	fs.BoolVar(&f.reverse, "reverse", false, "reverse mode")
@@ -242,6 +246,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.stats != 0 {
 		cfg.StatsInterval = f.stats
+	}
+	if f.mtu != 0 {
+		cfg.MTU = f.mtu
 	}
 	if f.verbose {
 		cfg.Verbose = true
