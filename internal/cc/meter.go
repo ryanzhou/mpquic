@@ -27,6 +27,9 @@ type Metrics struct {
 	// packets sent / declared lost so far (quic-go only counts losses
 	// itself when its built-in controller is used)
 	PacketsSent, PacketsLost uint64
+	// StaleResets counts bandwidth estimates found stale (rate drop with a
+	// standing queue) and reset to the measured delivery rate.
+	StaleResets uint64
 }
 
 // Meter wraps a BBR sender and publishes its state through atomics. All
@@ -46,6 +49,7 @@ type Meter struct {
 	probeGate  atomic.Pointer[ProbeGate]
 	sentPkts   atomic.Uint64
 	lostPkts   atomic.Uint64
+	stale      atomic.Uint64
 }
 
 // ProbeGate serialises BBR PROBE_RTT among the connections sharing it (the
@@ -135,6 +139,7 @@ func (m *Meter) Snapshot() Metrics {
 
 		PacketsSent: m.sentPkts.Load(),
 		PacketsLost: m.lostPkts.Load(),
+		StaleResets: m.stale.Load(),
 	}
 }
 
@@ -149,6 +154,7 @@ func (m *Meter) publish() {
 	m.mode.Store(m.s.ModeName())
 	m.bw.Store(m.s.BandwidthEstimate())
 	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))
+	m.stale.Store(m.s.StaleResets)
 	if m.hasRTT.Load() {
 		m.minRTT.Store(int64(m.s.MinRTT()))
 		m.pacing.Store(m.s.PacingRateBytes())

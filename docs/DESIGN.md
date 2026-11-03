@@ -219,6 +219,51 @@ seconds. The scheduler therefore tells BBR exactly when a path's sender is
 idle (an app-limited hint), so samples from idle periods are ignored. This
 alone doubled post-idle throughput in one scenario (45 → 76 Mbit/s).
 
+Further changes keep queues short (bufferbloat), since every stream of
+a session shares the paths' bottleneck queues: a bulk download's queue is
+latency added to every interactive stream through the tunnel. See
+docs/CONGESTION.md for measurements.
+
+* **Drain to target.** Stock BBRv1 paces at a max-filtered bandwidth estimate
+  that is a little above the real rate, and its 0.75 gain phase ends after
+  one min RTT whether or not the queue built by the 1.25 probe has drained.
+  It ends up limited by its 2·BDP window with a standing queue of a whole
+  BDP, which doubles the path RTT under load. The default profile holds the
+  0.75 phase until bytes in flight are down to the BDP.
+* **Stale estimate reset.** When the bottleneck rate drops (cellular, Wi-Fi,
+  a relay whose uplink gets busy), BBRv1 keeps pacing at the old rate until
+  the old samples leave its 10-round max filter. With a deep buffer nothing
+  is lost, the queue grows to the 2·BDP window, and the rounds the filter
+  counts stretch with the queue: an 8× drop kept ~0.8 s of queue for many
+  seconds. BBR never holds a queue for a whole min RTT on its own, so if for
+  `max(2·minRTT, 100 ms)` every RTT sample shows a queue of at least
+  `max(minRTT/2, 10 ms)` *and* the delivery rate stays below ¾ of the
+  estimate, the estimate is replaced by the measured delivery rate and the
+  queue is drained. The long interval spans ACK-aggregation bursts (Wi-Fi,
+  cellular), which otherwise look like rate drops. The max filter itself still
+  counts real round trips: a wall-clock window made BBR starve against
+  loss-based flows filling a deep buffer, where the inflated RTT really is the
+  feedback loop. Resets are counted per path and shown in the
+  session's stats log line as `rate_drops=N`.
+* **Regrowth after a rate drop.** BBRv1 grows its estimate by at most 25%
+  per gain cycle (8 min RTTs), so after a reset a rate that comes back (a
+  flapping link) would take ~10 s to be used again at 150 ms RTT. For 10 s
+  after a reset, while the estimate is below the old one, the gain cycle
+  therefore re-probes (1.25) right after each drain, and once the estimate
+  has grown by 15% since a probe started BBR re-enters STARTUP. In the
+  simulator, on a link flapping between 40 and 5 Mbit/s every 3 s (50 ms
+  RTT) this uses ~93% of the capacity with a median queue of ~15 ms; stock
+  BBRv1 used ~97% but kept the buffer full (median queue 170–260 ms).
+* **ProbeRTT turn-taking** (see below) only holds the session-wide turn while
+  actually in ProbeRTT. A path whose min RTT expired on the first ACK after
+  an idle period skips ProbeRTT; it used to keep the turn forever, so no other
+  path of the session ever probed again.
+
+The `bbr-conservative` profile's overestimate avoidance (Chromium's "A0"
+sampler) is not used by default: under ACK aggregation on low-RTT paths (ACKs
+in 10–40 ms bursts on a 5–10 ms path) it collapses the estimate to a few
+percent of the link.
+
 ### Lossy and misbehaving paths
 
 The rule is: **adding a path must never make the session worse than leaving
@@ -324,16 +369,20 @@ a bottleneck, they will together take more than one flow's fair share there.
   ~1.3 Gbit/s at 150 ms (see docs/CONGESTION.md).
 * `chunk_size` (16 KB) is the scheduling granularity.
 * `congestion`: `bbr` (default), `bbr-aggressive` (faster startup),
-  `bbr-conservative` (less queueing), `cubic` (quic-go's built-in loss-based
-  controller, for comparison only: it collapses under random loss).
+  `bbr-conservative` (gentler startup; avoid on Wi-Fi/cellular paths with
+  low RTT, see above), `cubic` (quic-go's built-in loss-based controller, for
+  comparison only: it collapses under random loss and fills deep buffers).
 * `no_dup`: disables duplication if the relay traffic is metered.
 
 ## Limitations / future work
 
 * No congestion coupling between paths that share a bottleneck.
-* BBRv1 builds about one BDP of queue on a saturated path, so interactive
-  latency under full load roughly doubles the path's base RTT. That's similar
-  to a single TCP flow.
+* A sudden rate drop still costs one window's worth of queue: what is already
+  in flight (up to 2·BDP at the old rate) has to drain at the new rate before
+  the queue is gone (~1 s for an 8× drop at 50 ms RTT), and smaller drops
+  (< 25%) are left to BBR's 10-round filter.
+* Against a loss-based flow filling a deep buffer, BBRv1 gets a minority
+  share (~20% against Reno in the simulator), as before.
 * A path that recovers from a long blackout waits for QUIC's exponentially
   backed-off probe timer. That takes ~1–2 s after the path heals, during
   which the other paths carry the traffic.

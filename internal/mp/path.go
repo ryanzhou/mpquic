@@ -66,6 +66,7 @@ type Path struct {
 	bw, cwnd     uint64
 	pacing       uint64
 	ccMode       string
+	staleResets  uint64 // BBR stale-estimate resets (rate drops)
 	// measured send rate (fallback when the controller exposes no estimate)
 	measRate  float64
 	measAt    time.Time
@@ -446,6 +447,7 @@ func (p *Path) refreshStatsLocked() {
 		p.cwnd = m.Cwnd
 		p.pacing = m.Pacing
 		p.ccMode = m.Mode
+		p.staleResets = m.StaleResets
 	}
 }
 
@@ -832,5 +834,6 @@ func (p *Path) statLocked() PathStat {
 		Name: p.name, Index: int(p.index), State: state, SRTT: p.srtt, MinRTT: p.minRTT,
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
+		StaleResets: p.staleResets,
 	}
 }

@@ -156,12 +156,22 @@ func configForProfile(profile Profile) profileConfig {
 			expireAckAggregationStartup:  true,
 		}
 	default:
+		// mpquic: drainToTarget. Pacing at a max-filtered estimate that is a
+		// little above the real rate, standard BBRv1 never drained the queue
+		// its 1.25 probe built (the 0.75 phase ended after one min_rtt
+		// regardless), became cwnd-limited at 2*BDP and kept a standing queue
+		// of a whole BDP: every other stream through the tunnel saw twice the
+		// path RTT during a bulk transfer. Holding the 0.75 phase until
+		// in-flight <= BDP fixes this at no throughput cost. (The conservative
+		// profile's overestimate avoidance is not used: under ACK aggregation,
+		// e.g. Wi-Fi, on low-RTT paths it collapses the estimate.)
 		return profileConfig{
 			highGain:                     defaultHighGain,
 			highCwndGain:                 derivedHighCWNDGain,
 			congestionWindowGainConstant: 2.0,
 			numStartupRtts:               roundTripsWithoutGrowthBeforeExitingStartup,
 			bytesLostMultiplier:          2,
+			drainToTarget:                true,
 		}
 	}
 }
@@ -331,6 +341,24 @@ type bbrSender struct {
 	// (enter=false). mpquic uses it so that only one path of a session
 	// probes at a time.
 	ProbeRTTGate func(enter bool) bool
+	// holdsProbeGate: ProbeRTTGate(true) succeeded and has not been released
+	// yet. The gate must only be held while in PROBE_RTT.
+	holdsProbeGate bool
+
+	// Stale-estimate detection (mpquic), see checkStaleBandwidth.
+	staleStart    monotime.Time
+	staleMinRTT   time.Duration
+	staleMaxBw    Bandwidth
+	staleSamples  int
+	staleCooldown bool
+	// After a reset: the estimate before it, until when to re-probe quickly
+	// and the estimate when the last 1.25 probe started (see
+	// maybeRegrowAfterStale).
+	staleOldBw        Bandwidth
+	staleReprobeUntil monotime.Time
+	probeStartBw      Bandwidth
+	// StaleResets counts estimate resets by checkStaleBandwidth (stats).
+	StaleResets uint64
 }
 
 var _ congestion.CongestionControl = &bbrSender{}
@@ -606,6 +634,9 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	if sample.sampleRtt != infRTT {
 		minRttExpired = b.maybeUpdateMinRtt(eventTime, sample.sampleRtt)
 	}
+	if b.mode == bbrModeProbeBw && totalBytesAckedBefore != b.sampler.TotalBytesAcked() {
+		b.checkStaleBandwidth(eventTime, sample.sampleRtt, sample.sampleMaxBandwidth, sample.sampleIsAppLimited)
+	}
 	bytesLost = b.sampler.TotalBytesLost() - totalBytesLostBefore
 
 	excessAcked = sample.extraAcked
@@ -619,6 +650,7 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	// Handle logic specific to PROBE_BW mode.
 	if b.mode == bbrModeProbeBw {
 		b.updateGainCyclePhase(eventTime, priorInFlight, len(lostPackets) != 0)
+		b.maybeRegrowAfterStale(eventTime)
 	}
 
 	// Handle logic specific to STARTUP and DRAIN modes.
@@ -762,13 +794,18 @@ func (b *bbrSender) maybeUpdateMinRtt(now monotime.Time, sampleMinRtt time.Durat
 		b.minRttExpiryJittered = time.Duration(float64(minRttExpiry) * (0.75 + 0.5*rand.Float64()))
 	}
 	minRttExpired := b.minRtt != 0 && now.After(b.minRttTimestamp.Add(b.minRttExpiryJittered))
-	if minRttExpired && b.mode != bbrModeProbeRtt && b.ProbeRTTGate != nil && !b.ProbeRTTGate(true) {
-		minRttExpired = false // another path is probing; retry on a later ACK
-		if sampleMinRtt < b.minRtt {
-			b.minRtt = sampleMinRtt // fresh minimum: no probe needed
-			b.minRttTimestamp = now
+	if minRttExpired && b.mode != bbrModeProbeRtt && b.ProbeRTTGate != nil {
+		if !b.ProbeRTTGate(true) {
+			// another path is probing; retry on a later ACK
+			if sampleMinRtt < b.minRtt {
+				b.minRtt = sampleMinRtt // fresh minimum: no probe needed
+				b.minRttTimestamp = now
+			}
+			return false
 		}
-		return false
+		// Released by maybeEnterOrExitProbeRtt if PROBE_RTT is not entered
+		// after all (exiting quiescence), or when it ends.
+		b.holdsProbeGate = true
 	}
 	if minRttExpired || sampleMinRtt < b.minRtt || b.minRtt == 0 {
 		b.minRtt = sampleMinRtt
@@ -806,6 +843,8 @@ func (b *bbrSender) enterProbeBandwidthMode(now monotime.Time) {
 
 	b.lastCycleStart = now
 	b.pacingGain = pacingGain[b.cycleCurrentOffset]
+	b.probeStartBw = b.bandwidthEstimate()
+	b.resetStaleWindow(now)
 
 	if b.debug {
 		b.debugPrint("Phase: PROBE_BW")
@@ -821,6 +860,116 @@ func (b *bbrSender) updateRoundTripCounter(lastAckedPacket congestion.PacketNumb
 		return true
 	}
 	return false
+}
+
+// Stale bandwidth estimate detection (mpquic). BBRv1 keeps the max delivery
+// rate of the last ~10 rounds. When the bottleneck rate drops (cellular,
+// Wi-Fi, a relay whose uplink gets busy), it keeps pacing at the old rate
+// until the old samples expire, filling a deep buffer up to its 2*BDP window,
+// and without loss nothing else reacts: latency stays inflated by up to a
+// second for many seconds. BBR itself never keeps a queue for a whole min_rtt
+// in PROBE_BW (the 1.25 phase adds 0.25*BDP for one min_rtt; the 0.75 phase
+// drains it). So if, over an interval of max(2*min_rtt, 100ms), every RTT
+// sample shows a queue of at least max(min_rtt/2, 10ms) AND the highest
+// non-app-limited delivery rate is below 3/4 of the estimate, the estimate is
+// stale: it is replaced by the measured delivery rate and the queue is drained
+// (0.75 gain phase, held until in-flight <= BDP with drainToTarget). The
+// delivery rate while a queue persists is what the bottleneck currently gives
+// us, so this only fast-forwards what the max filter would do after its
+// window. At most once per gain cycle (re-armed by the next 1.25 phase).
+//
+// The interval spans ACK-aggregation bursts (Wi-Fi, cellular), whose short-
+// term delivery rate and RTT look like a rate drop. The max filter itself is
+// deliberately still counted in real round trips: against a loss-based flow
+// filling the buffer, the feedback loop really is the inflated RTT, and a
+// window in wall-clock time made BBR lose its 1.25 probes' gains and starve.
+const (
+	staleQueueFrac = 0.5
+	staleQueueMin  = 10 * time.Millisecond
+	staleBwFrac    = 0.75
+	staleWindowMin = 100 * time.Millisecond
+	staleMinEvents = 4
+)
+
+func (b *bbrSender) resetStaleWindow(now monotime.Time) {
+	b.staleStart = now
+	b.staleMinRTT = infRTT
+	b.staleMaxBw = 0
+	b.staleSamples = 0
+}
+
+func (b *bbrSender) checkStaleBandwidth(now monotime.Time, rtt time.Duration, bw Bandwidth, appLimited bool) {
+	if b.staleStart.IsZero() {
+		b.resetStaleWindow(now)
+	}
+	if rtt != infRTT {
+		b.staleMinRTT = min(b.staleMinRTT, rtt)
+	}
+	if !appLimited {
+		b.staleMaxBw = max(b.staleMaxBw, bw)
+	}
+	b.staleSamples++
+	if b.minRtt <= 0 || now.Sub(b.staleStart) < max(2*b.minRtt, staleWindowMin) {
+		return
+	}
+	queue := b.staleMinRTT - b.minRtt
+	if !b.staleCooldown && b.staleSamples >= staleMinEvents && b.staleMaxBw > 0 && b.staleMinRTT != infRTT &&
+		queue >= max(time.Duration(staleQueueFrac*float64(b.minRtt)), staleQueueMin) &&
+		float64(b.staleMaxBw) < staleBwFrac*float64(b.bandwidthEstimate()) {
+		if b.debug {
+			b.debugPrint("stale bandwidth estimate %s, delivering %s with %v queue: reset",
+				formatSpeed(b.bandwidthEstimate()), formatSpeed(b.staleMaxBw), queue)
+		}
+		b.staleOldBw = max(b.staleOldBw, b.bandwidthEstimate())
+		b.staleReprobeUntil = now.Add(staleReprobeTime)
+		b.probeStartBw = b.staleMaxBw
+		b.maxBandwidth.Reset(b.staleMaxBw, b.roundTripCount)
+		b.sampler.ResetMaxAckHeightTracker(0, b.roundTripCount)
+		b.cycleCurrentOffset = 1 // 0.75: drain the queue
+		b.pacingGain = pacingGain[b.cycleCurrentOffset]
+		b.lastCycleStart = now
+		b.staleCooldown = true
+		b.StaleResets++
+	}
+	b.resetStaleWindow(now)
+}
+
+// After a reset the capacity may come back (a flapping cellular/Wi-Fi rate),
+// and BBRv1 regrows its estimate by at most 25% per gain cycle of 8 min_rtt:
+// 5 -> 40 Mbit/s takes ~10 cycles, 12 s at 150 ms RTT. So while the estimate
+// is below the pre-reset one, for up to staleReprobeTime after the reset, the
+// gain cycle goes straight from the drain phase back to the 1.25 probe (each
+// probe adds at most 0.25*BDP of the new, small BDP for one min_rtt). Once the
+// estimate has grown by 15% since a probe started (the samples showing it
+// arrive a round trip later, usually in the following phases), the capacity is
+// coming back and BBR re-enters STARTUP, which finds the new rate within a few
+// round trips and drains its queue on exit as usual.
+const (
+	staleReprobeTime  = 10 * time.Second
+	staleRegrowFactor = 1.15
+)
+
+func (b *bbrSender) maybeRegrowAfterStale(now monotime.Time) {
+	if b.staleOldBw == 0 || b.mode != bbrModeProbeBw {
+		return
+	}
+	if float64(b.bandwidthEstimate()) >= 0.8*float64(b.staleOldBw) {
+		b.staleOldBw = 0 // recovered
+		return
+	}
+	if b.probeStartBw > 0 &&
+		float64(b.bandwidthEstimate()) >= staleRegrowFactor*float64(b.probeStartBw) {
+		if b.debug {
+			b.debugPrint("capacity growing after a rate drop (%s -> %s): STARTUP",
+				formatSpeed(b.probeStartBw), formatSpeed(b.bandwidthEstimate()))
+		}
+		b.staleOldBw = 0
+		b.isAtFullBandwidth = false
+		b.roundsWithoutBandwidthGain = 0
+		b.bandwidthAtLastRound = b.bandwidthEstimate()
+		b.recoveryState = bbrRecoveryStateNotInRecovery
+		b.enterStartupMode(now)
+	}
 }
 
 // Updates the current gain used in PROBE_BW mode.
@@ -854,7 +1003,15 @@ func (b *bbrSender) updateGainCyclePhase(now monotime.Time, priorInFlight conges
 			b.bytesInFlight > b.getTargetCongestionWindow(1) {
 			return
 		}
+		if b.staleOldBw > 0 && now.Before(b.staleReprobeUntil) && b.pacingGain < 1 && pacingGain[b.cycleCurrentOffset] == 1 {
+			// re-probe right after the drain (see maybeRegrowAfterStale)
+			b.cycleCurrentOffset = 0
+		}
 		b.pacingGain = pacingGain[b.cycleCurrentOffset]
+		if b.pacingGain > 1 {
+			b.staleCooldown = false
+			b.probeStartBw = b.bandwidthEstimate()
+		}
 	}
 }
 
@@ -943,9 +1100,6 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, mi
 			}
 			if now.Sub(b.exitProbeRttAt) >= 0 && b.probeRttRoundPassed {
 				b.minRttTimestamp = now
-				if b.ProbeRTTGate != nil {
-					b.ProbeRTTGate(false)
-				}
 				if b.debug {
 					b.debugPrint("MinRTT: %s", b.getMinRtt())
 				}
@@ -956,6 +1110,15 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, mi
 				}
 			}
 		}
+	}
+
+	// The gate is only held while probing. Without this, a path whose
+	// min_rtt expired on the first ACK after an idle period (which skips
+	// PROBE_RTT) kept the gate forever, and no other path of the session
+	// could probe again.
+	if b.holdsProbeGate && b.mode != bbrModeProbeRtt {
+		b.holdsProbeGate = false
+		b.ProbeRTTGate(false)
 	}
 
 	b.exitingQuiescence = false

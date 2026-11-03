@@ -394,6 +394,38 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 	var total atomic.Int64
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	// Latency under load: a small echo every 100 ms through the same session
+	// while the transfer runs (after the 2 s warm-up), against the idle
+	// latency measured first. This is what bufferbloat costs every other
+	// stream through the tunnel.
+	probe := b.dial('E', 0)
+	idle := echoRTTs(probe, 5, 20*time.Millisecond, 100)
+	var loaded []time.Duration
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		select {
+		case <-stop:
+			return
+		case <-time.After(2 * time.Second):
+		}
+		buf := make([]byte, 100)
+		for {
+			t := time.Now()
+			if _, err := probe.Write(buf); err != nil {
+				return
+			}
+			if _, err := io.ReadFull(probe, buf); err != nil {
+				return
+			}
+			loaded = append(loaded, time.Since(t))
+			select {
+			case <-stop:
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}()
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
@@ -426,31 +458,38 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 	var samples []float64
 	var fine []float64 // 100 ms buckets after the 2 s warm-up, for jitter
 	last, lastFine := base, base
+	// Samples are taken every 500 ms / 100 ms of wall time and divided by the
+	// time that actually elapsed (counting 10 ms sleeps overstated the rate
+	// by the sleeps' overshoot, a few percent).
+	lastAt, lastFineAt := start, start
 	var maxStall time.Duration
 	lastProgress := time.Now()
 	progressAt := base
-	for i := 1; time.Since(start) < dur; i++ {
+	for time.Since(start) < dur {
 		time.Sleep(10 * time.Millisecond)
 		cur := counter.Load()
+		now := time.Now()
 		if cur != progressAt {
-			progressAt, lastProgress = cur, time.Now()
-		} else if g := time.Since(lastProgress); g > maxStall && time.Since(start) > 2*time.Second {
+			progressAt, lastProgress = cur, now
+		} else if g := now.Sub(lastProgress); g > maxStall && now.Sub(start) > 2*time.Second {
 			maxStall = g
 		}
-		if i%10 == 0 {
-			if time.Since(start) > 2*time.Second {
-				fine = append(fine, mbps(cur-lastFine, 100*time.Millisecond))
+		if now.Sub(lastFineAt) >= 100*time.Millisecond {
+			if now.Sub(start) > 2*time.Second {
+				fine = append(fine, mbps(cur-lastFine, now.Sub(lastFineAt)))
 			}
-			lastFine = cur
+			lastFine, lastFineAt = cur, now
 		}
-		if i%50 == 0 {
-			samples = append(samples, mbps(cur-last, 500*time.Millisecond))
-			last = cur
+		if now.Sub(lastAt) >= 500*time.Millisecond {
+			samples = append(samples, mbps(cur-last, now.Sub(lastAt)))
+			last, lastAt = cur, now
 		}
 	}
 	got := counter.Load() - base
 	el := time.Since(start)
 	close(stop)
+	probe.Close()
+	<-probeDone
 	wg.Wait()
 	if cmd == 'R' {
 		waitDrain()
@@ -470,6 +509,10 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		name = "upload"
 	}
 	fmt.Printf("bulk     %s x%d: avg=%.1f Mbit/s steady=%.1f Mbit/s  [%s]\n", name, n, mbps(got, el), ss, b.pathShare())
+	if len(loaded) > 0 && len(idle) > 0 {
+		fmt.Printf("loaded   echo 100B during %s x%d: %s idle_p50=%v\n", name, len(loaded), fmtLat(loaded),
+			pct(idle, .5).Round(100*time.Microsecond))
+	}
 	if len(fine) > 0 && os.Getenv("MPBENCH_FINE") != "" {
 		fmt.Printf("         100ms: %s\n", fmtSamples(fine))
 	}

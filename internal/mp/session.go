@@ -641,6 +641,8 @@ type PathStat struct {
 	RecvBytes uint64
 	LostBytes uint64
 	Loss      float64 // estimated packet loss rate
+	// StaleResets: BBR bandwidth estimates reset after a rate drop
+	StaleResets uint64
 }
 
 // Stats returns per-path statistics.
@@ -661,8 +663,12 @@ func (s *Session) statsStringLocked() string {
 			b.WriteString("; ")
 		}
 		st := p.statLocked()
-		fmt.Fprintf(&b, "%s[%s rtt=%v bw=%.1fMbit/s tx=%dMB rx=%dMB lost=%dKB]", st.Name, st.State,
+		fmt.Fprintf(&b, "%s[%s rtt=%v bw=%.1fMbit/s tx=%dMB rx=%dMB lost=%dKB", st.Name, st.State,
 			st.SRTT.Round(time.Millisecond), float64(st.Bandwidth)*8/1e6, st.SentBytes>>20, st.RecvBytes>>20, st.LostBytes>>10)
+		if st.StaleResets > 0 {
+			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
+		}
+		b.WriteString("]")
 	}
 	return b.String()
 }
