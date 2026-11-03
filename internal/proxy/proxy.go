@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -97,10 +98,26 @@ func (l *Local) handle(c net.Conn, tunnelAddr []byte) {
 	Pipe(c, st)
 }
 
+// RemoteOptions configure the remote's outbound TCP connections.
+type RemoteOptions struct {
+	// DialTimeout bounds DNS resolution plus connection setup (default 10s).
+	DialTimeout time.Duration
+	// RaceConnect races up to 5 staggered connection attempts per target
+	// (see raceDialer) and keeps the first that connects.
+	RaceConnect bool
+}
+
 // RemoteHandler returns a stream handler for the server side: it reads the
 // target address, dials it and relays data.
-func RemoteHandler(log *slog.Logger, dialTimeout time.Duration) func(*mp.Stream) {
-	d := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+func RemoteHandler(log *slog.Logger, opt RemoteOptions) func(*mp.Stream) {
+	if opt.DialTimeout <= 0 {
+		opt.DialTimeout = 10 * time.Second
+	}
+	d := &net.Dialer{Timeout: opt.DialTimeout, KeepAlive: 30 * time.Second}
+	var race *raceDialer
+	if opt.RaceConnect {
+		race = newRaceDialer()
+	}
 	return func(st *mp.Stream) {
 		target, _, err := ReadAddr(st)
 		if err != nil {
@@ -108,15 +125,27 @@ func RemoteHandler(log *slog.Logger, dialTimeout time.Duration) func(*mp.Stream)
 			st.Close()
 			return
 		}
-		c, err := d.Dial("tcp", target)
+		start := time.Now()
+		var c net.Conn
+		var extra []any
+		if race != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), opt.DialTimeout)
+			var rs raceStats
+			c, rs, err = race.dialContext(ctx, target)
+			cancel()
+			extra = []any{"attempts", rs.attempts, "winner", rs.winner}
+		} else {
+			c, err = d.Dial("tcp", target)
+		}
+		dial := time.Since(start).Round(time.Millisecond)
 		if err != nil {
-			log.Debug("dial failed", "target", target, "err", err)
+			log.Debug("dial failed", append([]any{"target", target, "err", err, "after", dial}, extra...)...)
 			st.Reset(mp.ResetDialFailed)
 			st.Close()
 			return
 		}
 		setNoDelay(c)
-		log.Debug("connect", "target", target, "stream", st.ID())
+		log.Debug("connect", append([]any{"target", target, "stream", st.ID(), "dial", dial}, extra...)...)
 		Pipe(c, st)
 	}
 }

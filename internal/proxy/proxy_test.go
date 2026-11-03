@@ -25,10 +25,15 @@ type env struct {
 
 func setup(t *testing.T, reverse bool) *env {
 	t.Helper()
-	return setupMTU(t, reverse, 0)
+	return setupOpts(t, reverse, 0, RemoteOptions{DialTimeout: 5 * time.Second})
 }
 
 func setupMTU(t *testing.T, reverse bool, mtu int) *env {
+	t.Helper()
+	return setupOpts(t, reverse, mtu, RemoteOptions{DialTimeout: 5 * time.Second})
+}
+
+func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
 	t.Helper()
 	log := tlog()
 	// TCP echo target
@@ -58,7 +63,7 @@ func setupMTU(t *testing.T, reverse bool, mtu int) *env {
 	paths := []string{pc.LocalAddr().String(), pc.LocalAddr().String()}
 	udp := NewUDPLocal(nil, log)
 	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: NewUDPRemote(log).HandleDatagram,
-		StreamHandler: RemoteHandler(log, 5*time.Second), MTU: mtu}
+		StreamHandler: RemoteHandler(log, ro), MTU: mtu}
 	lopt := &mp.Options{Password: "x", Logger: log, DatagramHandler: udp.HandleDatagram, MTU: mtu}
 	var opener Opener
 	var stop func()
@@ -144,6 +149,24 @@ func testSocksConnect(t *testing.T, reverse bool) {
 	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, msg) {
 		t.Fatalf("echo mismatch: %v", err)
 	}
+}
+
+// With race_connect, the remote's outbound connections work the same.
+func TestSocksConnectRace(t *testing.T) {
+	both(t, func(t *testing.T, reverse bool) {
+		e := setupOpts(t, reverse, 0, RemoteOptions{DialTimeout: 5 * time.Second, RaceConnect: true})
+		_, port, _ := net.SplitHostPort(e.tcpEcho)
+		for _, target := range []string{e.tcpEcho, net.JoinHostPort("localhost", port)} {
+			c, _ := socksRequest(t, e.socks, 1, target)
+			c.Write([]byte("ping"))
+			b := make([]byte, 4)
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(c, b); err != nil || string(b) != "ping" {
+				t.Fatalf("%s: echo %q %v", target, b, err)
+			}
+			c.Close()
+		}
+	})
 }
 
 func TestSocksConnectRefused(t *testing.T) { both(t, testSocksConnectRefused) }

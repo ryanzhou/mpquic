@@ -75,9 +75,9 @@ func main() {
 	lopt, dopt := *opt, *opt
 	if *reverse {
 		lopt.SingleSession = true
-		dopt.StreamHandler = proxy.RemoteHandler(log, 5*time.Second)
+		dopt.StreamHandler = proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 5 * time.Second})
 	} else {
-		lopt.StreamHandler = proxy.RemoteHandler(log, 5*time.Second)
+		lopt.StreamHandler = proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 5 * time.Second})
 	}
 	srv, err := mp.NewServer(&lopt, nil)
 	check(err)

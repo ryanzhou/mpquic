@@ -117,6 +117,11 @@ mpquic options:
   --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
                     size, no MTU discovery (default: start at 1200-byte
                     packets and discover each path's MTU)
+  --race-connect    remote only (aggressive): open each outbound TCP
+                    connection by racing up to 5 attempts, started at 0, 100,
+                    300, 600 and 1000 ms (each from a new source port, rotating
+                    over the target's IPs); the first to connect wins. For
+                    networks/NATs that drop connection setup (SYNs)
   --cert/--key FILE TLS certificate for the server (optional)
   --sni NAME        TLS server name sent by the client
 
@@ -137,7 +142,7 @@ type commonFlags struct {
 	method, tunnel, congestion string
 	window, chunk              string
 	stats, mtu                 int
-	verbose, noDup             bool
+	verbose, noDup, race       bool
 	cert, key, sni, logLevel   string
 	plugin                     string
 	udp, udpOnly, reverse      bool
@@ -165,6 +170,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
 	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
+	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")
 	fs.StringVar(&f.cert, "cert", "", "TLS certificate")
 	fs.StringVar(&f.key, "key", "", "TLS key")
 	fs.StringVar(&f.sni, "sni", "", "TLS SNI")
@@ -255,6 +261,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.noDup {
 		cfg.NoDup = true
+	}
+	if f.race {
+		cfg.RaceConnect = true
 	}
 	if f.cert != "" {
 		cfg.Cert, cfg.Key = f.cert, f.key

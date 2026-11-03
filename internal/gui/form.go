@@ -34,9 +34,11 @@ type Form struct {
 	MTU        string
 	Stats      string
 	NoDup      bool
-	Cert, Key  string
-	SNI        string
-	LogLevel   string
+	// RaceConnect (remote): race staggered outbound TCP connection attempts.
+	RaceConnect bool
+	Cert, Key   string
+	SNI         string
+	LogLevel    string
 }
 
 // DefaultConfig is the config of a new instance.
@@ -77,27 +79,28 @@ func FormFromConfig(c *config.Config) Form {
 		logLevel = "info"
 	}
 	return Form{
-		Role:       role,
-		Reverse:    c.Reverse,
-		Paths:      strings.Join(paths, "\n"),
-		Port:       itoa(c.ServerPort),
-		Password:   c.EffectivePassword(),
-		UDP:        c.UDPEnabled(),
-		LocalAddr:  c.LocalAddress,
-		LocalPort:  itoa(c.LocalPort),
-		Tunnel:     c.TunnelAddress,
-		Relays:     FormatRelays(c.Relays),
-		Congestion: c.Congestion,
-		Window:     size(c.Window),
-		Chunk:      size(c.ChunkSize),
-		Timeout:    itoa(c.Timeout),
-		MTU:        itoa(c.MTU),
-		Stats:      itoa(c.StatsInterval),
-		NoDup:      c.NoDup,
-		Cert:       c.Cert,
-		Key:        c.Key,
-		SNI:        c.SNI,
-		LogLevel:   logLevel,
+		Role:        role,
+		Reverse:     c.Reverse,
+		Paths:       strings.Join(paths, "\n"),
+		Port:        itoa(c.ServerPort),
+		Password:    c.EffectivePassword(),
+		UDP:         c.UDPEnabled(),
+		LocalAddr:   c.LocalAddress,
+		LocalPort:   itoa(c.LocalPort),
+		Tunnel:      c.TunnelAddress,
+		Relays:      FormatRelays(c.Relays),
+		Congestion:  c.Congestion,
+		Window:      size(c.Window),
+		Chunk:       size(c.ChunkSize),
+		Timeout:     itoa(c.Timeout),
+		MTU:         itoa(c.MTU),
+		Stats:       itoa(c.StatsInterval),
+		NoDup:       c.NoDup,
+		RaceConnect: c.RaceConnect,
+		Cert:        c.Cert,
+		Key:         c.Key,
+		SNI:         c.SNI,
+		LogLevel:    logLevel,
 	}
 }
 
@@ -188,6 +191,7 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		num("Idle timeout", f.Timeout, &c.Timeout)
 		num("Path MTU", f.MTU, &c.MTU)
 		c.NoDup = f.NoDup
+		c.RaceConnect = f.RaceConnect
 		c.Cert = strings.TrimSpace(f.Cert)
 		c.Key = strings.TrimSpace(f.Key)
 		c.SNI = strings.TrimSpace(f.SNI)

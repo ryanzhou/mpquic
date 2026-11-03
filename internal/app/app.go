@@ -268,7 +268,7 @@ func runRemote(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 	if cfg.UDPEnabled() {
 		opt.DatagramHandler = proxy.NewUDPRemote(log).HandleDatagram
 	}
-	opt.StreamHandler = proxy.RemoteHandler(log, 10*time.Second)
+	opt.StreamHandler = proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 10 * time.Second, RaceConnect: cfg.RaceConnect})
 	if cfg.Reverse {
 		// Reverse mode: dial the local instance over every configured path.
 		servers := cfg.ServerAddrs()
@@ -276,7 +276,7 @@ func runRemote(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 		if err != nil {
 			return err
 		}
-		log.Info("mpquic remote started", "version", Version, "mode", "reverse", "paths", strings.Join(servers, ","), "udp", cfg.UDPEnabled())
+		log.Info("mpquic remote started", "version", Version, "mode", "reverse", "paths", strings.Join(servers, ","), "udp", cfg.UDPEnabled(), "race_connect", cfg.RaceConnect)
 		<-ctx.Done()
 		client.Close()
 		return nil
@@ -290,7 +290,7 @@ func runRemote(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 	for _, a := range binds {
 		go func() { errc <- srv.ListenAndServe(a) }()
 	}
-	log.Info("mpquic remote started", "version", Version, "listen", strings.Join(binds, ","), "udp", cfg.UDPEnabled())
+	log.Info("mpquic remote started", "version", Version, "listen", strings.Join(binds, ","), "udp", cfg.UDPEnabled(), "race_connect", cfg.RaceConnect)
 	select {
 	case err = <-errc:
 	case <-ctx.Done():

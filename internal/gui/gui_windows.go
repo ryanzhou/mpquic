@@ -60,11 +60,12 @@ type ui struct {
 	mw                                     *walk.MainWindow
 	nameCB, roleCB, congCB, logCB          *walk.ComboBox
 	reverseCB, udpCB, noDupCB, showPwCB    *walk.CheckBox
+	raceCB                                 *walk.CheckBox
 	statusLbl, hintLbl, pathsLbl, portLbl  *walk.Label
 	laddrLbl, lportLbl, tunnelLbl          *walk.Label
 	relaysLbl, relaysHelp                  *walk.Label
 	quicRows                               *walk.Composite
-	quicGB                                 *walk.GroupBox
+	quicGB, outboundGB                     *walk.GroupBox
 	pathsTE, relaysTE, logTE               *walk.TextEdit
 	portLE, pwLE, laddrLE, lportLE         *walk.LineEdit
 	tunnelLE, windowLE, chunkLE, timeoutLE *walk.LineEdit
@@ -249,6 +250,12 @@ func (u *ui) create() error {
 						LineEdit{AssignTo: &u.sniLE, CueBanner: "mpquic", ColumnSpan: 2},
 						Label{ColumnSpan: 3, Text: "Certificate files must be readable by LOCAL SERVICE (e.g. keep them in the data folder)."},
 					}},
+					GroupBox{AssignTo: &u.outboundGB, Title: "Outbound TCP (remote)", Layout: VBox{}, Children: []Widget{
+						CheckBox{AssignTo: &u.raceCB, Text: "Race connection attempts (aggressive)"},
+						Label{Text: "Opens each connection with up to 5 staggered attempts (at 0, 100, 300, 600, 1000 ms) and keeps\r\n" +
+							"the first that connects. For networks or NATs that drop connection setup, where a lost SYN\r\n" +
+							"otherwise stalls the connection for 1 s, 3 s or more."},
+					}},
 					GroupBox{Title: "Logging", Layout: Grid{Columns: 2}, Children: []Widget{
 						Label{Text: "Log level:", TextAlignment: AlignFar},
 						ComboBox{AssignTo: &u.logCB, Model: logLevels},
@@ -332,6 +339,7 @@ func (u *ui) setForm(f Form) {
 	u.mtuLE.SetText(f.MTU)
 	u.statsLE.SetText(f.Stats)
 	u.noDupCB.SetChecked(f.NoDup)
+	u.raceCB.SetChecked(f.RaceConnect)
 	u.certLE.SetText(f.Cert)
 	u.keyLE.SetText(f.Key)
 	u.sniLE.SetText(f.SNI)
@@ -354,27 +362,28 @@ func (u *ui) readForm() Form {
 	}
 	nl := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 	return Form{
-		Role:       role,
-		Reverse:    u.reverseCB.Checked(),
-		Paths:      nl(u.pathsTE.Text()),
-		Port:       strings.TrimSpace(u.portLE.Text()),
-		Password:   u.pwLE.Text(),
-		UDP:        u.udpCB.Checked(),
-		LocalAddr:  strings.TrimSpace(u.laddrLE.Text()),
-		LocalPort:  strings.TrimSpace(u.lportLE.Text()),
-		Tunnel:     strings.TrimSpace(u.tunnelLE.Text()),
-		Relays:     nl(u.relaysTE.Text()),
-		Congestion: cong,
-		Window:     strings.TrimSpace(u.windowLE.Text()),
-		Chunk:      strings.TrimSpace(u.chunkLE.Text()),
-		Timeout:    strings.TrimSpace(u.timeoutLE.Text()),
-		MTU:        strings.TrimSpace(u.mtuLE.Text()),
-		Stats:      strings.TrimSpace(u.statsLE.Text()),
-		NoDup:      u.noDupCB.Checked(),
-		Cert:       strings.TrimSpace(u.certLE.Text()),
-		Key:        strings.TrimSpace(u.keyLE.Text()),
-		SNI:        strings.TrimSpace(u.sniLE.Text()),
-		LogLevel:   level,
+		Role:        role,
+		Reverse:     u.reverseCB.Checked(),
+		Paths:       nl(u.pathsTE.Text()),
+		Port:        strings.TrimSpace(u.portLE.Text()),
+		Password:    u.pwLE.Text(),
+		UDP:         u.udpCB.Checked(),
+		LocalAddr:   strings.TrimSpace(u.laddrLE.Text()),
+		LocalPort:   strings.TrimSpace(u.lportLE.Text()),
+		Tunnel:      strings.TrimSpace(u.tunnelLE.Text()),
+		Relays:      nl(u.relaysTE.Text()),
+		Congestion:  cong,
+		Window:      strings.TrimSpace(u.windowLE.Text()),
+		Chunk:       strings.TrimSpace(u.chunkLE.Text()),
+		Timeout:     strings.TrimSpace(u.timeoutLE.Text()),
+		MTU:         strings.TrimSpace(u.mtuLE.Text()),
+		Stats:       strings.TrimSpace(u.statsLE.Text()),
+		NoDup:       u.noDupCB.Checked(),
+		RaceConnect: u.raceCB.Checked(),
+		Cert:        strings.TrimSpace(u.certLE.Text()),
+		Key:         strings.TrimSpace(u.keyLE.Text()),
+		SNI:         strings.TrimSpace(u.sniLE.Text()),
+		LogLevel:    level,
 	}
 }
 
@@ -399,6 +408,7 @@ func (u *ui) updateRole() {
 	show(local, u.laddrLbl, u.laddrLE, u.lportLbl, u.lportLE)
 	show(role == "tunnel", u.tunnelLbl, u.tunnelLE)
 	show(!quic, u.relaysLbl, u.relaysTE, u.relaysHelp)
+	show(role == "remote", u.outboundGB)
 	u.quicGB.SetEnabled(quic)
 
 	listens := (local && rev) || (role == "remote" && !rev)
@@ -712,7 +722,7 @@ func (u *ui) smokeTest() error {
 		{Role: "local", Server: config.StringList{"203.0.113.10", "relay:9000"}, ServerPort: 8443, Password: "pw", Mode: "tcp_and_udp",
 			LocalAddress: "0.0.0.0", LocalPort: 1081, Congestion: "bbr-aggressive", Window: 32 << 20, Timeout: 60, LogLevel: "debug", StatsInterval: 30},
 		{Role: "tunnel", Server: config.StringList{"a:1"}, Password: "pw", TunnelAddress: "10.0.0.1:22", ChunkSize: 8 << 10, NoDup: true},
-		{Role: "remote", Reverse: true, Server: config.StringList{"198.51.100.7:8388"}, Password: "pw", Cert: `C:\c.pem`, Key: `C:\k.pem`, SNI: "x"},
+		{Role: "remote", Reverse: true, Server: config.StringList{"198.51.100.7:8388"}, Password: "pw", Cert: `C:\c.pem`, Key: `C:\k.pem`, SNI: "x", RaceConnect: true},
 		{Role: "relay", Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:8388", Link: "delay=40ms", Rev: "loss=1%"}}, LogLevel: "warn"},
 	} {
 		want := FormFromConfig(js)

@@ -37,19 +37,22 @@ type Config struct {
 	// Reverse swaps the QUIC roles: the local side listens (at "server" /
 	// "server_port", i.e. its own public address) and the remote dials the
 	// local through the "server" list (the local's address and relays).
-	Reverse       bool          `json:"reverse,omitempty"`
-	Congestion    string        `json:"congestion,omitempty"`
-	Window        Size          `json:"window,omitempty"`
-	ChunkSize     Size          `json:"chunk_size,omitempty"`
-	StatsInterval int           `json:"stats_interval,omitempty"`
-	Verbose       bool          `json:"verbose,omitempty"`
-	LogLevel      string        `json:"log_level,omitempty"`
-	Cert          string        `json:"cert,omitempty"`
-	Key           string        `json:"key,omitempty"`
-	SNI           string        `json:"sni,omitempty"`
-	NoDup         bool          `json:"no_dup,omitempty"`
-	MTU           int           `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
-	Relays        []RelayConfig `json:"relays,omitempty"`
+	Reverse       bool   `json:"reverse,omitempty"`
+	Congestion    string `json:"congestion,omitempty"`
+	Window        Size   `json:"window,omitempty"`
+	ChunkSize     Size   `json:"chunk_size,omitempty"`
+	StatsInterval int    `json:"stats_interval,omitempty"`
+	Verbose       bool   `json:"verbose,omitempty"`
+	LogLevel      string `json:"log_level,omitempty"`
+	Cert          string `json:"cert,omitempty"`
+	Key           string `json:"key,omitempty"`
+	SNI           string `json:"sni,omitempty"`
+	NoDup         bool   `json:"no_dup,omitempty"`
+	MTU           int    `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
+	// RaceConnect (remote role): race staggered TCP connection attempts to
+	// each target and keep the first that connects.
+	RaceConnect bool          `json:"race_connect,omitempty"`
+	Relays      []RelayConfig `json:"relays,omitempty"`
 }
 
 // RelayConfig configures one UDP relay (relay mode).
