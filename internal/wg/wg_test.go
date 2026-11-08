@@ -10,16 +10,21 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 
 	"mpquic/internal/mp"
 	"mpquic/internal/proxy"
@@ -229,6 +234,7 @@ func setupPeers(t *testing.T, udpOn bool, listen func(string, string) (net.Packe
 		if err != nil {
 			t.Fatal(err)
 		}
+		disableRACK(t, tnet)
 		cdev := device.NewDevice(ctun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
 		err = cdev.IpcSet(fmt.Sprintf("private_key=%s\npublic_key=%s\nendpoint=127.0.0.1:%d\nallowed_ip=0.0.0.0/0\n",
 			cpriv.hex(), spriv.PublicKey().hex(), s.Port()))
@@ -248,6 +254,39 @@ func setupPeers(t *testing.T, udpOn bool, listen func(string, string) (net.Packe
 		time.Sleep(20 * time.Millisecond)
 	}
 	return e
+}
+
+// disableRACK gives a client stack the server's loss recovery (see
+// newNetTun): with gVisor's default RACK, a client whose burst of data was
+// lost (the server's UDP socket overflowing, likely with several peers on a
+// slow machine) recovered at one or two segments per 200 ms and timed out.
+// wireguard-go's netstack does not expose its gVisor stack.
+func disableRACK(t *testing.T, n *netstack.Net) {
+	t.Helper()
+	f := reflect.ValueOf(n).Elem().FieldByName("stack")
+	if !f.IsValid() {
+		t.Fatal("netstack.Net has no stack field")
+	}
+	s := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface().(*stack.Stack)
+	opt := tcpip.TCPRecovery(0)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerLossRecovery(t *testing.T) {
+	nt, err := newNetTun(DefaultMTU, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nt.Close()
+	var rec tcpip.TCPRecovery
+	if err := nt.stack.TransportProtocolOption(tcp.ProtocolNumber, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec != 0 {
+		t.Fatalf("TCP recovery %v, want 0 (classic SACK recovery, not RACK)", rec)
+	}
 }
 
 func TestTCP(t *testing.T) {

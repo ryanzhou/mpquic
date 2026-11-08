@@ -47,6 +47,14 @@ func newNetTun(mtu int, intercept func([]byte) bool) (*netTun, error) {
 		ptr(tcpip.TCPSACKEnabled(true)),
 		ptr(tcpip.CongestionControlOption("cubic")),
 		ptr(tcpip.TCPModerateReceiveBufferOption(true)),
+		// Classic SACK loss recovery (RFC 6675) instead of gVisor's default
+		// RACK. After a retransmission timeout, the first ACK makes RACK
+		// declare every older unacknowledged segment lost (they were sent
+		// before the retransmission) and re-enter SACK recovery, which cuts
+		// the window again: the sender then sends one or two segments per
+		// timeout (~200 ms). A burst loss of 100+ KB, e.g. a UDP socket
+		// buffer overflowing, stalled a connection for many seconds.
+		ptr(tcpip.TCPRecovery(0)),
 		&tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: 8 << 20},
 		&tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: 8 << 20},
 	}
