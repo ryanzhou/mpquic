@@ -26,24 +26,60 @@ import (
 
 const udpIdle = 2 * time.Minute
 
-// UDPLocal handles the local side of UDP associations.
+// UDPLocal handles the local side of UDP associations. Besides SOCKS5 UDP
+// ASSOCIATE it serves other front-ends (the WireGuard listener) through
+// Register, and dispatches ICMP echo replies (association 0) to ICMP.
 type UDPLocal struct {
 	Client Opener
 	Log    *slog.Logger
+	// ICMP receives the body of ICMP echo datagrams (see icmp.go).
+	ICMP func(b []byte)
 
 	mu     sync.Mutex
-	assocs map[uint64]*localAssoc
+	assocs map[uint64]func(msg []byte)
 	nextID atomic.Uint64
 }
 
-type localAssoc struct {
-	id     uint64
-	pc     *net.UDPConn
-	client atomic.Pointer[net.UDPAddr]
+func NewUDPLocal(c Opener, log *slog.Logger) *UDPLocal {
+	return &UDPLocal{Client: c, Log: log, assocs: make(map[uint64]func([]byte))}
 }
 
-func NewUDPLocal(c Opener, log *slog.Logger) *UDPLocal {
-	return &UDPLocal{Client: c, Log: log, assocs: make(map[uint64]*localAssoc)}
+// Register allocates an association whose datagrams from the remote are
+// passed to deliver as "ATYP ADDR PORT DATA" (the peer's address). deliver
+// runs on the receive path and must not keep msg.
+func (u *UDPLocal) Register(deliver func(msg []byte)) uint64 {
+	id := u.nextID.Add(1)
+	u.mu.Lock()
+	u.assocs[id] = deliver
+	u.mu.Unlock()
+	return id
+}
+
+// Unregister removes an association. If notify is set, the remote is told to
+// release its socket now instead of when it idles out.
+func (u *UDPLocal) Unregister(id uint64, notify bool) {
+	u.mu.Lock()
+	delete(u.assocs, id)
+	u.mu.Unlock()
+	if notify {
+		if sess := u.Client.Session(); sess != nil {
+			// An association id alone closes it; older remotes ignore it.
+			sess.SendDatagram(quicvarint.Append(nil, id), 0)
+		}
+	}
+}
+
+// Send relays payload to target (a SOCKS5-format address) on association id.
+func (u *UDPLocal) Send(id uint64, target, payload []byte) error {
+	sess := u.Client.Session()
+	if sess == nil {
+		return mp.ErrNoSession
+	}
+	msg := quicvarint.Append(make([]byte, 0, 8+len(target)+len(payload)), id)
+	hdr := len(msg) + len(target)
+	msg = append(msg, target...)
+	msg = append(msg, payload...)
+	return sess.SendDatagram(msg, hdr)
 }
 
 // HandleDatagram is the mp.Options.DatagramHandler for the client.
@@ -53,21 +89,19 @@ func (u *UDPLocal) HandleDatagram(_ *mp.Session, b []byte) {
 	if err != nil {
 		return
 	}
-	u.mu.Lock()
-	a := u.assocs[id]
-	u.mu.Unlock()
-	if a == nil {
-		return
-	}
-	ca := a.client.Load()
-	if ca == nil {
-		return
-	}
 	rest := b[len(b)-r.Len():]
-	pkt := make([]byte, 0, 3+len(rest))
-	pkt = append(pkt, 0, 0, 0) // RSV RSV FRAG
-	pkt = append(pkt, rest...) // ATYP ADDR PORT DATA
-	a.pc.WriteToUDP(pkt, ca)
+	if id == icmpAssoc {
+		if u.ICMP != nil {
+			u.ICMP(rest)
+		}
+		return
+	}
+	u.mu.Lock()
+	deliver := u.assocs[id]
+	u.mu.Unlock()
+	if deliver != nil {
+		deliver(rest)
+	}
 }
 
 // associate serves one UDP ASSOCIATE request on control connection c.
@@ -85,22 +119,25 @@ func (u *UDPLocal) associate(c net.Conn) {
 	if _, err := c.Write(append([]byte{5, 0, 0}, rep...)); err != nil {
 		return
 	}
-	a := &localAssoc{id: u.nextID.Add(1), pc: pc}
-	u.mu.Lock()
-	u.assocs[a.id] = a
-	u.mu.Unlock()
-	defer func() {
-		u.mu.Lock()
-		delete(u.assocs, a.id)
-		u.mu.Unlock()
-	}()
-	u.Log.Debug("udp associate", "id", a.id, "bind", bound.String())
+	var client atomic.Pointer[net.UDPAddr]
+	id := u.Register(func(rest []byte) {
+		ca := client.Load()
+		if ca == nil {
+			return
+		}
+		pkt := make([]byte, 0, 3+len(rest))
+		pkt = append(pkt, 0, 0, 0) // RSV RSV FRAG
+		pkt = append(pkt, rest...) // ATYP ADDR PORT DATA
+		pc.WriteToUDP(pkt, ca)
+	})
+	defer u.Unregister(id, true)
+	u.Log.Debug("udp associate", "id", id, "bind", bound.String())
 	// The association lives as long as the TCP control connection.
 	go func() {
 		io.Copy(io.Discard, c)
 		pc.Close()
 	}()
-	hdr := quicvarint.Append(nil, a.id)
+	hdr := quicvarint.Append(nil, id)
 	buf := make([]byte, 65536)
 	for {
 		n, from, err := pc.ReadFromUDP(buf)
@@ -114,8 +151,8 @@ func (u *UDPLocal) associate(c net.Conn) {
 		if al < 0 {
 			continue
 		}
-		if ca := a.client.Load(); ca == nil || !ca.IP.Equal(from.IP) || ca.Port != from.Port {
-			a.client.Store(from)
+		if ca := client.Load(); ca == nil || !ca.IP.Equal(from.IP) || ca.Port != from.Port {
+			client.Store(from)
 		}
 		msg := make([]byte, 0, len(hdr)+n-3)
 		msg = append(msg, hdr...)
@@ -136,6 +173,7 @@ type UDPRemote struct {
 
 	mu     sync.Mutex
 	assocs map[assocKey]*remoteAssoc
+	icmp   *icmpRemote
 }
 
 type assocKey struct {
@@ -150,7 +188,7 @@ type remoteAssoc struct {
 }
 
 func NewUDPRemote(log *slog.Logger) *UDPRemote {
-	u := &UDPRemote{Log: log, assocs: make(map[assocKey]*remoteAssoc)}
+	u := &UDPRemote{Log: log, assocs: make(map[assocKey]*remoteAssoc), icmp: newICMPRemote(log)}
 	go u.reaper()
 	return u
 }
@@ -162,12 +200,25 @@ func (u *UDPRemote) HandleDatagram(s *mp.Session, b []byte) {
 	if err != nil {
 		return
 	}
+	k := assocKey{s, id}
+	if id == icmpAssoc {
+		u.icmp.handle(s, b[len(b)-r.Len():])
+		return
+	}
+	if r.Len() == 0 { // the local released the association
+		u.mu.Lock()
+		if a := u.assocs[k]; a != nil {
+			a.pc.Close()
+			delete(u.assocs, k)
+		}
+		u.mu.Unlock()
+		return
+	}
 	target, _, err := ReadAddr(r)
 	if err != nil {
 		return
 	}
 	payload := b[len(b)-r.Len():]
-	k := assocKey{s, id}
 	u.mu.Lock()
 	a := u.assocs[k]
 	if a == nil {
@@ -232,5 +283,6 @@ func (u *UDPRemote) reaper() {
 			}
 		}
 		u.mu.Unlock()
+		u.icmp.reap(now)
 	}
 }

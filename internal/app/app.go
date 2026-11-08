@@ -19,6 +19,7 @@ import (
 	"mpquic/internal/linkem"
 	"mpquic/internal/mp"
 	"mpquic/internal/proxy"
+	"mpquic/internal/wg"
 )
 
 // Version is reported in logs; the main package sets it.
@@ -115,6 +116,23 @@ func Validate(role string, cfg *config.Config) error {
 	if cfg.MTU != 0 && (cfg.MTU < 1228 || cfg.MTU > 65535) {
 		// QUIC needs 1200-byte UDP payloads: 1228-byte IPv4 / 1248-byte IPv6 packets
 		return fmt.Errorf("mtu %d: must be between 1228 and 65535 (QUIC needs paths that carry 1200-byte UDP payloads), or 0 to discover it", cfg.MTU)
+	}
+	if r != "local" && cfg.WireGuard != nil {
+		return errors.New("the WireGuard listener (--wg-*) is only available in local mode")
+	}
+	if r != "local" && cfg.NoSOCKS {
+		return errors.New("--no-socks applies to local mode only")
+	}
+	if r == "local" {
+		if cfg.NoSOCKS && cfg.WireGuard == nil {
+			return errors.New("--no-socks leaves no listener: enable WireGuard (--wg-listen) or drop --no-socks")
+		}
+		if cfg.WireGuard != nil {
+			o := wgOptions(cfg)
+			if err := o.Check(); err != nil {
+				return err
+			}
+		}
 	}
 	switch r {
 	case "local", "tunnel":
@@ -232,35 +250,72 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 		}
 		opener, shutdown, pathDesc = client, client.Close, strings.Join(servers, ",")
 	}
-	ln, err := net.Listen("tcp", LocalListenAddr(cfg))
-	if err != nil {
-		shutdown()
-		return err
-	}
-	l := &proxy.Local{Client: opener, Log: log, UDP: udp}
 	if udp != nil {
 		udp.Client = opener
 	}
-	if mode == "tunnel" {
-		l.Tunnel = cfg.TunnelAddress
-	}
-	what := "socks5"
-	if l.Tunnel != "" {
-		what = "tunnel to " + l.Tunnel
-	}
-	log.Info("mpquic local started", "version", Version, "listen", ln.Addr().String(), "mode", what, "udp", udp != nil, "paths", pathDesc)
-	go func() {
-		if err := l.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
-			errc <- fmt.Errorf("listener: %w", err)
+	var ln net.Listener
+	what := "off"
+	if !cfg.NoSOCKS {
+		var err error
+		ln, err = net.Listen("tcp", LocalListenAddr(cfg))
+		if err != nil {
+			shutdown()
+			return err
 		}
-	}()
+		l := &proxy.Local{Client: opener, Log: log, UDP: udp}
+		what = "socks5 on " + ln.Addr().String()
+		if mode == "tunnel" {
+			l.Tunnel = cfg.TunnelAddress
+			what = "tunnel " + ln.Addr().String() + " to " + l.Tunnel
+		}
+		go func() {
+			if err := l.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
+				errc <- fmt.Errorf("listener: %w", err)
+			}
+		}()
+	}
+	var wgs *wg.Server
+	if cfg.WireGuard != nil {
+		o := wgOptions(cfg)
+		o.Opener, o.UDP, o.Log = opener, udp, log
+		var err error
+		wgs, err = wg.Start(o)
+		if err != nil {
+			if ln != nil {
+				ln.Close()
+			}
+			shutdown()
+			return err
+		}
+		log.Info("wireguard listener started", "listen", o.Listen, "port", wgs.Port(), "public_key", wgs.PublicKey(), "peers", len(o.Peers), "udp_and_ping", udp != nil)
+		if udp == nil {
+			log.Warn("UDP relaying is off: WireGuard peers get no UDP (including DNS) and no ping; enable it with -u (on both ends)")
+		}
+	}
+	log.Info("mpquic local started", "version", Version, "listen", what, "wireguard", wgs != nil, "udp", udp != nil, "paths", pathDesc)
+	var err error
 	select {
 	case <-ctx.Done():
 	case err = <-errc:
 	}
-	ln.Close()
+	if ln != nil {
+		ln.Close()
+	}
+	if wgs != nil {
+		wgs.Close()
+	}
 	shutdown()
 	return err
+}
+
+// wgOptions converts the WireGuard config (cfg.WireGuard must be set).
+func wgOptions(cfg *config.Config) wg.Options {
+	w := cfg.WireGuard
+	o := wg.Options{Listen: w.WireGuardListen(), PrivateKey: w.PrivateKey, MTU: w.MTU}
+	for _, p := range w.Peers {
+		o.Peers = append(o.Peers, wg.Peer{PublicKey: p.PublicKey, PresharedKey: p.PresharedKey, AllowedIPs: p.AllowedIPs})
+	}
+	return o
 }
 
 func runRemote(ctx context.Context, cfg *config.Config, log *slog.Logger) error {

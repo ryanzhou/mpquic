@@ -127,6 +127,10 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		return nil, fmt.Errorf("unknown role %q", f.Role)
 	}
 	c.Role = role
+	if role != "local" {
+		// Local-only keys the form does not edit (WireGuard listener).
+		c.WireGuard, c.NoSOCKS = nil, false
+	}
 	var err error
 	num := func(what, s string, dst *int) {
 		if err != nil {

@@ -159,7 +159,8 @@ func setNoDelay(c net.Conn) {
 var bufPool = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
 
 // Pipe relays data between a TCP connection and a stream in both directions
-// with half-close propagation, then closes both.
+// with half-close propagation, then closes both. Besides *net.TCPConn, c may
+// implement CloseWrite() error (half-close) and Abort() (close with a reset).
 func Pipe(c net.Conn, st *mp.Stream) {
 	done := make(chan struct{})
 	go func() {
@@ -181,10 +182,12 @@ func Pipe(c net.Conn, st *mp.Stream) {
 		st.Reset(mp.ResetGeneric)
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetLinger(0)
+		} else if a, ok := c.(interface{ Abort() }); ok {
+			a.Abort()
 		}
 		c.Close()
-	} else if tc, ok := c.(*net.TCPConn); ok {
-		tc.CloseWrite()
+	} else if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		cw.CloseWrite()
 	}
 	<-done
 	c.Close()

@@ -1,0 +1,19 @@
+{
+  "server": ["203.0.113.10:8388", "relay-tokyo.example.net:9000"],
+  "password": "change-me-to-a-long-random-string",
+  "mode": "tcp_and_udp",
+
+  "local_address": "127.0.0.1",
+  "local_port": 1080,
+  "no_socks": false,
+
+  "wireguard": {
+    "listen": ":51820",
+    "private_key": "REPLACE-with-PrivateKey-from-mpquic-wg-keygen",
+    "mtu": 1420,
+    "peers": [
+      {"public_key": "REPLACE-with-the-phone-PublicKey", "allowed_ips": ["10.66.0.2/32", "fd66::2/128"]},
+      {"public_key": "REPLACE-with-the-laptop-PublicKey", "allowed_ips": ["10.66.0.3/32", "fd66::3/128"]}
+    ]
+  }
+}

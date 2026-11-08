@@ -123,6 +123,29 @@ address with zero extra round trips. UDP ASSOCIATE payloads travel as QUIC
 DATAGRAM frames (`assoc_id ‖ socks_addr ‖ payload`) on the lowest-latency
 path that can carry them (see "Packet sizes" for the limits).
 
+Two more datagram forms share that format:
+
+* `assoc_id` alone releases an association (the local sends it when a SOCKS
+  control connection closes or a WireGuard UDP flow idles out), so the
+  remote closes its socket before its 2-minute idle timer. Older remotes
+  fail to parse the address and ignore it.
+* association id 0 carries ICMP echo for the WireGuard listener:
+  `0 ‖ socks_addr(ip, port 0) ‖ flow:u16 ‖ seq:u16 ‖ data`. The address is
+  the target in requests and the replying host in replies; `flow` names an
+  echo flow of the local (one per client, target and echo identifier). The
+  remote pings from one unprivileged ICMP socket per flow, or from a shared
+  raw socket with an identifier per flow. An older remote would send it as
+  UDP to port 0, which the OS rejects.
+
+The WireGuard listener (`internal/wg`) runs wireguard-go over a gVisor
+network stack in promiscuous mode with spoofing, so it accepts TCP
+connections to any address and replies as that address. TCP SYNs go to a
+forwarder that opens a stream (address first, as above) and then completes
+the handshake. UDP and ICMP bypass gVisor's sockets: UDP is taken from the
+stack after IP reassembly, one association per client socket; echo requests
+are intercepted before the stack (which would otherwise answer them itself);
+replies are built as raw IP packets, fragmented to the interface MTU.
+
 ### Packet sizes (MTU)
 
 QUIC packets are sent with the IP don't-fragment bit and never fragmented.

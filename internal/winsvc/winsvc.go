@@ -65,8 +65,8 @@ func joinPorts(ports []int) string {
 }
 
 // FirewallRules lists the inbound rules a config needs: the QUIC/relay UDP
-// listeners, and the SOCKS5/tunnel listener only when it is bound to a
-// non-loopback address.
+// listeners, the WireGuard listener, and the SOCKS5/tunnel listener only
+// when it is bound to a non-loopback address.
 func FirewallRules(cfg *config.Config) []FirewallRule {
 	role, _ := app.NormalizeRole(cfg.Role)
 	var udp []string
@@ -84,11 +84,17 @@ func FirewallRules(cfg *config.Config) []FirewallRule {
 			udp = append(udp, r.Listen)
 		}
 	}
+	if role == "local" && cfg.WireGuard != nil {
+		l := cfg.WireGuard.WireGuardListen()
+		if host, _, err := net.SplitHostPort(l); err == nil && (host == "" || !isLoopback(host)) {
+			udp = append(udp, l) // "" is all interfaces here
+		}
+	}
 	var rules []FirewallRule
 	if ports := portsOf(udp); len(ports) > 0 {
 		rules = append(rules, FirewallRule{"UDP", ports})
 	}
-	if (role == "local" || role == "tunnel") && !isLoopback(cfg.LocalAddress) {
+	if (role == "local" || role == "tunnel") && !cfg.NoSOCKS && !isLoopback(cfg.LocalAddress) {
 		ports := portsOf([]string{app.LocalListenAddr(cfg)})
 		rules = append(rules, FirewallRule{"TCP", ports})
 		if role == "local" && cfg.UDPEnabled() {

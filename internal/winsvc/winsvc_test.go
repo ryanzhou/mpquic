@@ -34,6 +34,10 @@ func TestFirewallRules(t *testing.T) {
 			[]FirewallRule{{"UDP", nil}, {"TCP", []int{1081}}}},
 		{config.Config{Role: "tunnel", LocalAddress: "192.168.1.2", Mode: "tcp_and_udp"}, []FirewallRule{{"TCP", []int{1080}}}},
 		{config.Config{Role: "local", LocalAddress: "::1"}, nil},
+		{config.Config{Role: "local", WireGuard: &config.WireGuardConfig{}}, []FirewallRule{{"UDP", []int{51820}}}},
+		{config.Config{Role: "local", LocalAddress: "0.0.0.0", NoSOCKS: true, WireGuard: &config.WireGuardConfig{Listen: "192.168.1.2:4500"}},
+			[]FirewallRule{{"UDP", []int{4500}}}},
+		{config.Config{Role: "local", WireGuard: &config.WireGuardConfig{Listen: "127.0.0.1:4500"}}, nil},
 		{config.Config{Role: "relay", Relays: []config.RelayConfig{{Listen: ":9001"}, {Listen: "0.0.0.0:9000"}, {Listen: ":9001"}}},
 			[]FirewallRule{{"UDP", []int{9000, 9001}}}},
 	}

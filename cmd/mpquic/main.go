@@ -47,6 +47,10 @@ func main() {
 		err = runService(args)
 	case "gui":
 		err = runGUI(args)
+	case "wg-keygen":
+		err = wgKeygen(args)
+	case "wg-pubkey":
+		err = wgPubkey(args)
 	case "version", "-V", "--version":
 		fmt.Println("mpquic", version)
 	case "help", "-h", "--help", "":
@@ -90,6 +94,8 @@ Usage:
   mpquic service COMMAND    Windows service: install, uninstall, start, stop,
                             restart, status (see "mpquic service help")
   mpquic gui                Windows configurator (also opened by double-click)
+  mpquic wg-keygen          print a new WireGuard key pair
+  mpquic wg-pubkey          print the public key of the private key on stdin
   mpquic version
 
 Common options (shadowsocks-compatible):
@@ -125,6 +131,22 @@ mpquic options:
   --cert/--key FILE TLS certificate for the server (optional)
   --sni NAME        TLS server name sent by the client
 
+Local listeners (SOCKS5 on -b/-l is on unless --no-socks; any --wg-* option
+enables a userspace WireGuard server whose peers' TCP, UDP and ping traffic
+is proxied transparently; UDP and ping need -u on both ends):
+  --no-socks        do not run the SOCKS5 listener
+  --wg-listen [HOST:]PORT
+                    WireGuard UDP listen address (default: port 51820 on
+                    all interfaces)
+  --wg-private-key KEY
+                    the WireGuard server's private key (mpquic wg-keygen)
+  --wg-peer PUBKEY[,ALLOWED_IP...]
+                    a WireGuard peer (client), repeatable; ALLOWED_IPs are
+                    its tunnel addresses (default: any; required with
+                    several peers)
+  --wg-psk KEY      preshared key of every peer (optional)
+  --wg-mtu BYTES    WireGuard interface MTU (default 1420)
+
 Relay options:
   --listen ADDR --target HOST:PORT [--link SPEC] [--fwd SPEC] [--rev SPEC]
   SPEC: delay=40ms,jitter=5ms,loss=1%,burst=3,rate=20mbit,queue=80ms,
@@ -146,6 +168,10 @@ type commonFlags struct {
 	cert, key, sni, logLevel   string
 	plugin                     string
 	udp, udpOnly, reverse      bool
+	noSOCKS                    bool
+	wgListen, wgKey, wgPSK     string
+	wgPeers                    multi
+	wgMTU                      int
 }
 
 func parseCommon(name string, args []string) (*commonFlags, error) {
@@ -176,6 +202,12 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.StringVar(&f.sni, "sni", "", "TLS SNI")
 	fs.StringVar(&f.logLevel, "log-level", "", "debug|info|warn|error")
 	fs.StringVar(&f.plugin, "plugin", "", "SIP003 plugin (unsupported)")
+	fs.BoolVar(&f.noSOCKS, "no-socks", false, "disable the SOCKS5 listener (local)")
+	fs.StringVar(&f.wgListen, "wg-listen", "", "WireGuard listen address [HOST:]PORT (local)")
+	fs.StringVar(&f.wgKey, "wg-private-key", "", "WireGuard private key (local)")
+	fs.Var(&f.wgPeers, "wg-peer", "WireGuard peer PUBKEY[,ALLOWED_IP...] (repeatable)")
+	fs.StringVar(&f.wgPSK, "wg-psk", "", "WireGuard preshared key of every peer")
+	fs.IntVar(&f.wgMTU, "wg-mtu", 0, "WireGuard interface MTU")
 	// Accepted for shadowsocks compatibility, ignored.
 	var ign string
 	var ignb bool
@@ -279,6 +311,42 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.udp || f.udpOnly {
 		cfg.Mode = "tcp_and_udp"
+	}
+	if f.noSOCKS {
+		cfg.NoSOCKS = true
+	}
+	if f.wgListen != "" || f.wgKey != "" || len(f.wgPeers) > 0 || f.wgPSK != "" || f.wgMTU != 0 {
+		if cfg.WireGuard == nil {
+			cfg.WireGuard = &config.WireGuardConfig{}
+		}
+		w := cfg.WireGuard
+		if f.wgListen != "" {
+			w.Listen = f.wgListen
+		}
+		if f.wgKey != "" {
+			w.PrivateKey = f.wgKey
+		}
+		if f.wgMTU != 0 {
+			w.MTU = f.wgMTU
+		}
+		if len(f.wgPeers) > 0 {
+			w.Peers = nil
+			for _, spec := range f.wgPeers {
+				parts := strings.Split(spec, ",")
+				p := config.WireGuardPeer{PublicKey: strings.TrimSpace(parts[0])}
+				for _, a := range parts[1:] {
+					if a = strings.TrimSpace(a); a != "" {
+						p.AllowedIPs = append(p.AllowedIPs, a)
+					}
+				}
+				w.Peers = append(w.Peers, p)
+			}
+		}
+		if f.wgPSK != "" {
+			for i := range w.Peers {
+				w.Peers[i].PresharedKey = f.wgPSK
+			}
+		}
 	}
 	if f.plugin != "" || cfg.Plugin != "" {
 		return nil, errors.New("SIP003 plugins are not supported")

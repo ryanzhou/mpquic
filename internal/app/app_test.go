@@ -12,9 +12,19 @@ import (
 	"time"
 
 	"mpquic/internal/config"
+	"mpquic/internal/wg"
 )
 
+func testWG(t *testing.T, listen string) *config.WireGuardConfig {
+	k, _ := wg.GenerateKey()
+	p, _ := wg.GenerateKey()
+	return &config.WireGuardConfig{Listen: listen, PrivateKey: k.String(), Peers: []config.WireGuardPeer{{PublicKey: p.PublicKey().String()}}}
+}
+
 func TestValidate(t *testing.T) {
+	w := testWG(t, "")
+	badKey := testWG(t, "51820")
+	badKey.PrivateKey = "nope"
 	ok := []struct {
 		role string
 		cfg  config.Config
@@ -26,6 +36,8 @@ func TestValidate(t *testing.T) {
 		{"server", config.Config{Password: "p", MTU: 1280}},
 		{"remote", config.Config{Reverse: true, Servers: []config.ServerEntry{{Server: "a", Password: "p"}}}},
 		{"relay", config.Config{Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:1", Link: "delay=10ms"}}}},
+		{"local", config.Config{Server: config.StringList{"a"}, Password: "p", WireGuard: w}},
+		{"local", config.Config{Server: config.StringList{"a"}, Password: "p", WireGuard: w, NoSOCKS: true}},
 	}
 	for _, c := range ok {
 		if err := Validate(c.role, &c.cfg); err != nil {
@@ -49,6 +61,11 @@ func TestValidate(t *testing.T) {
 		{"remote", config.Config{Password: "p", Plugin: "v2ray"}, "plugin"},
 		{"remote", config.Config{Password: "p", MTU: 1200}, "mtu"},
 		{"relay", config.Config{}, "no relays"},
+		{"local", config.Config{Server: config.StringList{"a"}, Password: "p", NoSOCKS: true}, "no listener"},
+		{"tunnel", config.Config{Server: config.StringList{"a"}, Password: "p", TunnelAddress: "h:22", WireGuard: w}, "only available in local mode"},
+		{"remote", config.Config{Password: "p", NoSOCKS: true}, "local mode only"},
+		{"local", config.Config{Server: config.StringList{"a"}, Password: "p", WireGuard: badKey}, "private key"},
+		{"local", config.Config{Server: config.StringList{"a"}, Password: "p", WireGuard: &config.WireGuardConfig{PrivateKey: w.PrivateKey}}, "peer"},
 		{"relay", config.Config{Relays: []config.RelayConfig{{Listen: "9000", Target: "h:1"}}}, "listen"},
 		{"relay", config.Config{Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:1", Rev: "bogus=1"}}}, "relay 1"},
 	}
@@ -195,6 +212,7 @@ func TestRunBindFailure(t *testing.T) {
 		{"remote", &config.Config{Server: config.StringList{"127.0.0.1"}, ServerPort: port, Password: "pw"}},
 		{"local", &config.Config{Reverse: true, Server: config.StringList{"127.0.0.1"}, ServerPort: port, Password: "pw", LocalPort: freeTCPPort(t)}},
 		{"relay", &config.Config{Relays: []config.RelayConfig{{Listen: "127.0.0.1:" + strconv.Itoa(port), Target: "127.0.0.1:1"}}}},
+		{"local", &config.Config{Server: config.StringList{"127.0.0.1:1"}, Password: "pw", NoSOCKS: true, WireGuard: testWG(t, "127.0.0.1:"+strconv.Itoa(port))}},
 	} {
 		done := make(chan error, 1)
 		go func() { done <- Run(context.Background(), c.role, c.cfg, log) }()

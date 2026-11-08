@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ type env struct {
 	socks, tunnel string
 	tcpEcho       string
 	udpEcho       *net.UDPAddr
+	remoteUDP     *UDPRemote
 }
 
 func setup(t *testing.T, reverse bool) *env {
@@ -62,7 +64,8 @@ func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
 	pc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	paths := []string{pc.LocalAddr().String(), pc.LocalAddr().String()}
 	udp := NewUDPLocal(nil, log)
-	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: NewUDPRemote(log).HandleDatagram,
+	remoteUDP := NewUDPRemote(log)
+	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: remoteUDP.HandleDatagram,
 		StreamHandler: RemoteHandler(log, ro), MTU: mtu}
 	lopt := &mp.Options{Password: "x", Logger: log, DatagramHandler: udp.HandleDatagram, MTU: mtu}
 	var opener Opener
@@ -109,7 +112,7 @@ func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
 	for (opener.Session() == nil || opener.Session().ActivePaths() < 2) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	return &env{socks: sl.Addr().String(), tunnel: tn.Addr().String(), tcpEcho: tl.Addr().String(), udpEcho: ue.LocalAddr().(*net.UDPAddr)}
+	return &env{socks: sl.Addr().String(), tunnel: tn.Addr().String(), tcpEcho: tl.Addr().String(), udpEcho: ue.LocalAddr().(*net.UDPAddr), remoteUDP: remoteUDP}
 }
 
 func socksRequest(t *testing.T, addr string, cmd byte, target string) (net.Conn, []byte) {
@@ -212,6 +215,24 @@ func testSocksUDP(t *testing.T, reverse bool) {
 	}
 }
 
+// Closing the SOCKS control connection releases the remote's socket at once.
+func TestSocksUDPRelease(t *testing.T) {
+	e := setup(t, false)
+	if !udpEcho(t, e, 10, 5, time.Second) {
+		t.Fatal("no UDP echo")
+	}
+	n := -1
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		e.remoteUDP.mu.Lock()
+		n = len(e.remoteUDP.assocs)
+		e.remoteUDP.mu.Unlock()
+		if n == 0 {
+			return
+		}
+	}
+	t.Fatalf("%d remote associations left after the SOCKS association ended", n)
+}
+
 // With a 1280-byte path MTU, a QUIC DATAGRAM carries 1280-28-37 = 1215
 // bytes: the type byte, the association id (1 byte) and the IPv4 address (7)
 // leave 1206 for the UDP payload. Bigger payloads up to 1472 bytes are dropped
@@ -268,6 +289,26 @@ func udpEcho(t *testing.T, e *env, size, tries int, wait time.Duration) bool {
 			ok = bytes.Equal(got, payload)
 		}
 		return ok
+	}
+}
+
+func TestEchoCodec(t *testing.T) {
+	for _, ip := range []string{"192.0.2.1", "2001:db8::1"} {
+		a := netip.MustParseAddr(ip)
+		msg, hdr := AppendEcho([]byte{0xff}, a, 513, 65535, []byte("data"))
+		if msg[0] != 0xff || msg[1] != icmpAssoc || string(msg[hdr:]) != "data" {
+			t.Fatalf("bad echo datagram %x", msg)
+		}
+		got, flow, seq, data, ok := ParseEcho(msg[2:])
+		if !ok || got != a || flow != 513 || seq != 65535 || string(data) != "data" {
+			t.Fatalf("ParseEcho: %v %d %d %q %v", got, flow, seq, data, ok)
+		}
+		if _, _, _, _, ok := ParseEcho(msg[2 : hdr-1]); ok {
+			t.Fatal("truncated echo datagram accepted")
+		}
+	}
+	if _, _, ok := ParseAddrPort([]byte{atypDomain, 1, 'a', 0, 80}); ok {
+		t.Fatal("domain accepted as an IP address")
 	}
 }
 

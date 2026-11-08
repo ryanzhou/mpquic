@@ -53,6 +53,46 @@ type Config struct {
 	// each target and keep the first that connects.
 	RaceConnect bool          `json:"race_connect,omitempty"`
 	Relays      []RelayConfig `json:"relays,omitempty"`
+	// NoSOCKS (local role) disables the SOCKS5 listener, e.g. to serve
+	// only WireGuard.
+	NoSOCKS bool `json:"no_socks,omitempty"`
+	// WireGuard (local role), if set, runs a userspace WireGuard server
+	// whose peers' traffic is proxied transparently.
+	WireGuard *WireGuardConfig `json:"wireguard,omitempty"`
+}
+
+// DefaultWireGuardPort is the default WireGuard listen port.
+const DefaultWireGuardPort = 51820
+
+// WireGuardConfig configures the WireGuard listener of the local role.
+type WireGuardConfig struct {
+	// Listen is the UDP listen address: "[host]:port" or "port"
+	// (default: port 51820 on all interfaces).
+	Listen     string          `json:"listen,omitempty"`
+	PrivateKey string          `json:"private_key,omitempty"`
+	MTU        int             `json:"mtu,omitempty"` // interface MTU (default 1420)
+	Peers      []WireGuardPeer `json:"peers,omitempty"`
+}
+
+// WireGuardPeer is a client of the WireGuard listener.
+type WireGuardPeer struct {
+	PublicKey    string `json:"public_key"`
+	PresharedKey string `json:"preshared_key,omitempty"`
+	// AllowedIPs are the peer's tunnel addresses (default: any; required
+	// with several peers).
+	AllowedIPs StringList `json:"allowed_ips,omitempty"`
+}
+
+// WireGuardListen returns the WireGuard listen address with defaults.
+func (w *WireGuardConfig) WireGuardListen() string {
+	l := strings.TrimSpace(w.Listen)
+	if l == "" {
+		return ":" + strconv.Itoa(DefaultWireGuardPort)
+	}
+	if _, err := strconv.Atoi(l); err == nil {
+		return ":" + l
+	}
+	return l
 }
 
 // RelayConfig configures one UDP relay (relay mode).
@@ -204,6 +244,15 @@ func (c *Config) Clone() *Config {
 	n.Server = append(StringList(nil), c.Server...)
 	n.Servers = append([]ServerEntry(nil), c.Servers...)
 	n.Relays = append([]RelayConfig(nil), c.Relays...)
+	if c.WireGuard != nil {
+		w := *c.WireGuard
+		w.Peers = nil
+		for _, p := range c.WireGuard.Peers {
+			p.AllowedIPs = append(StringList(nil), p.AllowedIPs...)
+			w.Peers = append(w.Peers, p)
+		}
+		n.WireGuard = &w
+	}
 	return &n
 }
 

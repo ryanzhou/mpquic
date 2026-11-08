@@ -87,3 +87,24 @@ func TestSaveAndSizes(t *testing.T) {
 		t.Fatal("Clone shares the server list")
 	}
 }
+
+func TestWireGuardConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	os.WriteFile(path, []byte(`{"server":"h","password":"p","no_socks":true,
+		"wireguard":{"private_key":"k","peers":[{"public_key":"a","allowed_ips":"10.0.0.2/32"}]}}`), 0o600)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.NoSOCKS || c.WireGuard == nil || c.WireGuard.WireGuardListen() != ":51820" ||
+		len(c.WireGuard.Peers) != 1 || c.WireGuard.Peers[0].AllowedIPs[0] != "10.0.0.2/32" {
+		t.Fatalf("%+v", c.WireGuard)
+	}
+	n := c.Clone()
+	n.WireGuard.Peers[0].AllowedIPs[0] = "x"
+	n.WireGuard.Listen = "1"
+	if c.WireGuard.Peers[0].AllowedIPs[0] != "10.0.0.2/32" || c.WireGuard.Listen != "" {
+		t.Fatal("Clone shares the WireGuard config")
+	}
+}
