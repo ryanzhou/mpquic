@@ -147,6 +147,69 @@ With unconstrained loopback paths, a single process running both endpoints
 and both relays moves ~3.7 Gbit/s download / ~4.0 Gbit/s upload (7 of 8
 cores busy). Internet paths, not CPU, are the bottleneck for this use case.
 
+## SOCKS5 vs WireGuard entrypoint
+
+`scripts/bench-wireguard.sh` runs one `mpquic local` with both listeners on
+the same multipath session, in Docker. A client container reaches the same
+target through SOCKS5 (plain TCP to the local) or through WireGuard (the
+Linux kernel implementation, MTU 1420). `scripts/netbench` does the
+measuring for both. Throughput is the median of 3 runs, each 10 s after a
+2 s warm-up. Latencies come from 1000 round trips (connect: 200 new
+connections, timed to the first echoed byte). CPU is the local container's
+cgroup usage (100% = one core). Host: Ryzen 7 5700X, 8 cores shared by all
+containers.
+
+**lan**: one direct path, no emulation (overhead / CPU ceiling)
+
+| test | direct | SOCKS5 | WireGuard | local CPU, SOCKS5 → WG |
+|---|---|---|---|---|
+| download, 1 stream | 27.9 Gbit/s | 2224 Mbit/s | 1236 Mbit/s | 178% → 241% |
+| upload, 1 stream | 18.2 Gbit/s | 2075 Mbit/s | 1508 Mbit/s | 190% → 258% |
+| download, 4 streams | – | 2042 Mbit/s | 1177 Mbit/s | 185% → 249% |
+| upload, 4 streams | – | 2005 Mbit/s | 1415 Mbit/s | 181% → 261% |
+| TCP 64 B round trip, p50 / p99 | 0.054 / 0.22 ms | 0.320 / 0.49 ms | 0.455 / 1.10 ms | |
+| new TCP connection, p50 / p99 | 0.158 / 0.50 ms | 0.650 / 1.13 ms | 0.773 / 1.51 ms | |
+| UDP 64 B round trip, p50 / p99 | 0.039 / 0.10 ms | 0.283 / 0.42 ms | 0.390 / 0.78 ms | |
+| UDP 1200 B round trip, p50 / p99 | 0.039 / 0.10 ms | 0.324 / 0.64 ms | 0.402 / 0.77 ms | |
+
+**wan**: two emulated paths through relays, 10 ms and 25 ms one-way, 100
+Mbit/s each
+
+| test | SOCKS5 | WireGuard | local CPU, SOCKS5 → WG |
+|---|---|---|---|
+| download, 1 / 4 streams | 188 / 186 Mbit/s | 187 / 187 Mbit/s | 67% → 104%, 62% → 84% |
+| upload, 1 / 4 streams | 186 / 193 Mbit/s | 186 / 187 Mbit/s | 51% → 80%, 50% → 81% |
+| TCP 64 B round trip, p50 | 21.77 ms | 21.85 ms | |
+| new TCP connection, p50 | 21.51 ms | 21.69 ms | |
+| UDP 64 B / 1200 B round trip, p50 | 20.99 / 21.20 ms | 21.15 / 21.38 ms | |
+
+When the paths are the bottleneck, both entrypoints fill them equally, and
+WireGuard adds about 0.1–0.2 ms of latency. Without a bottleneck, the
+WireGuard listener runs at 55–75% of SOCKS5 throughput and uses about twice
+the local CPU per byte (the remote's cost per byte is the same).
+Profiling the local during a WireGuard download puts about 25% of its CPU
+in wireguard-go's UDP socket I/O (one ~1420-byte packet per send), about
+20% in gVisor's TCP stack and only about 3% in ChaCha20-Poly1305.
+
+Simple optimizations tried (4 full runs, judged by the WireGuard/SOCKS5
+ratio within each run, since unchanged SOCKS5 drifted by up to ±8% between
+runs) changed neither throughput nor latency beyond the noise, so none was
+kept:
+
+* gVisor software GSO (TCP sends a burst of up to 32 KB per pass), tun
+  batches of 128 packets, one fewer copy per packet: the batches that
+  wireguard-go encrypts and sends grew from mostly single packets to about
+  25, and gVisor's share of CPU fell from ~21% to ~12%. The serial
+  per-peer send path (UDP `sendmmsg`) stayed the limit.
+* GRO on packets from the peers, with receive checksums skipped (WireGuard
+  authenticates every packet). gVisor's GRO also requires the link to
+  advertise `CapabilityRXChecksumOffload`, as it leaves the IPv4 header
+  checksum of merged packets stale.
+
+On this testbed all containers share one host, so the time in the local's
+send system calls includes the client kernel's receive work. A two-machine
+setup would show the local's own limit.
+
 ## Reproduce
 
 ```sh
@@ -156,4 +219,5 @@ scripts/harm-bench.sh ./bin/mpbench        # good paths vs. good paths + one bad
 scripts/harm-summary.py                    # flags metrics the bad path made worse
 scripts/lossy-bench.sh ./bin/mpbench       # four lossy paths (20/10/5/1%)
 mpbench --path delay=20ms,rate=50mbit,loss=1% --path delay=60ms,rate=80mbit -v
+scripts/bench-wireguard.sh                 # SOCKS5 vs WireGuard entrypoint (Docker)
 ```
