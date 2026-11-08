@@ -18,6 +18,7 @@ import (
 	"mpquic/internal/config"
 	"mpquic/internal/linkem"
 	"mpquic/internal/mp"
+	"mpquic/internal/procs"
 	"mpquic/internal/proxy"
 	"mpquic/internal/wg"
 )
@@ -171,6 +172,8 @@ func Run(ctx context.Context, role string, cfg *config.Config, log *slog.Logger)
 	if err := Validate(r, cfg); err != nil {
 		return err
 	}
+	// Run on one thread while it has headroom (see package procs).
+	defer procs.Start(log)()
 	switch r {
 	case "local", "tunnel":
 		return runLocal(ctx, r, cfg, log)

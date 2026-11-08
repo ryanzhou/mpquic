@@ -84,9 +84,11 @@ type Path struct {
 	ackedSentMax time.Time
 	// largest chunk payload that fits in one data datagram
 	dgramChunk int
-	// datagram data: sender-side record of outstanding datagrams by dseq
+	// datagram data: sender-side record of outstanding datagrams by dseq,
+	// dgSent[dgHead:] (consecutive dseqs; see dropDgSent)
 	dgNext uint64
 	dgSent []dgSent
+	dgHead int
 	// receiver side: which dseqs arrived (bit i of rxBits = dseq rxLargest-i)
 	rxLargest uint64
 	rxBits    [pathAckBits/64 + 1]uint64
@@ -315,7 +317,7 @@ func (p *Path) sendLoop() {
 			ss.CancelWrite(0)
 		}
 	}()
-	var hdr []byte
+	var hdr, dbuf []byte
 	for {
 		c, dseq, perStream, ids, err := p.sess.nextChunk(p)
 		dgram := dseq >= 0
@@ -338,13 +340,14 @@ func (p *Path) sendLoop() {
 			if c.fin {
 				lf |= 1
 			}
-			b := make([]byte, 0, dgDataOverhead+len(c.data))
-			b = append(b, dgData)
+			// SendDatagram copies the payload: the buffer is reused.
+			b := append(dbuf[:0], dgData)
 			b = quicvarint.Append(b, uint64(dseq))
 			b = quicvarint.Append(b, id)
 			b = quicvarint.Append(b, c.off)
 			b = quicvarint.Append(b, lf)
 			b = append(b, c.data...)
+			dbuf = b
 			if err := p.conn.SendDatagram(b); err != nil {
 				var tl *quic.DatagramTooLargeError
 				if errors.As(err, &tl) {
@@ -764,6 +767,29 @@ func (p *Path) tickLocked(now time.Time, active bool) bool {
 		go p.conn.CloseWithError(errCodeShutdown, "path dead")
 	}
 	return false
+}
+
+// outstandingDgrams returns the records of datagrams not yet resolved
+// (acknowledged or declared lost) at the front, in dseq order.
+func (p *Path) outstandingDgrams() []dgSent { return p.dgSent[p.dgHead:] }
+
+// dropDgSent drops the n oldest outstanding records. The backing array is
+// reused: it is compacted once the dropped prefix is as long as the rest, so
+// that steady-state appends do not reallocate it.
+func (p *Path) dropDgSent(n int) {
+	if n <= 0 {
+		return
+	}
+	clear(p.dgSent[p.dgHead : p.dgHead+n]) // release the chunks
+	p.dgHead += n
+	switch {
+	case p.dgHead == len(p.dgSent):
+		p.dgSent, p.dgHead = p.dgSent[:0], 0
+	case p.dgHead >= 256 && 2*p.dgHead >= len(p.dgSent):
+		k := copy(p.dgSent, p.dgSent[p.dgHead:])
+		clear(p.dgSent[k:])
+		p.dgSent, p.dgHead = p.dgSent[:k], 0
+	}
 }
 
 type dgSent struct {

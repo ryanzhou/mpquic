@@ -293,8 +293,16 @@ func (l *Link) currentRate(now time.Time) float64 {
 	return s.Rate
 }
 
-// Send submits a packet; out is called (from the link goroutine) when it is
-// delivered. The packet data is copied.
+// passthrough reports whether the spec leaves packets unchanged.
+func (s *Spec) passthrough() bool {
+	return s.Delay == 0 && s.Jitter == 0 && s.Loss == 0 && s.Rate == 0 && (s.Rate2 == 0 || s.Flap == 0) &&
+		s.Police == 0 && s.Reorder == 0 && s.Dup == 0 && (s.OutageEvery == 0 || s.OutageFor == 0) && s.MTU == 0
+}
+
+// Send submits a packet; out is called when it is delivered: from the link
+// goroutine with a copy of b, or, on an unimpaired link (a plain relay),
+// directly with b before Send returns (no copy and no goroutine hand-off
+// per packet).
 func (l *Link) Send(b []byte, out func([]byte)) {
 	now := time.Now()
 	l.mu.Lock()
@@ -302,6 +310,12 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 	if l.down || l.closed {
 		l.Dropped++
 		l.mu.Unlock()
+		return
+	}
+	if len(l.q) == 0 && s.passthrough() { // nothing queued: order is kept
+		l.Passed++
+		l.mu.Unlock()
+		out(b)
 		return
 	}
 	if s.OutageEvery > 0 && s.OutageFor > 0 {

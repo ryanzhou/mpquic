@@ -116,3 +116,47 @@ func TestOutage(t *testing.T) {
 		t.Fatalf("outage: delivered %d, want 1", n.Load())
 	}
 }
+
+// TestPassthrough: an unimpaired link delivers synchronously and in order,
+// also right after an impaired phase whose packets are still queued.
+func TestPassthrough(t *testing.T) {
+	l := NewLink(Spec{}, 1)
+	defer l.Close()
+	var mu sync.Mutex
+	var got []byte
+	out := func(b []byte) {
+		mu.Lock()
+		got = append(got, b[0])
+		mu.Unlock()
+	}
+	l.Send([]byte{1}, out)
+	mu.Lock()
+	if len(got) != 1 {
+		mu.Unlock()
+		t.Fatal("unimpaired link did not deliver synchronously")
+	}
+	mu.Unlock()
+	l.SetSpec(Spec{Delay: 30 * time.Millisecond})
+	l.Send([]byte{2}, out)
+	l.SetSpec(Spec{})
+	l.Send([]byte{3}, out) // must wait behind 2
+	deadline := time.Now().Add(time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n == 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	l.Send([]byte{4}, out)
+	mu.Lock()
+	defer mu.Unlock()
+	if string(got) != "\x01\x02\x03\x04" {
+		t.Fatalf("delivery order %v, want [1 2 3 4]", got)
+	}
+	if l.Passed != 4 {
+		t.Fatalf("passed %d, want 4", l.Passed)
+	}
+}

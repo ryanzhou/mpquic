@@ -444,3 +444,79 @@ func TestBenchedNeedsAlternative(t *testing.T) {
 		t.Fatal("probing path not benched although a good one exists")
 	}
 }
+
+// TestEchoDatagramMode: a very lossy path sends data as datagrams (PATHACK
+// loss detection, reinjection on the clean path); data must arrive intact.
+func TestEchoDatagramMode(t *testing.T) {
+	old := dgramLossThreshold
+	dgramLossThreshold = 0.03 // switch as soon as the loss is measured
+	t.Cleanup(func() { dgramLossThreshold = old })
+	tb := newTestbed(t, []string{"delay=5ms,loss=15%,rate=30mbit", "delay=20ms,rate=20mbit"}, echoHandler, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			echoRoundTrip(t, tb.cl, randBytes(2<<20+i*333))
+		}(i)
+	}
+	wg.Wait()
+	s := tb.cl.Session()
+	s.mu.Lock()
+	dgram := false
+	for _, p := range s.paths {
+		dgram = dgram || p.dgNext > 0
+	}
+	s.mu.Unlock()
+	if !dgram {
+		t.Fatal("no data was sent as datagrams")
+	}
+}
+
+func TestDropDgSent(t *testing.T) {
+	p := &Path{}
+	var next uint64
+	push := func(n int) {
+		for range n {
+			p.dgSent = append(p.dgSent, dgSent{seq: next, c: &chunk{}})
+			next++
+		}
+	}
+	check := func() {
+		t.Helper()
+		out := p.outstandingDgrams()
+		for i := 1; i < len(out); i++ {
+			if out[i].seq != out[i-1].seq+1 {
+				t.Fatalf("records not consecutive at %d: %d after %d", i, out[i].seq, out[i-1].seq)
+			}
+		}
+		for i := range p.dgSent[:p.dgHead] {
+			if p.dgSent[i].c != nil {
+				t.Fatal("dropped record still references its chunk")
+			}
+		}
+	}
+	push(1000)
+	p.dropDgSent(300)
+	check()
+	if out := p.outstandingDgrams(); len(out) != 700 || out[0].seq != 300 {
+		t.Fatalf("after drop: %d records from %d", len(out), out[0].seq)
+	}
+	capBefore := cap(p.dgSent)
+	// Steady state: as many sent as resolved; the array is reused.
+	for range 100 {
+		push(400)
+		p.dropDgSent(400)
+		check()
+	}
+	if out := p.outstandingDgrams(); len(out) != 700 || out[0].seq != next-700 {
+		t.Fatalf("steady state: %d records from %d", len(out), out[0].seq)
+	}
+	if cap(p.dgSent) > 4*capBefore {
+		t.Fatalf("backing array grew from %d to %d", capBefore, cap(p.dgSent))
+	}
+	p.dropDgSent(700)
+	if len(p.outstandingDgrams()) != 0 || p.dgHead != 0 {
+		t.Fatal("not empty after dropping everything")
+	}
+}

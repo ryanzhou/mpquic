@@ -395,6 +395,7 @@ internal/cc       congestion-control glue + vendored BBR (from Hysteria, MIT)
 internal/proxy    SOCKS5 / tunnel / remote dialer / UDP associate / ICMP echo
 internal/wg       WireGuard listener (wireguard-go + gVisor netstack)
 internal/linkem   UDP relay with link emulation
+internal/procs    adapts GOMAXPROCS to the load (see docs/DESIGN.md, "Tuning")
 internal/config   shadowsocks-compatible JSON config
 deploy/           docker-compose testbed
 ```

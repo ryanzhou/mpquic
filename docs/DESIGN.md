@@ -441,6 +441,18 @@ a bottleneck, they will together take more than one flow's fair share there.
   low RTT, see above), `cubic` (quic-go's built-in loss-based controller, for
   comparison only: it collapses under random loss and fills deep buffers).
 * `no_dup`: disables duplication if the relay traffic is metered.
+* `GOMAXPROCS` (environment): by default the local, remote and relay adapt
+  the number of Go scheduler threads to the load (`internal/procs`). Each
+  packet passes through several goroutines (socket reader, QUIC connection
+  loop, send queue, stream reader, proxied connection). With idle CPUs
+  around, each hand-off wakes another OS thread, which spins and sleeps
+  again, and the goroutines bounce between CPUs. At moderate rates that
+  costs as much as the packet processing itself. So a process starts on one
+  thread and doubles the number, up to all CPUs or the container's limit,
+  when they are busy (CPU usage near the number of threads) or goroutines
+  queue for them (mean scheduling latency ≥ 100 µs). It halves it again when
+  the load fits in half. Setting `GOMAXPROCS` pins the number and turns
+  this off. See docs/BENCHMARKS.md, "CPU".
 
 ## Limitations / future work
 

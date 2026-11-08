@@ -84,9 +84,9 @@ func (s *Session) nextChunk(p *Path) (*chunk, int64, int, []uint64, error) {
 				dseq = int64(p.dgNext)
 				p.dgSent = append(p.dgSent, dgSent{seq: p.dgNext, c: c, at: now})
 				p.dgNext++
-				if len(p.dgSent) > 1<<15 { // bound memory; oldest presumed lost
-					s.dgLostLocked(p, &p.dgSent[0], now)
-					p.dgSent = p.dgSent[1:]
+				if len(p.dgSent)-p.dgHead > 1<<15 { // bound memory; oldest presumed lost
+					s.dgLostLocked(p, &p.dgSent[p.dgHead], now)
+					p.dropDgSent(1)
 				}
 			}
 			p.busy = true
@@ -133,11 +133,12 @@ func (s *Session) nextChunk(p *Path) (*chunk, int64, int, []uint64, error) {
 // numbers and a reorder window older than a received one are lost, and their
 // chunks are reinjected at once (on the best path, see pickLocked).
 func (s *Session) onPathAckLocked(p *Path, largest uint64, bm []byte, now time.Time) {
+	// Outstanding records have consecutive sequence numbers.
+	out := p.outstandingDgrams()
 	var largestAt time.Time
-	for i := range p.dgSent {
-		if p.dgSent[i].seq == largest {
-			largestAt = p.dgSent[i].at
-			break
+	if len(out) > 0 && largest >= out[0].seq {
+		if k := largest - out[0].seq; k < uint64(len(out)) && out[k].seq == largest {
+			largestAt = out[k].at
 		}
 	}
 	received := func(seq uint64) bool {
@@ -151,9 +152,12 @@ func (s *Session) onPathAckLocked(p *Path, largest uint64, bm []byte, now time.T
 		return d < pathAckBits && bm[d/8]&(1<<(d%8)) != 0
 	}
 	lost := 0
-	for i := range p.dgSent {
-		e := &p.dgSent[i]
-		if e.resolved || e.seq > largest {
+	for i := range out {
+		e := &out[i]
+		if e.seq > largest {
+			break
+		}
+		if e.resolved {
 			continue
 		}
 		if received(e.seq) {
@@ -169,10 +173,10 @@ func (s *Session) onPathAckLocked(p *Path, largest uint64, bm []byte, now time.T
 		}
 	}
 	i := 0
-	for i < len(p.dgSent) && p.dgSent[i].resolved {
+	for i < len(out) && out[i].resolved {
 		i++
 	}
-	p.dgSent = p.dgSent[i:]
+	p.dropDgSent(i)
 	if lost > 0 {
 		s.wakeAllLocked()
 	}
@@ -222,12 +226,13 @@ func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration, str
 	if !p.usable() {
 		return nil, 20 * time.Millisecond, ""
 	}
-	// 1. reinjection queue
-	for i := 0; i < len(s.reinjectQ); {
-		c := s.reinjectQ[i]
+	// 1. reinjection queue (compacted in place: chunks acknowledged
+	// meanwhile are dropped in the same pass)
+	q, w := s.reinjectQ, 0
+	for i := 0; i < len(q); i++ {
+		c := q[i]
 		if c.acked || c.st.err != nil {
 			c.queued = false
-			s.reinjectQ = append(s.reinjectQ[:i], s.reinjectQ[i+1:]...)
 			continue
 		}
 		if st := c.st; c.off > st.sq.frontOff() && st.pendingData() > 0 && st.peerWindow > st.sq.frontOff() {
@@ -235,17 +240,21 @@ func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration, str
 			// before this chunk (lost far ahead of the front, e.g. on a slow
 			// path). The front catches up with it soon enough.
 			c.queuedAt = now // target-choice timeouts start when it is due
-			i++
+			q[w], w = c, w+1
 			continue
 		}
 		if s.carriedLocked(c, p, now) || !p.canCarry(c) || s.betterFreePathLocked(p, c, now) || !s.goodReinjectTargetLocked(p, c, now) {
-			i++
+			q[w], w = c, w+1
 			continue
 		}
 		c.queued = false
-		s.reinjectQ = append(s.reinjectQ[:i], s.reinjectQ[i+1:]...)
+		w += copy(q[w:], q[i+1:])
+		clear(q[w:])
+		s.reinjectQ = q[:w]
 		return c, 0, "reinject"
 	}
+	clear(q[w:])
+	s.reinjectQ = q[:w]
 	var recheck time.Duration
 	// 2. new data
 	if s.backlog > 0 && len(s.rr) > 0 {

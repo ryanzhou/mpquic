@@ -147,6 +147,53 @@ With unconstrained loopback paths, a single process running both endpoints
 and both relays moves ~3.7 Gbit/s download / ~4.0 Gbit/s upload (7 of 8
 cores busy). Internet paths, not CPU, are the bottleneck for this use case.
 
+### CPU at moderate rates
+
+Each endpoint (and relay) in its own process: `mpquic remote`, one
+`mpquic relay --link SPEC` per path, `mpquic local`, and `scripts/netbench`
+downloading through SOCKS5 (one stream unless noted). CPU is measured over
+6 s after a 3 s warm-up, 100% = one core; the relay column is the first
+(emulating) relay. Average of 2 runs, Ryzen 7 5700X, all processes on one
+8-core host. "before" is commit 93843ef, "after" adds the GOMAXPROCS
+governor (`internal/procs`, see docs/DESIGN.md, "Tuning"), a pass-through
+fast path in the relay, and cheaper reinjection-queue and datagram-ACK
+bookkeeping:
+
+| condition | throughput before → after | local CPU | remote CPU | relay CPU |
+|---|---|---|---|---|
+| 20 Mbit/s, 10 ms | 19 → 19 Mbit/s | 19% → 11% | 20% → 13% | 21% → 12% |
+| 100 Mbit/s, 10 ms | 95 → 95 Mbit/s | 35% → 18% | 28% → 13% | 38% → 16% |
+| 300 Mbit/s, 10 ms | 286 → 286 Mbit/s | 117% → 41% | 104% → 29% | 146% → 38% |
+| 100 Mbit/s upload | 94 → 92 Mbit/s | 28% → 14% | 34% → 18% | 37% → 15% |
+| 2 × 50 Mbit/s (10 / 30 ms) | 95 → 94 Mbit/s | 36% → 20% | 32% → 15% | 26% → 13% |
+| 100 Mbit/s, 1% loss | 96 → 93 Mbit/s | 39% → 19% | 31% → 14% | 40% → 17% |
+| 100 Mbit/s, 3% loss | 93 → 94 Mbit/s | 41% → 21% | 31% → 17% | 42% → 18% |
+| 50 Mbit/s 10% loss (datagram mode) + 50 Mbit/s clean | 90 → 90 Mbit/s | 43% → 24% | 40% → 20% | 28% → 17% |
+| 100 Mbit/s, 150 ms RTT | 96 → 96 Mbit/s | 36% → 20% | 30% → 17% | 38% → 17% |
+| 3 paths: 50 / 30 (2% loss) / 20 Mbit/s | 96 → 94 Mbit/s | 43% → 24% | 36% → 18% | 24% → 13% |
+| 100 Mbit/s, 16 streams | 95 → 95 Mbit/s | 43% → 19% | 36% → 19% | 45% → 16% |
+| unlimited, 1 path | 989 → 1450 Mbit/s | 150% → 124% | 140% → 109% | 174% → 193% |
+| unlimited, 2 paths, 4 streams | 1242 → 1162 Mbit/s | 160% → 160% | 192% → 195% | 117% → 107% |
+| 64 B round trip, p50 | 2.63 → 2.57 ms | 23% → 15% | 24% → 15% | 28% → 16% |
+| new connection, p50 | 11.91 → 11.75 ms | 16% → 8% | 14% → 7% | 16% → 10% |
+
+A plain relay (`mpquic relay` without `--link`) forwarding a 100 Mbit/s
+download used 49% → 21%.
+
+Before, at moderate rates, about half of the CPU went to the Go scheduler
+rather than to packets: each packet is handed through several goroutines,
+and with idle CPUs each hand-off woke another thread (futex wake, spinning,
+sleep). Running on one thread halved the CPU at the same throughput and
+latency. The governor keeps a process on one thread until it is busy or
+goroutines queue for it, then doubles the number of threads. A single path
+peaks higher with fewer threads (~1.45 Gbit/s on 2 vs ~1 Gbit/s on 8). In
+the last unlimited case the whole host is saturated, and runs vary by about
+±10%. What remains at moderate rates is mostly system calls: quic-go
+acknowledges every second packet, so the receiver sends one ACK per two
+data packets, and nothing batches until the rate is high. On this testbed
+the send-side system calls also include the next hop's receive work, as
+all processes share one host.
+
 ## SOCKS5 vs WireGuard entrypoint
 
 `scripts/bench-wireguard.sh` runs one `mpquic local` with both listeners on
