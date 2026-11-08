@@ -101,6 +101,9 @@ func FirewallRules(cfg *config.Config) []FirewallRule {
 			// SOCKS5 UDP ASSOCIATE relays on ephemeral ports.
 			rules = append(rules, FirewallRule{"UDP", nil})
 		}
+		if role == "tunnel" && cfg.UDPEnabled() {
+			rules = append(rules, FirewallRule{"UDP", ports}) // UDP tunnel
+		}
 	}
 	return mergeRules(rules)
 }

@@ -52,11 +52,11 @@ const dgDataOverhead = 1 + 8 + 8 + 8 + 4
 const maxCtrlDatagram = 900
 
 const (
-	frPing    = 1 // seq
-	frPong    = 2 // seq
-	frAck     = 3 // n, n*(id, cum, window, nranges, nranges*(start,end))
-	frReset   = 4 // id, code
-	frDgram   = 5 // raw datagram too large for a QUIC DATAGRAM frame
+	frPing  = 1 // seq
+	frPong  = 2 // seq
+	frAck   = 3 // n, n*(id, cum, window, nranges, nranges*(start,end))
+	frReset = 4 // id, code
+	// 5 was frDgram (an oversized UDP datagram sent reliably); unused now
 	frPathAck = 6 // pathIndex, largest dseq, 32-byte bitmap of the 256 dseqs below
 )
 

@@ -85,8 +85,8 @@ client resets its streams instead of waiting for data that no longer exists.
 
 The handshake also carries the protocol version (currently **2**; both ends
 must run the same version). Control frames are length-prefixed and travel as
-QUIC DATAGRAMs (falling back to the reliable control stream when a frame is
-too large or datagrams are unavailable). A reliable stream would put the
+QUIC DATAGRAMs (falling back to the reliable control stream when a control
+frame is too large or datagrams are unavailable). A reliable stream would put the
 liveness and acknowledgement signals behind every retransmission on a lossy
 path, which used to produce false "path suspect" events and late SACKs:
 
@@ -96,7 +96,6 @@ path, which used to produce false "path suspect" events and late SACKs:
 | ACK | per stream: cumulative offset, window, ≤200 SACK ranges (delta-encoded) | data-level acknowledgement + flow control; sent on the two best paths, re-sent every 30 ms while data is arriving |
 | PATHACK | path index, largest datagram seq, 256-bit bitmap | per-path receipt of data datagrams (loss detection on lossy paths) |
 | RESET | stream id, code | abort (dial failure, idle timeout, …) |
-| DGRAM | raw datagram | UDP payloads too large for a QUIC DATAGRAM frame |
 
 Every DATAGRAM payload starts with a type byte: 0 = proxied UDP, 1 = control
 frames, 2 = stream data (`dseq id off len|fin data`, see "Lossy paths").
@@ -119,9 +118,10 @@ blocks other proxied connections that share the path.
 As in shadowsocks, the first bytes of every stream are the target address in
 SOCKS5 format. That means there's no separate "open" message. The local
 replies to the SOCKS client immediately, and the request bytes follow the
-address with zero extra round trips. UDP ASSOCIATE payloads travel as QUIC
-DATAGRAM frames (`assoc_id ‖ socks_addr ‖ payload`) on the lowest-latency
-path that can carry them (see "Packet sizes" for the limits).
+address with zero extra round trips. UDP (SOCKS5 UDP ASSOCIATE, the UDP
+tunnel, WireGuard) travels as QUIC DATAGRAM frames (`assoc_id ‖ socks_addr ‖
+payload`) on the lowest-latency path that can carry them (see "Packet sizes"
+for the limits), or over streams with reliable UDP (see "Reliable UDP").
 
 Two more datagram forms share that format:
 
@@ -173,20 +173,46 @@ bytes) and the SOCKS address (7 bytes IPv4, 19 IPv6, 4 + name for domains).
 For an IPv4 target (and a 1-byte id) that leaves 1200 − 37 − 1 − 8 = 1154
 bytes of UDP payload at the start, ~1390–1406 on a 1500-byte path after
 discovery, and `mtu − 74` with `mtu` set (1206 at 1280). A datagram that no
-path can carry:
+path can carry is **dropped**, like a network with a smaller MTU drops it,
+including while discovery may still raise the limit. Protocols that discover
+the MTU themselves (QUIC inside the tunnel, i.e. HTTP/3) settle at a size
+that fits. Drops are logged (at most every 30 s) and counted in the stats
+(`udp_too_large`); set the client's MTU ≤ the logged maximum + 28, or use
+reliable UDP. There is no reliable fallback for large datagrams (e.g. big
+DNS responses, which an IP network would fragment).
 
-* is **dropped** if its payload is at most 1472 bytes (what a 1500-byte
-  network carries) and the paths' MTU is known (fixed, or 10 s / 40 RTTs
-  after the path came up). This is what a network with a smaller MTU does,
-  and protocols that discover the MTU themselves (QUIC inside the tunnel,
-  i.e. HTTP/3) settle at a size that fits. Sending these reliably made the
-  inner discovery succeed, so all full-size inner packets went over a
-  reliable stream: retransmissions inside retransmissions and head-of-line
-  blocking. Drops are logged (at most every 30 s) and counted in the stats
-  (`udp_too_large`); set the client's MTU ≤ the logged maximum + 28.
-* is sent **reliably** on the best path's control stream otherwise: bigger
-  datagrams (e.g. large DNS responses, which an IP network would fragment)
-  and anything while discovery may still raise the limit.
+### Reliable UDP
+
+With `reliable_udp` (`--reliable-udp`, local and tunnel roles) every UDP
+association (SOCKS5 UDP ASSOCIATE, UDP tunnel client, WireGuard UDP flow) is
+one multipath stream instead, opened on its first datagram:
+
+```
+stream = 0x55 frame*          (0x55: not a SOCKS5 address type)
+frame  = len:varint socks_addr payload
+```
+
+The address is the target towards the remote and the replying peer back
+towards the local; the remote relays through one UDP socket per stream
+(full-cone, as for datagrams). The local closes its side (FIN) when the
+association ends; the remote then closes the socket and its side. A stream
+that fails (idle timeout, lost session) is reopened on the next datagram. A
+remote without UDP enabled (or older than reliable UDP) resets the stream,
+which the local logs as a warning.
+
+Datagrams then get retransmission, multipath scheduling, reinjection and
+congestion control, and have no size limit (65,535-byte payloads), at the
+cost of head-of-line blocking and in-order delivery within an association.
+Only the local's setting matters: a remote with `-u` serves both kinds.
+
+UDP senders don't slow down when the tunnel is full, and a stream would
+otherwise buffer up to its window (seconds). Each writer (local and remote)
+therefore measures how fast its stream's unsent backlog drains (an average
+over 50 ms samples taken while backlogged) and drops a new datagram when the
+backlog exceeds 64 KB and would take more than 200 ms to drain: tail drop at
+the tunnel entrance, like a router queue. Drops are logged at most every
+30 s. In a test with 20 MB/s offered to two 8 Mbit/s paths, the last
+datagram arrived ~0.5 s after the sender stopped instead of ~2.9 s.
 
 ## Session layer
 
@@ -555,7 +581,7 @@ controllers.
   backed-off probe timer. That takes ~1–2 s after the path heals, during
   which the other paths carry the traffic.
 * UDP datagrams are sent on the best path that can carry them, with no
-  redundancy.
+  redundancy (unless reliable UDP is on).
 * A path MTU that drops mid-connection is not detected (set `mtu`).
 * SIP003 plugins and SOCKS username/password authentication aren't
   supported.

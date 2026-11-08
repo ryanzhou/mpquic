@@ -52,7 +52,11 @@ type Config struct {
 	MTU           int    `json:"mtu,omitempty"`         // path MTU (IP packet size) of every path; 0 discovers it
 	// RaceConnect (remote role): race staggered TCP connection attempts to
 	// each target and keep the first that connects.
-	RaceConnect bool          `json:"race_connect,omitempty"`
+	RaceConnect bool `json:"race_connect,omitempty"`
+	// ReliableUDP (local and tunnel roles): relay UDP over streams
+	// (retransmitted, congestion-controlled, no size limit) instead of
+	// unreliable QUIC DATAGRAMs.
+	ReliableUDP bool          `json:"reliable_udp,omitempty"`
 	Relays      []RelayConfig `json:"relays,omitempty"`
 	// NoSOCKS (local role) disables the SOCKS5 listener, e.g. to serve
 	// only WireGuard.

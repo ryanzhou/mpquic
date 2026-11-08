@@ -138,12 +138,12 @@ func setup(t *testing.T, udpOn bool) *testEnv {
 
 func setupPing(t *testing.T, udpOn bool, listen func(string, string) (net.PacketConn, error)) *testEnv {
 	t.Helper()
-	return setupPeers(t, udpOn, listen, 1)
+	return setupPeers(t, udpOn, false, listen, 1)
 }
 
 // setupPeers starts the environment with n WireGuard peers; peer i has the
 // tunnel address 10.77.0.(2+i).
-func setupPeers(t *testing.T, udpOn bool, listen func(string, string) (net.PacketConn, error), n int) *testEnv {
+func setupPeers(t *testing.T, udpOn, reliable bool, listen func(string, string) (net.PacketConn, error), n int) *testEnv {
 	t.Helper()
 	log := tlog()
 	host := hostIP(t)
@@ -188,7 +188,7 @@ func setupPeers(t *testing.T, udpOn bool, listen func(string, string) (net.Packe
 	remoteUDP := proxy.NewUDPRemote(log)
 	remoteUDP.SetICMPListener(listen)
 	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: remoteUDP.HandleDatagram,
-		StreamHandler: proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 5 * time.Second})}
+		StreamHandler: proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 5 * time.Second, UDP: udpOn})}
 	srv, err := mp.NewServer(ropt, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -198,6 +198,7 @@ func setupPeers(t *testing.T, udpOn bool, listen func(string, string) (net.Packe
 	lopt := &mp.Options{Password: "x", Logger: log}
 	if udpOn {
 		udp = proxy.NewUDPLocal(nil, log)
+		udp.Reliable = reliable
 		lopt.DatagramHandler = udp.HandleDatagram
 	}
 	cl, err := mp.NewClient([]string{pc.LocalAddr().String(), pc.LocalAddr().String()}, lopt)
@@ -296,7 +297,7 @@ func TestTCP(t *testing.T) {
 
 // Several peers transfer at once (their packets are processed in parallel).
 func TestTCPPeers(t *testing.T) {
-	e := setupPeers(t, false, dgramPing, 3)
+	e := setupPeers(t, false, false, dgramPing, 3)
 	var wg sync.WaitGroup
 	for _, tnet := range e.tnets {
 		wg.Add(1)
@@ -384,18 +385,25 @@ func udpRoundTrip(t *testing.T, c *net.UDPConn, uc interface {
 }
 
 func TestUDP(t *testing.T) {
-	e := setup(t, true)
-	uc, err := e.tnet.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr("10.77.0.2"), 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer uc.Close()
-	// One socket, two targets (full-cone association); 3000 bytes need
-	// IP fragmentation in both directions.
-	for _, size := range []int{1, 1000, 3000, 9000} {
-		for _, to := range e.udpEcho {
-			udpRoundTrip(t, nil, uc, to, size)
+	for _, reliable := range []bool{false, true} {
+		e := setupPeers(t, true, reliable, dgramPing, 1)
+		uc, err := e.tnet.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr("10.77.0.2"), 0))
+		if err != nil {
+			t.Fatal(err)
 		}
+		// One socket, two targets (full-cone association). Datagrams
+		// beyond a QUIC packet only pass with reliable UDP; 3000 bytes
+		// need IP fragmentation in both directions.
+		sizes := []int{1, 1000}
+		if reliable {
+			sizes = append(sizes, 3000, 9000)
+		}
+		for _, size := range sizes {
+			for _, to := range e.udpEcho {
+				udpRoundTrip(t, nil, uc, to, size)
+			}
+		}
+		uc.Close()
 	}
 }
 

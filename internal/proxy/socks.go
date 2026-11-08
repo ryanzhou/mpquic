@@ -21,10 +21,17 @@ const (
 
 // ReadAddr reads a SOCKS5-format address (ATYP, ADDR, PORT).
 func ReadAddr(r io.Reader) (string, []byte, error) {
-	var b [1 + 255 + 2]byte
-	if _, err := io.ReadFull(r, b[:1]); err != nil {
+	var t [1]byte
+	if _, err := io.ReadFull(r, t[:]); err != nil {
 		return "", nil, err
 	}
+	return readAddrRest(r, t[0])
+}
+
+// readAddrRest reads the rest of a SOCKS5-format address of type atyp.
+func readAddrRest(r io.Reader, atyp byte) (string, []byte, error) {
+	var b [1 + 255 + 2]byte
+	b[0] = atyp
 	var host string
 	n := 1
 	switch b[0] {

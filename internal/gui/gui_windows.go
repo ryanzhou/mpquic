@@ -60,7 +60,7 @@ type ui struct {
 	mw                                     *walk.MainWindow
 	nameCB, roleCB, congCB, logCB          *walk.ComboBox
 	reverseCB, udpCB, noDupCB, showPwCB    *walk.CheckBox
-	raceCB                                 *walk.CheckBox
+	raceCB, reliableCB                     *walk.CheckBox
 	statusLbl, hintLbl, pathsLbl, portLbl  *walk.Label
 	laddrLbl, lportLbl, tunnelLbl          *walk.Label
 	relaysLbl, relaysHelp                  *walk.Label
@@ -213,7 +213,9 @@ func (u *ui) create() error {
 							PushButton{Text: "Generate", OnClicked: u.generatePassword},
 						}},
 						label("", nil),
-						CheckBox{AssignTo: &u.udpCB, Text: "Relay UDP (SOCKS5 UDP ASSOCIATE; enable on both ends)"},
+						CheckBox{AssignTo: &u.udpCB, Text: "Relay UDP (SOCKS5 UDP ASSOCIATE / UDP tunnel; enable on both ends)", OnCheckedChanged: u.updateRole},
+						label("", nil),
+						CheckBox{AssignTo: &u.reliableCB, Text: "Reliable UDP: relay UDP over streams (no losses or size limit; may add delay)"},
 						label("Listen address:", &u.laddrLbl),
 						LineEdit{AssignTo: &u.laddrLE, CueBanner: "127.0.0.1"},
 						label("Listen port:", &u.lportLbl),
@@ -328,6 +330,7 @@ func (u *ui) setForm(f Form) {
 	u.portLE.SetText(f.Port)
 	u.pwLE.SetText(f.Password)
 	u.udpCB.SetChecked(f.UDP)
+	u.reliableCB.SetChecked(f.ReliableUDP)
 	u.laddrLE.SetText(f.LocalAddr)
 	u.lportLE.SetText(f.LocalPort)
 	u.tunnelLE.SetText(f.Tunnel)
@@ -378,6 +381,7 @@ func (u *ui) readForm() Form {
 		Timeout:     strings.TrimSpace(u.timeoutLE.Text()),
 		MTU:         strings.TrimSpace(u.mtuLE.Text()),
 		Stats:       strings.TrimSpace(u.statsLE.Text()),
+		ReliableUDP: u.reliableCB.Checked(),
 		NoDup:       u.noDupCB.Checked(),
 		RaceConnect: u.raceCB.Checked(),
 		Cert:        strings.TrimSpace(u.certLE.Text()),
@@ -404,7 +408,9 @@ func (u *ui) updateRole() {
 		}
 	}
 	show(quic, u.reverseCB, u.pathsLbl, u.pathsTE, u.quicRows)
-	show(role == "local" || role == "remote", u.udpCB)
+	show(quic, u.udpCB)
+	show(local, u.reliableCB)
+	u.reliableCB.SetEnabled(f.UDP)
 	show(local, u.laddrLbl, u.laddrLE, u.lportLbl, u.lportLE)
 	show(role == "tunnel", u.tunnelLbl, u.tunnelLE)
 	show(!quic, u.relaysLbl, u.relaysTE, u.relaysHelp)
@@ -438,7 +444,11 @@ func (u *ui) updateRole() {
 		if role == "local" {
 			hint = append(hint, "Applications use the SOCKS5 proxy at "+addr+".")
 		} else {
-			hint = append(hint, "Connections to "+addr+" are forwarded to the tunnel target.")
+			what := "Connections"
+			if f.UDP {
+				what = "TCP connections and UDP datagrams"
+			}
+			hint = append(hint, what+" to "+addr+" are forwarded to the tunnel target.")
 		}
 	}
 	if cfg != nil {

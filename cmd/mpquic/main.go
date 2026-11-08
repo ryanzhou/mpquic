@@ -89,6 +89,7 @@ func usage() {
 Usage:
   mpquic local  [options]   SOCKS5 server forwarding over all paths (like ss-local)
   mpquic tunnel [options]   port forwarder to a fixed target (-L), like ss-tunnel
+                            (TCP; also UDP with -u)
   mpquic remote [options]   server that forwards to targets (like ss-server)
   mpquic relay  [options]   UDP relay with optional link emulation (like socat)
   mpquic service COMMAND    Windows service: install, uninstall, start, stop,
@@ -108,7 +109,8 @@ Common options (shadowsocks-compatible):
   -m METHOD         accepted for compatibility; QUIC/TLS 1.3 always encrypts
   -t SECONDS        idle timeout of proxied connections (default 300)
   -L HOST:PORT      tunnel target (tunnel mode)
-  -u                enable UDP relay (SOCKS5 UDP ASSOCIATE; set on both ends)
+  -u                enable UDP relay (set on both ends): SOCKS5 UDP ASSOCIATE,
+                    and in tunnel mode a UDP forwarder on the same port
   -v                verbose logging
   --reverse         reverse mode (set on both ends): the local listens for QUIC
                     (-s/-p = its bind address) and the remote dials it
@@ -129,6 +131,11 @@ mpquic options:
                     300, 600 and 1000 ms (each from a new source port, rotating
                     over the target's IPs); the first to connect wins. For
                     networks/NATs that drop connection setup (SYNs)
+  --reliable-udp    local/tunnel only: relay UDP over streams (retransmitted,
+                    congestion-controlled, any size; head-of-line blocking
+                    within each UDP association) instead of unreliable QUIC
+                    datagrams, which drop UDP payloads the path MTU cannot
+                    carry. Needs -u (on both ends)
   --cert/--key FILE TLS certificate for the server (optional)
   --sni NAME        TLS server name sent by the client
 
@@ -166,6 +173,7 @@ type commonFlags struct {
 	window, chunk              string
 	stats, mtu                 int
 	verbose, noDup, race       bool
+	reliableUDP                bool
 	noCoupling                 bool
 	cert, key, sni, logLevel   string
 	plugin                     string
@@ -200,6 +208,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
 	fs.BoolVar(&f.noCoupling, "no-coupling", false, "disable shared-bottleneck coupling of paths")
 	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")
+	fs.BoolVar(&f.reliableUDP, "reliable-udp", false, "relay UDP over streams (local/tunnel)")
 	fs.StringVar(&f.cert, "cert", "", "TLS certificate")
 	fs.StringVar(&f.key, "key", "", "TLS key")
 	fs.StringVar(&f.sni, "sni", "", "TLS SNI")
@@ -302,6 +311,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.race {
 		cfg.RaceConnect = true
+	}
+	if f.reliableUDP {
+		cfg.ReliableUDP = true
 	}
 	if f.cert != "" {
 		cfg.Cert, cfg.Key = f.cert, f.key

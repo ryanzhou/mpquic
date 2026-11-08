@@ -197,6 +197,14 @@ func (st *Stream) sendLimit() int64 {
 	return min(l, st.sess.opt.Window)
 }
 
+// Unsent returns the bytes written to st that no path has sent yet.
+func (st *Stream) Unsent() int64 {
+	s := st.sess
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return st.unsent
+}
+
 func (st *Stream) appendAccounting(n int) {
 	st.writeOff += uint64(n)
 	st.unsent += int64(n)

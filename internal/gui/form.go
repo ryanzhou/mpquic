@@ -17,23 +17,25 @@ import (
 
 // Form is the editable state of the configurator.
 type Form struct {
-	Role       string // local, tunnel, remote, relay
-	Reverse    bool
-	Paths      string // one address per line
-	Port       string
-	Password   string
-	UDP        bool
-	LocalAddr  string
-	LocalPort  string
-	Tunnel     string
-	Relays     string // one relay per line, see FormatRelays
-	Congestion string
-	Window     string
-	Chunk      string
-	Timeout    string
-	MTU        string
-	Stats      string
-	NoDup      bool
+	Role     string // local, tunnel, remote, relay
+	Reverse  bool
+	Paths    string // one address per line
+	Port     string
+	Password string
+	UDP      bool
+	// ReliableUDP (local, tunnel): relay UDP over streams.
+	ReliableUDP bool
+	LocalAddr   string
+	LocalPort   string
+	Tunnel      string
+	Relays      string // one relay per line, see FormatRelays
+	Congestion  string
+	Window      string
+	Chunk       string
+	Timeout     string
+	MTU         string
+	Stats       string
+	NoDup       bool
 	// RaceConnect (remote): race staggered outbound TCP connection attempts.
 	RaceConnect bool
 	Cert, Key   string
@@ -85,6 +87,7 @@ func FormFromConfig(c *config.Config) Form {
 		Port:        itoa(c.ServerPort),
 		Password:    c.EffectivePassword(),
 		UDP:         c.UDPEnabled(),
+		ReliableUDP: c.ReliableUDP,
 		LocalAddr:   c.LocalAddress,
 		LocalPort:   itoa(c.LocalPort),
 		Tunnel:      c.TunnelAddress,
@@ -186,6 +189,8 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		case c.UDPEnabled():
 			c.Mode = ""
 		}
+		local := role == "local" || role == "tunnel"
+		c.ReliableUDP = f.ReliableUDP && f.UDP && local
 		c.LocalAddress = strings.TrimSpace(f.LocalAddr)
 		num("Listen port", f.LocalPort, &c.LocalPort)
 		c.TunnelAddress = strings.TrimSpace(f.Tunnel)

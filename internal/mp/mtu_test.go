@@ -90,15 +90,9 @@ func (d *dgramSink) has(b []byte, wait time.Duration) bool {
 	}
 }
 
+// Datagrams that no path carries are dropped, never sent reliably.
 func TestOversizeDatagrams(t *testing.T) {
-	old := pmtuSettle
-	pmtuSettle = 300 * time.Millisecond
-	defer func() { pmtuSettle = old }()
 	const hdr = 9 // e.g. association id + SOCKS IPv4 address
-	dgram := func(payload int) []byte {
-		b := randBytes(hdr + payload)
-		return b
-	}
 	for _, mtu := range []int{0, 1280} {
 		sink := &dgramSink{}
 		tb := newTestbed(t, []string{"delay=5ms,mtu=1280"}, echoHandler, func(o *Options) {
@@ -106,18 +100,6 @@ func TestOversizeDatagrams(t *testing.T) {
 			o.DatagramHandler = sink.handle
 		})
 		sess := tb.cl.Session()
-		if mtu == 0 {
-			// before the path MTU is known, a datagram that does not fit
-			// is sent reliably (the limit may still grow)
-			b := dgram(1300)
-			if err := sess.SendDatagram(b, hdr); err != nil {
-				t.Fatalf("mtu %d, unsettled: %v", mtu, err)
-			}
-			if !sink.has(b, 2*time.Second) {
-				t.Fatalf("mtu %d, unsettled: 1300-byte datagram not delivered", mtu)
-			}
-			time.Sleep(time.Second) // > pmtuSettle and 40 RTTs
-		}
 		// 1280-byte path: 1252-byte UDP payload, 1215 for the DATAGRAM,
 		// minus the type byte and the header (discovery may end up to 20
 		// bytes lower, and start at 1200)
@@ -126,28 +108,27 @@ func TestOversizeDatagrams(t *testing.T) {
 		if mtu == 0 {
 			minLim = 1200 - 37 - 1 - hdr
 		}
-		if lim := sess.DatagramLimit(hdr); lim < minLim || lim > maxLim {
-			t.Errorf("mtu %d: limit %d", mtu, lim)
-		}
-		small := dgram(1000)
+		small := randBytes(hdr + 1000)
 		if err := sess.SendDatagram(small, hdr); err != nil {
 			t.Fatalf("mtu %d: %v", mtu, err)
 		}
-		mid := dgram(1300)
-		err := sess.SendDatagram(mid, hdr)
-		var tl *DatagramTooLargeError
-		if !errors.As(err, &tl) || tl.Size != 1300 || tl.Max < minLim || tl.Max > maxLim {
-			t.Fatalf("mtu %d: 1300-byte payload: err = %v", mtu, err)
+		var dropped [][]byte
+		for _, size := range []int{1300, 3000} {
+			b := randBytes(hdr + size)
+			err := sess.SendDatagram(b, hdr)
+			var tl *DatagramTooLargeError
+			if !errors.As(err, &tl) || tl.Size != size || tl.Max < minLim || tl.Max > maxLim {
+				t.Fatalf("mtu %d: %d-byte payload: err = %v", mtu, size, err)
+			}
+			dropped = append(dropped, b)
 		}
-		big := dgram(3000)
-		if err := sess.SendDatagram(big, hdr); err != nil {
-			t.Fatalf("mtu %d: %v", mtu, err)
+		if !sink.has(small, 2*time.Second) {
+			t.Fatalf("mtu %d: datagram not delivered", mtu)
 		}
-		if !sink.has(small, 2*time.Second) || !sink.has(big, 2*time.Second) {
-			t.Fatalf("mtu %d: datagrams not delivered", mtu)
-		}
-		if sink.has(mid, 200*time.Millisecond) {
-			t.Fatalf("mtu %d: oversize datagram delivered", mtu)
+		for _, b := range dropped {
+			if sink.has(b, 200*time.Millisecond) {
+				t.Fatalf("mtu %d: oversize datagram delivered", mtu)
+			}
 		}
 		tb.close()
 	}

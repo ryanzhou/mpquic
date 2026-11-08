@@ -59,7 +59,6 @@ type Path struct {
 	// guarded by sess.mu
 	state        pathState
 	suspectSince time.Time
-	upSince      time.Time
 	srtt, rttvar time.Duration
 	minRTT       time.Duration
 	latestRTT    time.Duration

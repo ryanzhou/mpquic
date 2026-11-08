@@ -14,15 +14,17 @@ import (
 	"mpquic/internal/mp"
 )
 
-// UDP relaying (SOCKS5 UDP ASSOCIATE).
+// UDP relaying (SOCKS5 UDP ASSOCIATE, the UDP tunnel, WireGuard peers).
 //
 // Every association gets a session-unique id. Datagrams travel as
 //
 //	assocID:varint  SOCKS5-address  payload
 //
-// using QUIC DATAGRAM frames on the lowest-latency path (unreliable, like UDP).
-// On the remote side each association owns one UDP socket, so replies from any
-// peer are relayed back (full-cone).
+// using QUIC DATAGRAM frames on the lowest-latency path (unreliable, like UDP;
+// datagrams that do not fit in a packet are dropped). In reliable mode (see
+// reliable.go) each association is a stream instead. On the remote side each
+// association owns one UDP socket, so replies from any peer are relayed back
+// (full-cone).
 
 const udpIdle = 2 * time.Minute
 
@@ -34,14 +36,24 @@ type UDPLocal struct {
 	Log    *slog.Logger
 	// ICMP receives the body of ICMP echo datagrams (see icmp.go).
 	ICMP func(b []byte)
+	// Reliable relays every association over a stream (see reliable.go)
+	// instead of QUIC DATAGRAMs. Set it before registering associations.
+	Reliable bool
 
 	mu     sync.Mutex
-	assocs map[uint64]func(msg []byte)
+	assocs map[uint64]*localAssoc
 	nextID atomic.Uint64
+	// reliable mode: datagrams dropped (congestion), streams refused
+	drops, refused rateLog
+}
+
+type localAssoc struct {
+	deliver func(msg []byte)
+	rel     *relAssoc // reliable mode
 }
 
 func NewUDPLocal(c Opener, log *slog.Logger) *UDPLocal {
-	return &UDPLocal{Client: c, Log: log, assocs: make(map[uint64]func([]byte))}
+	return &UDPLocal{Client: c, Log: log, assocs: make(map[uint64]*localAssoc)}
 }
 
 // Register allocates an association whose datagrams from the remote are
@@ -49,18 +61,28 @@ func NewUDPLocal(c Opener, log *slog.Logger) *UDPLocal {
 // runs on the receive path and must not keep msg.
 func (u *UDPLocal) Register(deliver func(msg []byte)) uint64 {
 	id := u.nextID.Add(1)
+	a := &localAssoc{deliver: deliver}
+	if u.Reliable {
+		a.rel = newRelAssoc(u, id, deliver)
+	}
 	u.mu.Lock()
-	u.assocs[id] = deliver
+	u.assocs[id] = a
 	u.mu.Unlock()
 	return id
 }
 
 // Unregister removes an association. If notify is set, the remote is told to
-// release its socket now instead of when it idles out.
+// release its socket now instead of when it idles out (a reliable
+// association's stream is always closed).
 func (u *UDPLocal) Unregister(id uint64, notify bool) {
 	u.mu.Lock()
+	a := u.assocs[id]
 	delete(u.assocs, id)
 	u.mu.Unlock()
+	if a != nil && a.rel != nil {
+		a.rel.close()
+		return
+	}
 	if notify {
 		if sess := u.Client.Session(); sess != nil {
 			// An association id alone closes it; older remotes ignore it.
@@ -70,7 +92,17 @@ func (u *UDPLocal) Unregister(id uint64, notify bool) {
 }
 
 // Send relays payload to target (a SOCKS5-format address) on association id.
+// It does not keep target or payload, and does not block.
 func (u *UDPLocal) Send(id uint64, target, payload []byte) error {
+	if u.Reliable {
+		u.mu.Lock()
+		a := u.assocs[id]
+		u.mu.Unlock()
+		if a == nil {
+			return net.ErrClosed
+		}
+		return a.rel.send(target, payload)
+	}
 	sess := u.Client.Session()
 	if sess == nil {
 		return mp.ErrNoSession
@@ -97,10 +129,10 @@ func (u *UDPLocal) HandleDatagram(_ *mp.Session, b []byte) {
 		return
 	}
 	u.mu.Lock()
-	deliver := u.assocs[id]
+	a := u.assocs[id]
 	u.mu.Unlock()
-	if deliver != nil {
-		deliver(rest)
+	if a != nil && a.rel == nil {
+		a.deliver(rest)
 	}
 }
 
@@ -137,7 +169,6 @@ func (u *UDPLocal) associate(c net.Conn) {
 		io.Copy(io.Discard, c)
 		pc.Close()
 	}()
-	hdr := quicvarint.Append(nil, id)
 	buf := make([]byte, 65536)
 	for {
 		n, from, err := pc.ReadFromUDP(buf)
@@ -154,14 +185,7 @@ func (u *UDPLocal) associate(c net.Conn) {
 		if ca := client.Load(); ca == nil || !ca.IP.Equal(from.IP) || ca.Port != from.Port {
 			client.Store(from)
 		}
-		msg := make([]byte, 0, len(hdr)+n-3)
-		msg = append(msg, hdr...)
-		msg = append(msg, buf[3:n]...)
-		sess := u.Client.Session()
-		if sess == nil {
-			continue
-		}
-		if err := sess.SendDatagram(msg, len(hdr)+al); err != nil {
+		if err := u.Send(id, buf[3:3+al], buf[3+al:n]); err != nil {
 			u.Log.Debug("udp send", "err", err)
 		}
 	}

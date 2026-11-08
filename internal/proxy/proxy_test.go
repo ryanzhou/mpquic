@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"mpquic/internal/linkem"
 	"mpquic/internal/mp"
 )
 
@@ -20,22 +21,32 @@ func tlog() *slog.Logger {
 
 type env struct {
 	socks, tunnel string
+	udpTunnel     *net.UDPAddr // UDP tunnel to udpEcho
 	tcpEcho       string
 	udpEcho       *net.UDPAddr
 	remoteUDP     *UDPRemote
 }
 
+var defaultRO = RemoteOptions{DialTimeout: 5 * time.Second, UDP: true}
+
 func setup(t *testing.T, reverse bool) *env {
 	t.Helper()
-	return setupOpts(t, reverse, 0, RemoteOptions{DialTimeout: 5 * time.Second})
+	return setupOpts(t, reverse, 0, false, defaultRO)
 }
 
-func setupMTU(t *testing.T, reverse bool, mtu int) *env {
+func setupMTU(t *testing.T, reverse bool, mtu int, reliable bool) *env {
 	t.Helper()
-	return setupOpts(t, reverse, mtu, RemoteOptions{DialTimeout: 5 * time.Second})
+	return setupOpts(t, reverse, mtu, reliable, defaultRO)
 }
 
-func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
+func setupOpts(t *testing.T, reverse bool, mtu int, reliable bool, ro RemoteOptions) *env {
+	t.Helper()
+	return setupLink(t, reverse, mtu, reliable, ro, "")
+}
+
+// setupLink runs both paths through emulated links with the given spec (none
+// if empty).
+func setupLink(t *testing.T, reverse bool, mtu int, reliable bool, ro RemoteOptions, link string) *env {
 	t.Helper()
 	log := tlog()
 	// TCP echo target
@@ -63,7 +74,23 @@ func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
 	}()
 	pc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	paths := []string{pc.LocalAddr().String(), pc.LocalAddr().String()}
+	if link != "" {
+		sp, err := linkem.ParseSpec(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range paths {
+			r, err := linkem.NewRelay("127.0.0.1:0", pc.LocalAddr().String(), sp, sp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			go r.Serve()
+			t.Cleanup(func() { r.Close() })
+			paths[i] = r.Addr().String()
+		}
+	}
 	udp := NewUDPLocal(nil, log)
+	udp.Reliable = reliable
 	remoteUDP := NewUDPRemote(log)
 	ropt := &mp.Options{Password: "x", Logger: log, DatagramHandler: remoteUDP.HandleDatagram,
 		StreamHandler: RemoteHandler(log, ro), MTU: mtu}
@@ -101,7 +128,10 @@ func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
 	go (&Local{Client: opener, Log: log, UDP: udp}).Serve(sl)
 	tn, _ := net.Listen("tcp", "127.0.0.1:0")
 	go (&Local{Client: opener, Log: log, Tunnel: tl.Addr().String()}).Serve(tn)
+	ut, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	go udp.ServeTunnel(ut, ue.LocalAddr().String())
 	t.Cleanup(func() {
+		ut.Close()
 		stop()
 		tl.Close()
 		ue.Close()
@@ -112,7 +142,7 @@ func setupOpts(t *testing.T, reverse bool, mtu int, ro RemoteOptions) *env {
 	for (opener.Session() == nil || opener.Session().ActivePaths() < 2) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	return &env{socks: sl.Addr().String(), tunnel: tn.Addr().String(), tcpEcho: tl.Addr().String(), udpEcho: ue.LocalAddr().(*net.UDPAddr), remoteUDP: remoteUDP}
+	return &env{socks: sl.Addr().String(), tunnel: tn.Addr().String(), udpTunnel: ut.LocalAddr().(*net.UDPAddr), tcpEcho: tl.Addr().String(), udpEcho: ue.LocalAddr().(*net.UDPAddr), remoteUDP: remoteUDP}
 }
 
 func socksRequest(t *testing.T, addr string, cmd byte, target string) (net.Conn, []byte) {
@@ -157,7 +187,7 @@ func testSocksConnect(t *testing.T, reverse bool) {
 // With race_connect, the remote's outbound connections work the same.
 func TestSocksConnectRace(t *testing.T) {
 	both(t, func(t *testing.T, reverse bool) {
-		e := setupOpts(t, reverse, 0, RemoteOptions{DialTimeout: 5 * time.Second, RaceConnect: true})
+		e := setupOpts(t, reverse, 0, false, RemoteOptions{DialTimeout: 5 * time.Second, UDP: true, RaceConnect: true})
 		_, port, _ := net.SplitHostPort(e.tcpEcho)
 		for _, target := range []string{e.tcpEcho, net.JoinHostPort("localhost", port)} {
 			c, _ := socksRequest(t, e.socks, 1, target)
@@ -208,7 +238,7 @@ func TestSocksUDP(t *testing.T) { both(t, testSocksUDP) }
 
 func testSocksUDP(t *testing.T, reverse bool) {
 	e := setup(t, reverse)
-	for _, size := range []int{10, 1000, 4000} { // 4000 exceeds a QUIC datagram: control-stream fallback
+	for _, size := range []int{10, 1000} {
 		if !udpEcho(t, e, size, 5, time.Second) {
 			t.Fatalf("no UDP echo for size %d", size)
 		}
@@ -235,23 +265,133 @@ func TestSocksUDPRelease(t *testing.T) {
 
 // With a 1280-byte path MTU, a QUIC DATAGRAM carries 1280-28-37 = 1215
 // bytes: the type byte, the association id (1 byte) and the IPv4 address (7)
-// leave 1206 for the UDP payload. Bigger payloads up to 1472 bytes are dropped
-// as a network with that MTU would; even bigger ones are sent reliably.
+// leave 1206 for the UDP payload. Bigger payloads are dropped, as a network
+// with that MTU would drop them; reliable UDP has no size limit.
 func TestSocksUDPOversize(t *testing.T) { both(t, testSocksUDPOversize) }
 
 func testSocksUDPOversize(t *testing.T, reverse bool) {
-	e := setupMTU(t, reverse, 1280)
-	for _, c := range []struct {
-		size int
-		ok   bool
-	}{{1206, true}, {1207, false}, {1472, false}, {4000, true}} {
-		tries, wait := 5, time.Second
-		if !c.ok {
-			tries, wait = 2, 300*time.Millisecond
+	for _, reliable := range []bool{false, true} {
+		e := setupMTU(t, reverse, 1280, reliable)
+		for _, c := range []struct {
+			size int
+			ok   bool
+		}{{1206, true}, {1207, reliable}, {4000, reliable}, {65000, reliable}} {
+			tries, wait := 5, time.Second
+			if !c.ok {
+				tries, wait = 2, 300*time.Millisecond
+			}
+			if got := udpEcho(t, e, c.size, tries, wait); got != c.ok {
+				t.Errorf("reliable %v: payload %d: echoed %v, want %v", reliable, c.size, got, c.ok)
+			}
 		}
-		if got := udpEcho(t, e, c.size, tries, wait); got != c.ok {
-			t.Errorf("payload %d: echoed %v, want %v", c.size, got, c.ok)
+	}
+}
+
+// Reliable UDP through SOCKS5 and the UDP tunnel: no datagram is lost on
+// lossy paths, and order is kept.
+func TestReliableUDP(t *testing.T) { both(t, testReliableUDP) }
+
+func testReliableUDP(t *testing.T, reverse bool) {
+	e := setupLink(t, reverse, 0, true, defaultRO, "delay=5ms,loss=5%")
+	if !udpEcho(t, e, 3000, 5, 2*time.Second) {
+		t.Fatal("no SOCKS UDP echo")
+	}
+	uc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer uc.Close()
+	const n = 500
+	go func() {
+		for i := range n {
+			b := make([]byte, 1000+i)
+			binary.BigEndian.PutUint32(b, uint32(i))
+			uc.WriteToUDP(b, e.udpTunnel)
+			if i%5 == 4 {
+				// ~3 MB/s: a burst far beyond the paths' rate would
+				// (rightly) be dropped at the tunnel entrance
+				time.Sleep(2 * time.Millisecond)
+			}
 		}
+	}()
+	b := make([]byte, 65536)
+	for i := range n {
+		uc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		k, from, err := uc.ReadFromUDP(b)
+		if err != nil {
+			t.Fatalf("datagram %d: %v", i, err)
+		}
+		if from.Port != e.udpTunnel.Port || k != 1000+i || binary.BigEndian.Uint32(b) != uint32(i) {
+			t.Fatalf("datagram %d: got %d bytes #%d from %v", i, k, binary.BigEndian.Uint32(b), from)
+		}
+	}
+}
+
+// A UDP sender faster than the paths gets datagrams dropped at the tunnel
+// entrance instead of seconds of queueing; what arrives is in order.
+func TestReliableUDPBacklog(t *testing.T) {
+	e := setupLink(t, false, 0, true, defaultRO, "delay=5ms,rate=8mbit")
+	uc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer uc.Close()
+	uc.SetReadBuffer(8 << 20)
+	const n, size = 4000, 1200 // 4.8 MB: 2.4 s at the paths' 2 MB/s
+	var sentAll time.Time
+	go func() {
+		b := make([]byte, size)
+		for i := range n {
+			binary.BigEndian.PutUint32(b, uint32(i))
+			uc.WriteToUDP(b, e.udpTunnel)
+			if i%20 == 19 {
+				time.Sleep(time.Millisecond) // ~20 MB/s
+			}
+		}
+		sentAll = time.Now()
+	}()
+	b := make([]byte, 65536)
+	got, last := 0, -1
+	for {
+		uc.SetReadDeadline(time.Now().Add(time.Second))
+		k, _, err := uc.ReadFromUDP(b)
+		if err != nil {
+			break
+		}
+		i := int(binary.BigEndian.Uint32(b))
+		if k != size || i <= last {
+			t.Fatalf("datagram #%d (%d bytes) after #%d", i, k, last)
+		}
+		got, last = got+1, i
+	}
+	lag := time.Since(sentAll) - time.Second // minus the read timeout
+	if got == n || got < n/10 {
+		t.Fatalf("%d of %d datagrams arrived", got, n)
+	}
+	if lag > time.Second {
+		t.Fatalf("last datagram arrived %v after the sender finished", lag)
+	}
+	t.Logf("%d of %d datagrams arrived, the last %v after the sender finished", got, n, lag.Round(time.Millisecond))
+}
+
+// The UDP tunnel in datagram mode.
+func TestUDPTunnel(t *testing.T) { both(t, testUDPTunnel) }
+
+func testUDPTunnel(t *testing.T, reverse bool) {
+	e := setup(t, reverse)
+	uc, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer uc.Close()
+	b := make([]byte, 65536)
+	for try := 0; try < 5; try++ {
+		uc.WriteToUDP([]byte("ping"), e.udpTunnel)
+		uc.SetReadDeadline(time.Now().Add(time.Second))
+		k, _, err := uc.ReadFromUDP(b)
+		if err == nil && string(b[:k]) == "ping" {
+			return
+		}
+	}
+	t.Fatal("no echo through the UDP tunnel")
+}
+
+// A remote without UDP relaying refuses reliable UDP streams.
+func TestReliableUDPRefused(t *testing.T) {
+	e := setupOpts(t, false, 0, true, RemoteOptions{DialTimeout: 5 * time.Second})
+	if udpEcho(t, e, 10, 2, 300*time.Millisecond) {
+		t.Fatal("UDP relayed by a remote with UDP off")
 	}
 }
 

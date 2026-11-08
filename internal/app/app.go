@@ -121,6 +121,14 @@ func Validate(role string, cfg *config.Config) error {
 	if r != "local" && cfg.WireGuard != nil {
 		return errors.New("the WireGuard listener (--wg-*) is only available in local mode")
 	}
+	if cfg.ReliableUDP {
+		if r != "local" && r != "tunnel" {
+			return errors.New("--reliable-udp applies to local and tunnel modes (the remote accepts both kinds of UDP relaying)")
+		}
+		if !cfg.UDPEnabled() {
+			return errors.New("--reliable-udp needs UDP relaying (-u)")
+		}
+	}
 	if r != "local" && cfg.NoSOCKS {
 		return errors.New("--no-socks applies to local mode only")
 	}
@@ -221,11 +229,12 @@ func LocalListenAddr(cfg *config.Config) string {
 func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Logger) error {
 	opt := options(cfg, log)
 	var udp *proxy.UDPLocal
-	if cfg.UDPEnabled() && mode != "tunnel" {
+	if cfg.UDPEnabled() {
 		udp = proxy.NewUDPLocal(nil, log)
+		udp.Reliable = cfg.ReliableUDP
 		opt.DatagramHandler = udp.HandleDatagram
 	}
-	errc := make(chan error, 1+len(cfg.Server))
+	errc := make(chan error, 2+len(cfg.Server)) // listeners + QUIC binds
 	var opener proxy.Opener
 	var shutdown func()
 	var pathDesc string
@@ -258,6 +267,15 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 		udp.Client = opener
 	}
 	var ln net.Listener
+	var tunUDP *net.UDPConn
+	closeListeners := func() {
+		if ln != nil {
+			ln.Close()
+		}
+		if tunUDP != nil {
+			tunUDP.Close()
+		}
+	}
 	what := "off"
 	if !cfg.NoSOCKS {
 		var err error
@@ -266,11 +284,31 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 			shutdown()
 			return err
 		}
-		l := &proxy.Local{Client: opener, Log: log, UDP: udp}
+		l := &proxy.Local{Client: opener, Log: log}
 		what = "socks5 on " + ln.Addr().String()
 		if mode == "tunnel" {
 			l.Tunnel = cfg.TunnelAddress
 			what = "tunnel " + ln.Addr().String() + " to " + l.Tunnel
+			if udp != nil {
+				// UDP tunnel on the same address and port
+				ua, err := net.ResolveUDPAddr("udp", ln.Addr().String())
+				if err == nil {
+					tunUDP, err = net.ListenUDP("udp", ua)
+				}
+				if err != nil {
+					closeListeners()
+					shutdown()
+					return fmt.Errorf("udp tunnel listener: %w", err)
+				}
+				what = "tunnel tcp+udp " + ln.Addr().String() + " to " + l.Tunnel
+				go func() {
+					if err := udp.ServeTunnel(tunUDP, cfg.TunnelAddress); err != nil && !errors.Is(err, net.ErrClosed) {
+						errc <- fmt.Errorf("udp tunnel listener: %w", err)
+					}
+				}()
+			}
+		} else {
+			l.UDP = udp
 		}
 		go func() {
 			if err := l.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -285,9 +323,7 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 		var err error
 		wgs, err = wg.Start(o)
 		if err != nil {
-			if ln != nil {
-				ln.Close()
-			}
+			closeListeners()
 			shutdown()
 			return err
 		}
@@ -296,15 +332,13 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 			log.Warn("UDP relaying is off: WireGuard peers get no UDP (including DNS) and no ping; enable it with -u (on both ends)")
 		}
 	}
-	log.Info("mpquic local started", "version", Version, "listen", what, "wireguard", wgs != nil, "udp", udp != nil, "paths", pathDesc)
+	log.Info("mpquic local started", "version", Version, "listen", what, "wireguard", wgs != nil, "udp", udp != nil, "reliable_udp", udp != nil && udp.Reliable, "paths", pathDesc)
 	var err error
 	select {
 	case <-ctx.Done():
 	case err = <-errc:
 	}
-	if ln != nil {
-		ln.Close()
-	}
+	closeListeners()
 	if wgs != nil {
 		wgs.Close()
 	}
@@ -327,7 +361,7 @@ func runRemote(ctx context.Context, cfg *config.Config, log *slog.Logger) error 
 	if cfg.UDPEnabled() {
 		opt.DatagramHandler = proxy.NewUDPRemote(log).HandleDatagram
 	}
-	opt.StreamHandler = proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 10 * time.Second, RaceConnect: cfg.RaceConnect})
+	opt.StreamHandler = proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 10 * time.Second, RaceConnect: cfg.RaceConnect, UDP: cfg.UDPEnabled()})
 	if cfg.Reverse {
 		// Reverse mode: dial the local instance over every configured path.
 		servers := cfg.ServerAddrs()

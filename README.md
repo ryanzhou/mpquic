@@ -161,7 +161,8 @@ Notes:
   internet (for example for `traceroute`) are not.
 * As with SOCKS5 UDP, a datagram that the paths cannot carry is dropped (see
   "Packet sizes" in docs/DESIGN.md); the local then sends the client an ICMP
-  "fragmentation needed"/"packet too big" with the tunnel's limit.
+  "fragmentation needed"/"packet too big" with the tunnel's limit. With
+  `--reliable-udp`, UDP goes over streams and has no size limit.
 * TCP handshakes complete in the local right away (as SOCKS5 replies
   immediately): a connection the remote cannot make is reset after
   connecting instead of being refused.
@@ -251,10 +252,18 @@ The Windows resources (manifest, icon, version info) live in
 | mode | shadowsocks equivalent | purpose |
 |---|---|---|
 | `mpquic local` | `ss-local` / `sslocal` | SOCKS5 server (CONNECT + UDP ASSOCIATE with `-u`), optionally a WireGuard server too |
-| `mpquic tunnel -L host:port` | `ss-tunnel` | fixed-target TCP port forward |
+| `mpquic tunnel -L host:port` | `ss-tunnel` | fixed-target port forward: TCP, plus UDP on the same port with `-u` |
 | `mpquic remote` | `ss-server` / `ssserver` | accepts paths, dials targets |
 | `mpquic local --reverse` / `remote --reverse` | – | same, but the local accepts the paths and the remote dials them |
 | `mpquic relay` | `socat UDP-LISTEN,fork UDP:…` | UDP forwarder, optional link emulation |
+
+For example, a DNS forwarder (TCP and UDP on 127.0.0.1:5353), with UDP
+carried reliably over streams:
+
+```sh
+mpquic remote -k secret -u
+mpquic tunnel -s remote.example.com -k secret -u --reliable-udp -l 5353 -L 1.1.1.1:53
+```
 
 Shadowsocks-compatible flags:
 
@@ -267,7 +276,7 @@ Shadowsocks-compatible flags:
 | `-k PASSWORD` | shared password |
 | `-m METHOD` | accepted and ignored: QUIC (TLS 1.3) always encrypts |
 | `-t SECONDS` | idle timeout of proxied connections (300) |
-| `-u` / `-U` | enable UDP relay; `mode: tcp_and_udp` in the config. Set it on both ends |
+| `-u` / `-U` | enable UDP relay (SOCKS5 UDP ASSOCIATE; the UDP tunnel in tunnel mode); `mode: tcp_and_udp` in the config. Set it on both ends |
 | `-L HOST:PORT` | tunnel target (tunnel mode) |
 | `-v` | verbose logging |
 
@@ -286,6 +295,7 @@ MPQUIC-specific flags (and config keys):
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
 | `--no-coupling` | `no_coupling` | false | don't couple paths that share a bottleneck (e.g. the sender's uplink); see docs/DESIGN.md, "Shared bottlenecks" |
 | `--race-connect` | `race_connect` | false | remote only (incl. reverse), aggressive: open each outbound TCP connection by racing up to 5 attempts started at 0, 100, 300, 600 and 1000 ms (each from a new source port, rotating over the target's IPs, IPv6/IPv4 interleaved); the first to connect wins and the rest are aborted. For networks or NATs that drop connection setup, where a lost SYN otherwise stalls the connection for 1 s, 3 s or more. An attempt that fails outright starts the next at once |
+| `--reliable-udp` | `reliable_udp` | false | local/tunnel only, needs `-u`: relay all UDP over streams (retransmitted, congestion-controlled, any size; in order, so a loss delays later datagrams of the same association) instead of QUIC datagrams, which drop payloads the path MTU cannot carry. Datagrams sent faster than the tunnel carries them are dropped once ~200 ms are queued. The remote needs this version with `-u`. See docs/DESIGN.md, "Reliable UDP" |
 | `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see docs/DESIGN.md, "Packet sizes") |
 | `--cert/--key` | `cert`/`key` | self-signed | server TLS certificate (optional, see security notes) |
 | `--sni` | `sni` | `mpquic` | client TLS SNI |
@@ -367,7 +377,10 @@ remote together: a version-1 peer is rejected.
 
 Within version 2, newer releases add optional datagram messages that older
 peers ignore: releasing a UDP association early, and ICMP echo for the
-WireGuard listener (which needs a remote that knows it).
+WireGuard listener (which needs a remote that knows it). Reliable UDP needs a
+remote that knows it; an older one refuses the streams (the local warns).
+Oversized UDP datagrams are no longer sent reliably on the control stream:
+they are dropped, unless reliable UDP is on.
 
 ## Security notes
 

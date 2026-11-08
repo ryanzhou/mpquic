@@ -170,7 +170,6 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	s.nextPID++
 	p.id = s.nextPID
 	p.state = stateActive
-	p.upSince = time.Now()
 	s.paths = append(s.paths, p)
 	s.wakeAllLocked()
 	s.log.Info("path up", "path", p.name, "count", s.activeCountLocked())
@@ -424,8 +423,6 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 			s.closedIDs[v[0]] = time.Now()
 		}
 		s.mu.Unlock()
-	case frDgram:
-		s.deliverDatagram(body)
 	case frPathAck:
 		r := &byteReader{b: body}
 		idx, err := r.varint()
@@ -606,20 +603,12 @@ func (s *Session) tick(now time.Time) bool {
 }
 
 // UDP relaying over QUIC DATAGRAMs. A datagram goes out unreliably on the best
-// path that can carry it in one QUIC packet. One that no path can carry:
-//
-//   - with a payload of at most oversizeDropMax bytes, i.e. one that a
-//     1500-byte network would carry, is dropped once the paths' MTU is known,
-//     exactly as an IP network with that MTU would drop it. Senders that
-//     discover the path MTU themselves (QUIC, i.e. HTTP/3, inside the tunnel)
-//     then settle at a size that fits. Sending these reliably instead let the
-//     inner protocol's MTU probes succeed, so all its full-size packets went
-//     over a reliable stream: retransmissions inside retransmissions and
-//     head-of-line blocking.
-//   - larger ones (e.g. big DNS responses, which an IP network would
-//     fragment), and any datagram while path MTU discovery may still raise
-//     the limit, are sent reliably on the best path's control stream.
-const oversizeDropMax = 1472 // UDP payload of a 1500-byte IPv4 packet
+// path that can carry it in one QUIC packet. One that no path can carry is
+// dropped, exactly as an IP network with that MTU would drop it: senders that
+// discover the path MTU themselves (e.g. QUIC inside the tunnel) settle at a
+// size that fits. While a path's MTU discovery runs (from 1200-byte packets),
+// the limit may still grow. Relaying UDP over streams instead (the proxy's
+// reliable UDP mode) has no size limit.
 
 // DatagramTooLargeError is returned by SendDatagram for a dropped datagram.
 type DatagramTooLargeError struct {
@@ -631,35 +620,19 @@ func (e *DatagramTooLargeError) Error() string {
 	return fmt.Sprintf("UDP datagram with %d-byte payload exceeds the tunnel's limit of %d bytes", e.Size, e.Max)
 }
 
-// dgramProbe is larger than any QUIC DATAGRAM: SendDatagram rejects it
-// without sending anything and reports the current limit.
-var dgramProbe = make([]byte, 4096)
-
-// pmtuSettle is how long after a path comes up its MTU is taken as final,
-// unless the MTU is fixed or already at the maximum: quic-go's discovery
-// converged within ~8 s in tests (it backs off after lost probes),
-// at 10-150 ms RTT, ending up to 20 bytes below the real limit.
-var pmtuSettle = 10 * time.Second
-
 // SendDatagram sends b as an unreliable datagram (see above). The last
 // len(b)-hdrLen bytes of b are the relayed UDP payload.
 func (s *Session) SendDatagram(b []byte, hdrLen int) error {
-	now := time.Now()
 	s.mu.Lock()
 	paths := s.bestPathsLocked(len(s.paths))
-	settled := make([]bool, len(paths))
-	for i, p := range paths {
-		settled[i] = s.opt.MTU > 0 || now.Sub(p.upSince) >= max(pmtuSettle, 40*p.srttOrDefault())
-	}
 	s.mu.Unlock()
 	if len(paths) == 0 {
 		return errors.New("no path available")
 	}
 	msg := append([]byte{dgUDP}, b...)
-	allSettled := true
 	limit := -1 // largest payload some path carries
 	var lastErr error
-	for i, p := range paths {
+	for _, p := range paths {
 		err := p.conn.SendDatagram(msg)
 		if err == nil {
 			return nil
@@ -669,37 +642,14 @@ func (s *Session) SendDatagram(b []byte, hdrLen int) error {
 			lastErr = err // e.g. the path is closing
 			continue
 		}
-		m := int(tl.MaxDatagramPayloadSize)
-		limit = max(limit, m-1-hdrLen)
-		if !settled[i] && m < maxPacketSize-37 { // 37: quic-go's DATAGRAM overhead estimate
-			allSettled = false
-		}
+		limit = max(limit, int(tl.MaxDatagramPayloadSize)-1-hdrLen)
 	}
-	if limit < 0 && lastErr != nil {
+	if limit < 0 {
 		return lastErr
 	}
-	if size := len(b) - hdrLen; size <= oversizeDropMax && allSettled {
-		s.noteOversize(size, max(limit, 0), now)
-		return &DatagramTooLargeError{Size: size, Max: max(limit, 0)}
-	}
-	paths[0].sendCtrl(appendFrame(nil, frDgram, b))
-	return nil
-}
-
-// DatagramLimit returns the largest UDP payload (behind hdrLen header bytes)
-// that SendDatagram currently sends unreliably on some path, 0 if no path is up.
-func (s *Session) DatagramLimit(hdrLen int) int {
-	s.mu.Lock()
-	paths := s.bestPathsLocked(len(s.paths))
-	s.mu.Unlock()
-	limit := 0
-	for _, p := range paths {
-		var tl *quic.DatagramTooLargeError
-		if err := p.conn.SendDatagram(dgramProbe); errors.As(err, &tl) {
-			limit = max(limit, int(tl.MaxDatagramPayloadSize)-1-hdrLen)
-		}
-	}
-	return limit
+	size := len(b) - hdrLen
+	s.noteOversize(size, max(limit, 0), time.Now())
+	return &DatagramTooLargeError{Size: size, Max: max(limit, 0)}
 }
 
 // noteOversize counts a dropped datagram and says so at most every 30 s.
@@ -714,7 +664,7 @@ func (s *Session) noteOversize(size, limit int, now time.Time) {
 	s.mu.Unlock()
 	if warn {
 		s.log.Warn("UDP datagram too large for the tunnel, dropped (as a network with a smaller MTU would); "+
-			"lower the UDP client's MTU", "payload", size, "max_payload", limit, "dropped_total", n)
+			"lower the UDP client's MTU, or relay UDP over streams (--reliable-udp)", "payload", size, "max_payload", limit, "dropped_total", n)
 	}
 }
 

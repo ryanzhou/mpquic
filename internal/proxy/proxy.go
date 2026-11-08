@@ -105,10 +105,13 @@ type RemoteOptions struct {
 	// RaceConnect races up to 5 staggered connection attempts per target
 	// (see raceDialer) and keeps the first that connects.
 	RaceConnect bool
+	// UDP accepts reliable UDP associations (UDP relayed over streams).
+	UDP bool
 }
 
 // RemoteHandler returns a stream handler for the server side: it reads the
-// target address, dials it and relays data.
+// target address, dials it and relays data. Streams carrying a reliable UDP
+// association instead start with streamUDP (see reliable.go).
 func RemoteHandler(log *slog.Logger, opt RemoteOptions) func(*mp.Stream) {
 	if opt.DialTimeout <= 0 {
 		opt.DialTimeout = 10 * time.Second
@@ -118,8 +121,24 @@ func RemoteHandler(log *slog.Logger, opt RemoteOptions) func(*mp.Stream) {
 	if opt.RaceConnect {
 		race = newRaceDialer()
 	}
+	var udpDrops rateLog
 	return func(st *mp.Stream) {
-		target, _, err := ReadAddr(st)
+		var t [1]byte
+		_, err := io.ReadFull(st, t[:])
+		if err == nil && t[0] == streamUDP {
+			if !opt.UDP {
+				log.Debug("reliable UDP stream refused: UDP relaying is off (-u)", "stream", st.ID())
+				st.Reset(mp.ResetGeneric)
+				st.Close()
+				return
+			}
+			serveUDPStream(log, st, &udpDrops)
+			return
+		}
+		var target string
+		if err == nil {
+			target, _, err = readAddrRest(st, t[0])
+		}
 		if err != nil {
 			st.Reset(mp.ResetGeneric)
 			st.Close()
