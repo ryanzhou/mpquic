@@ -196,6 +196,7 @@ func options(cfg *config.Config, log *slog.Logger) *mp.Options {
 		IdleTimeout:   time.Duration(cfg.Timeout) * time.Second,
 		StatsInterval: time.Duration(cfg.StatsInterval) * time.Second,
 		NoDup:         cfg.NoDup,
+		NoCoupling:    cfg.NoCoupling,
 		MTU:           cfg.MTU,
 		CertFile:      cfg.Cert,
 		KeyFile:       cfg.Key,

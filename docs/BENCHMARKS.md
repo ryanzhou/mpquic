@@ -114,6 +114,60 @@ upload (an earlier release reached about 100), with echo p50 42 ms. Before the
 control plane moved to datagrams, this setup produced frequent false
 "path suspect" events; now there are 2–5 per run.
 
+## Shared bottleneck (uplink slower than the relay paths)
+
+`scripts/shared-bench.sh` runs three 100 Mbit/s relay paths (RTT 20/40/60
+ms) behind one slower link shared by all of them (`mpbench --shared`: the
+uplink of the sending endpoint), with and without shared-bottleneck coupling
+(docs/DESIGN.md, "Shared bottlenecks"; `--no-coupling` for the old
+behaviour). Single 10 s runs (20 s where marked), download unless noted.
+**copies**: bytes sent again by the session (reinjections/rescues; there
+were no duplicates) as a share of the goodput. **drops**: packets dropped at
+the shared bottleneck (each also costs a QUIC retransmission). **echo**:
+p50/p90 of a 100-byte round trip during the transfer (idle: ~22 ms).
+**p10**: the 10th percentile of the goodput per 100 ms, i.e. how smooth the
+delivery is.
+
+| uplink (buffer) | | Mbit/s | copies | drops | echo p50/p90 | p10 Mbit/s |
+|---|---|---|---|---|---|---|
+| 150 Mbit/s (20 ms), 20 s | uncoupled | 129.5 | 2.6% | 5.4% | 43 / 46 ms | 12 |
+| | **coupled** | **142.6** | **0.4%** | **0.8%** | **30 / 36 ms** | **108** |
+| 150 Mbit/s (50 ms), 20 s | uncoupled | 135.7 | 1.2% | 0.6% | 49 / 68 ms | 24 |
+| | **coupled** | **141.2** | **0.2%** | **0.07%** | **30 / 37 ms** | **115** |
+| 150 Mbit/s (200 ms) | uncoupled | 144.4 | 0% | 0% | 50 / 63 ms | 29 |
+| | **coupled** | 141.8 | 0% | 0% | **33 / 53 ms** | **112** |
+| 150 Mbit/s (50 ms), upload | uncoupled | 144.0 | 0.6% | 0.7% | 51 / 64 ms | 31 |
+| | **coupled** | 140.4 | **0.1%** | **0.1%** | **30 / 44 ms** | **117** |
+| 150 Mbit/s (50 ms), 4 streams | uncoupled | 132.4 | 0.5% | 1.6% | 59 / 81 ms | 25 |
+| | **coupled** | **147.0** | **0.1%** | **0.1%** | **35 / 57 ms** | **60** |
+| 250 Mbit/s (50 ms) | uncoupled | 239.1 | 0% | 0% | 42 / 52 ms | 209 |
+| | **coupled** | 235.4 | 0.3% | 0% | **30 / 41 ms** | 186 |
+| 150 Mbit/s (100 ms), RTT 80/120/150 ms, 20 s | uncoupled | 138.9 | 3.6% | 1.9% | 146 / 181 ms (idle 82) | 1 |
+| | **coupled** | **142.0** | **0.3%** | **0.3%** | **98 / 129 ms** | **79** |
+| 150 ↔ 60 Mbit/s every 4 s (100 ms) | uncoupled | 96.2 | 0.1% | 0.8% | 64 / 102 ms | 2 |
+| | **coupled** | 89.5 | 0.1% | 0.4% | **33 / 53 ms** | **18** |
+| 100 Mbit/s (50 ms), 2 paths, the fastest with 1% loss | uncoupled | 95.8 | 0.2% | 0% | 40 / 47 ms | 58 |
+| | **coupled** | 94.5 | 0.1% | 0% | **28 / 34 ms** | **66** |
+
+Uncoupled, the three BBRs together estimated 170–190 Mbit/s for the
+150 Mbit/s uplink and kept its buffer full, the fastest path got the
+smallest share (BBRv1 favours long RTTs), and the stale-estimate reset fired
+over and over (up to 12 times in 10 s on one path) as the paths took
+capacity from each other. Coupled, the paths are capped at ~50 Mbit/s each
+and the uplink's queue stays at a few ms. The throughput is the same within
+a few percent, except where it was lost to drops; the rate-flapping uplink
+loses ~7%, as the group is more careful than three independent probes when
+the rate comes back.
+
+Controls without a shared bottleneck (paths of 10/20/30 ms × 50 Mbit/s; two
+identical 20 ms × 50 Mbit/s paths; 50 / 30 (2% loss) / 20 Mbit/s; a
+400 Mbit/s uplink that isn't the bottleneck; the six scenarios above) are
+unchanged within run-to-run noise. Only the identical paths were (sometimes)
+coupled, with no measurable effect. With a download and an upload at the
+same time through a 50 Mbit/s uplink at the local end, coupling keeps the
+upload's queue, which delays the download's ACKs, short: rescues 1.9% →
+0.1% of the download, p10 30 → 167 Mbit/s.
+
 ## Reading the results
 
 * **Latency of the shortest path is preserved.** In every scenario the
@@ -265,6 +319,8 @@ scripts/bench-summary.py bench-results     # markdown tables
 scripts/harm-bench.sh ./bin/mpbench        # good paths vs. good paths + one bad path
 scripts/harm-summary.py                    # flags metrics the bad path made worse
 scripts/lossy-bench.sh ./bin/mpbench       # four lossy paths (20/10/5/1%)
+scripts/shared-bench.sh ./bin/mpbench      # paths behind a shared uplink, coupled vs. uncoupled
+mpbench --path ... --path ... --shared 'none|rate=150mbit,queue=50ms'   # a shared bottleneck (fwd|rev)
 mpbench --path delay=20ms,rate=50mbit,loss=1% --path delay=60ms,rate=80mbit -v
 scripts/bench-wireguard.sh                 # SOCKS5 vs WireGuard entrypoint (Docker)
 ```

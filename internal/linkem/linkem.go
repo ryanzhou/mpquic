@@ -268,6 +268,13 @@ func (l *Link) SetDown(down bool) {
 	l.mu.Unlock()
 }
 
+// Counters returns the number of packets passed and dropped so far.
+func (l *Link) Counters() (passed, dropped uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.Passed, l.Dropped
+}
+
 // Close stops the delivery goroutine.
 func (l *Link) Close() {
 	l.mu.Lock()

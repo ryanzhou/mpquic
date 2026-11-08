@@ -120,6 +120,7 @@ mpquic options:
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths
+  --no-coupling     do not couple paths that share a bottleneck (e.g. an uplink)
   --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
                     size, no MTU discovery (default: start at 1200-byte
                     packets and discover each path's MTU)
@@ -165,6 +166,7 @@ type commonFlags struct {
 	window, chunk              string
 	stats, mtu                 int
 	verbose, noDup, race       bool
+	noCoupling                 bool
 	cert, key, sni, logLevel   string
 	plugin                     string
 	udp, udpOnly, reverse      bool
@@ -196,6 +198,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
 	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
+	fs.BoolVar(&f.noCoupling, "no-coupling", false, "disable shared-bottleneck coupling of paths")
 	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")
 	fs.StringVar(&f.cert, "cert", "", "TLS certificate")
 	fs.StringVar(&f.key, "key", "", "TLS key")
@@ -293,6 +296,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.noDup {
 		cfg.NoDup = true
+	}
+	if f.noCoupling {
+		cfg.NoCoupling = true
 	}
 	if f.race {
 		cfg.RaceConnect = true

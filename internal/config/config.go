@@ -48,7 +48,8 @@ type Config struct {
 	Key           string `json:"key,omitempty"`
 	SNI           string `json:"sni,omitempty"`
 	NoDup         bool   `json:"no_dup,omitempty"`
-	MTU           int    `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
+	NoCoupling    bool   `json:"no_coupling,omitempty"` // no shared-bottleneck coupling of paths
+	MTU           int    `json:"mtu,omitempty"`         // path MTU (IP packet size) of every path; 0 discovers it
 	// RaceConnect (remote role): race staggered TCP connection attempts to
 	// each target and keep the first that connects.
 	RaceConnect bool          `json:"race_connect,omitempty"`

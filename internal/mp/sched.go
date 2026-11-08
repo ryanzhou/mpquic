@@ -76,6 +76,12 @@ func (s *Session) nextChunk(p *Path) (*chunk, int64, int, []uint64, error) {
 			if traceSched {
 				s.trace(p, c, why, now)
 			}
+			switch why {
+			case "reinject":
+				p.reinjBytes += uint64(len(c.data))
+			case "dup":
+				p.dupBytes += uint64(len(c.data))
+			}
 			dgram := p.dgramMode() && len(c.data) <= p.dgramChunk
 			due := now.Add(time.Duration(p.deadlineBound(len(c.data), dgram, now) * float64(time.Second)))
 			c.sends = append(c.sends, sendRec{p: p, at: now, dgram: dgram, dueBy: due})

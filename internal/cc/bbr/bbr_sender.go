@@ -341,6 +341,14 @@ type bbrSender struct {
 	// (enter=false). mpquic uses it so that only one path of a session
 	// probes at a time.
 	ProbeRTTGate func(enter bool) bool
+	// RateCap, if set, returns an upper bound for the bandwidth estimate
+	// (0: none). mpquic sets it when several paths of a session share a
+	// bottleneck (e.g. an endpoint's uplink): each path's share of the
+	// aggregate capacity, so that the paths together pace at that capacity
+	// instead of each probing for the whole of it. Pacing, cwnd and STARTUP's
+	// full-bandwidth detection use the capped estimate; the max filter itself
+	// keeps the path's own samples.
+	RateCap func() Bandwidth
 	// holdsProbeGate: ProbeRTTGate(true) succeeded and has not been released
 	// yet. The gate must only be held while in PROBE_RTT.
 	holdsProbeGate bool
@@ -654,6 +662,11 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	}
 
 	// Handle logic specific to STARTUP and DRAIN modes.
+	if b.mode == bbrModeStartup && b.capped() {
+		// mpquic: the session caps this path at its share of a bottleneck
+		// shared with other paths; growing further would only queue.
+		b.isAtFullBandwidth = true
+	}
 	if isRoundStart && !b.isAtFullBandwidth {
 		b.checkIfFullBandwidthReached(&lastPacketSendState)
 	}
@@ -737,9 +750,48 @@ func (b *bbrSender) PacingRateBytes() uint64 { return uint64(b.PacingRate() / By
 // MinRTT returns BBR's min RTT estimate. Added for mpquic.
 func (b *bbrSender) MinRTT() time.Duration { return b.getMinRtt() }
 
+// RawBandwidthEstimate is the max-filtered estimate in bytes/s without the
+// RateCap. Added for mpquic.
+func (b *bbrSender) RawBandwidthEstimate() uint64 {
+	return uint64(b.maxBandwidth.GetBest() / BytesPerSecond)
+}
+
 // Get the current bandwidth estimate. Note that Bandwidth is in bits per second.
 func (b *bbrSender) bandwidthEstimate() Bandwidth {
-	return b.maxBandwidth.GetBest()
+	bw := b.maxBandwidth.GetBest()
+	if c := b.rateCap(); c > 0 && c < bw {
+		return c
+	}
+	return bw
+}
+
+func (b *bbrSender) rateCap() Bandwidth {
+	if b.RateCap == nil {
+		return 0
+	}
+	return b.RateCap()
+}
+
+// capped reports whether the RateCap currently limits the estimate.
+func (b *bbrSender) capped() bool {
+	c := b.rateCap()
+	return c > 0 && c < b.maxBandwidth.GetBest()
+}
+
+// Restart re-enters STARTUP from PROBE_BW (mpquic: a path's share of a
+// shared bottleneck grew, e.g. another path of the session went away, and
+// should be found within a few round trips rather than by 25% per gain
+// cycle).
+func (b *bbrSender) Restart() {
+	if b.mode != bbrModeProbeBw {
+		return
+	}
+	b.staleOldBw = 0
+	b.isAtFullBandwidth = false
+	b.roundsWithoutBandwidthGain = 0
+	b.bandwidthAtLastRound = b.bandwidthEstimate()
+	b.recoveryState = bbrRecoveryStateNotInRecovery
+	b.enterStartupMode(b.clock.Now())
 }
 
 func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
@@ -957,6 +1009,12 @@ const (
 
 func (b *bbrSender) maybeRegrowAfterStale(now monotime.Time) {
 	if b.staleOldBw == 0 || b.mode != bbrModeProbeBw {
+		return
+	}
+	if b.capped() {
+		// The path's share of a shared bottleneck is what limits it: the
+		// session sets that share, and STARTUP would only fill the queue
+		// that the other paths of the session see too.
 		return
 	}
 	if float64(b.bandwidthEstimate()) >= 0.8*float64(b.staleOldBw) {

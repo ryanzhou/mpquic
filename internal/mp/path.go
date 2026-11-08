@@ -115,6 +115,11 @@ type Path struct {
 
 	sentBytes atomic.Uint64
 	recvBytes atomic.Uint64
+	// chunk bytes scheduled as copies of data already sent (sess.mu held):
+	// reinjections/rescues and opportunistic duplicates
+	reinjBytes, dupBytes uint64
+	// shared-bottleneck detection and coupling (see shared.go)
+	sbs sbPathState
 
 	// owned by the send loop
 	sendStreams map[uint64]*quic.SendStream
@@ -860,6 +865,7 @@ func (p *Path) statLocked() PathStat {
 		Name: p.name, Index: int(p.index), State: state, SRTT: p.srtt, MinRTT: p.minRTT,
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
-		StaleResets: p.staleResets,
+		StaleResets: p.staleResets, ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
+		SharedCap: p.sbs.cap,
 	}
 }

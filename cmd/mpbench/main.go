@@ -3,6 +3,7 @@
 // and measures latency, throughput, completion times and failover.
 //
 //	mpbench --path delay=10ms,rate=50mbit --path delay=40ms,rate=50mbit,loss=1% --tests all
+//	mpbench --path delay=10ms,rate=100mbit --path delay=20ms,rate=100mbit --shared "none|rate=150mbit"
 package main
 
 import (
@@ -37,6 +38,7 @@ var (
 	single    = flag.Bool("single", true, "also run each path alone as baseline")
 	verbose   = flag.Bool("v", false, "verbose mpquic logs")
 	noDup     = flag.Bool("no-dup", false, "disable opportunistic duplication")
+	noCouple  = flag.Bool("no-coupling", false, "disable shared-bottleneck coupling")
 	window    = flag.Int64("window", 0, "stream window bytes")
 	chunk     = flag.Int("chunk", 0, "chunk size")
 	failAfter = flag.Duration("fail-after", 3*time.Second, "failover: take best path down after")
@@ -47,6 +49,7 @@ var (
 	subset    = flag.String("subset", "", "also run with only these path indexes (e.g. 0,1) as a baseline")
 	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
 	mtu       = flag.Int("mtu", 0, "fixed path MTU (0: discover)")
+	shared    = flag.String("shared", "", "link spec of a bottleneck shared by all paths ('fwd|rev' for asymmetric), e.g. the endpoints' uplinks: fwd = local->remote, rev = remote->local")
 )
 
 func main() {
@@ -69,7 +72,7 @@ func main() {
 	slog.SetDefault(log)
 
 	target := startTarget()
-	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk, Congestion: *ccName, MTU: *mtu}
+	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, NoCoupling: *noCouple, Window: *window, ChunkSize: *chunk, Congestion: *ccName, MTU: *mtu}
 	// The QUIC listener is the remote normally and the local in reverse mode;
 	// the relays always forward to the listener.
 	lopt, dopt := *opt, *opt
@@ -89,6 +92,19 @@ func main() {
 	go srv.Serve(udp)
 
 	var relays []*linkem.Relay
+	var sharedFwd, sharedRev *linkem.Link
+	if *shared != "" {
+		f, r, _ := strings.Cut(*shared, "|")
+		if r == "" {
+			r = f
+		}
+		fs, err := linkem.ParseSpec(f)
+		check(err)
+		rs, err := linkem.ParseSpec(r)
+		check(err)
+		sharedFwd, sharedRev = linkem.NewLink(fs, 7), linkem.NewLink(rs, 8)
+		fmt.Printf("shared bottleneck: fwd[%s] rev[%s]\n", fs, rs)
+	}
 	for _, p := range paths {
 		f, r, _ := strings.Cut(p, "|")
 		if r == "" {
@@ -101,6 +117,7 @@ func main() {
 		rl, err := linkem.NewRelay("127.0.0.1:0", udp.LocalAddr().String(), fs, rs)
 		check(err)
 		rl.Log = log
+		rl.SharedFwd, rl.SharedRev = sharedFwd, sharedRev
 		go rl.Serve()
 		relays = append(relays, rl)
 		fmt.Printf("path %d: fwd[%s] rev[%s]\n", len(relays)-1, fs, rs)
@@ -139,7 +156,7 @@ func main() {
 		check(err)
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		check(err)
-		b := &bench{relays: relays, idx: run.idx}
+		b := &bench{relays: relays, idx: run.idx, sharedFwd: sharedFwd, sharedRev: sharedRev}
 		var opener proxy.Opener = cl
 		b.local = cl.Session
 		b.remote = func() []mp.PathStat {
@@ -169,6 +186,11 @@ func main() {
 				b.bulk('S', *duration, *streams)
 			case "upload":
 				b.bulk('R', *duration, *streams)
+			case "bidir":
+				// a download while an upload runs through the same session
+				stop := b.background('R')
+				b.bulk('S', *duration, *streams)
+				stop()
 			case "fct":
 				b.fct()
 			case "rstats":
@@ -306,6 +328,28 @@ type bench struct {
 	idx    []int
 	local  func() *mp.Session   // the local (SOCKS/tunnel) side's session
 	remote func() []mp.PathStat // the remote side's path stats
+
+	sharedFwd, sharedRev *linkem.Link // shared bottleneck, if any
+}
+
+type wireStat struct{ sent, lost, reinj, dup uint64 }
+
+func sumWire(st []mp.PathStat) wireStat {
+	var w wireStat
+	for _, s := range st {
+		w.sent += s.SentBytes
+		w.lost += s.LostBytes
+		w.reinj += s.ReinjectBytes
+		w.dup += s.DupBytes
+	}
+	return w
+}
+
+func (w wireStat) sub(o wireStat) wireStat {
+	if w.sent < o.sent || w.lost < o.lost { // a path went away meanwhile
+		return w
+	}
+	return wireStat{w.sent - o.sent, w.lost - o.lost, w.reinj - o.reinj, w.dup - o.dup}
 }
 
 func (b *bench) localStats() []mp.PathStat {
@@ -318,7 +362,7 @@ func (b *bench) localStats() []mp.PathStat {
 func (b *bench) remoteStats() string {
 	var p []string
 	for _, s := range b.remote() {
-		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s sent=%dMB lost=%dMB", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode, s.SentBytes>>20, s.LostBytes>>20))
+		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s sent=%dMB lost=%dMB resets=%d", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode, s.SentBytes>>20, s.LostBytes>>20, s.StaleResets))
 	}
 	return strings.Join(p, "; ")
 }
@@ -455,6 +499,16 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		counter = &sinkBytes
 	}
 	base := counter.Load()
+	sender := b.remote
+	shl := b.sharedRev
+	if cmd == 'R' {
+		sender, shl = b.localStats, b.sharedFwd
+	}
+	wire0 := sumWire(sender())
+	var shPass0, shDrop0 uint64
+	if shl != nil {
+		shPass0, shDrop0 = shl.Counters()
+	}
 	start := time.Now()
 	var samples []float64
 	var fine []float64 // 100 ms buckets after the 2 s warm-up, for jitter
@@ -487,6 +541,12 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		}
 	}
 	got := counter.Load() - base
+	wire := sumWire(sender()).sub(wire0)
+	var shPass, shDrop uint64
+	if shl != nil {
+		shPass, shDrop = shl.Counters()
+		shPass, shDrop = shPass-shPass0, shDrop-shDrop0
+	}
 	el := time.Since(start)
 	close(stop)
 	probe.Close()
@@ -510,6 +570,17 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		name = "upload"
 	}
 	fmt.Printf("bulk     %s x%d: avg=%.1f Mbit/s steady=%.1f Mbit/s  [%s]\n", name, n, mbps(got, el), ss, b.pathShare())
+	// What the transfer cost on the wire, beyond its goodput: session-level
+	// copies (duplicates, rescues, reinjections) and QUIC retransmissions.
+	if got > 0 {
+		line := fmt.Sprintf("wire     %s: chunks sent=%dMB (+%.1f%% over goodput: reinject %.1f%% dup %.1f%%) quic lost=%.1fMB (%.2f%%)", name, wire.sent>>20,
+			(float64(wire.sent)/float64(got)-1)*100, float64(wire.reinj)/float64(got)*100, float64(wire.dup)/float64(got)*100,
+			float64(wire.lost)/(1<<20), float64(wire.lost)/float64(max(wire.sent, 1))*100)
+		if shl != nil {
+			line += fmt.Sprintf(" shared-link drops=%d (%.2f%%)", shDrop, float64(shDrop)/float64(max(shPass+shDrop, 1))*100)
+		}
+		fmt.Println(line)
+	}
 	if len(loaded) > 0 && len(idle) > 0 {
 		fmt.Printf("loaded   echo 100B during %s x%d: %s idle_p50=%v\n", name, len(loaded), fmtLat(loaded),
 			pct(idle, .5).Round(100*time.Microsecond))
@@ -541,6 +612,30 @@ func (b *bench) pathShare() string {
 		p = append(p, fmt.Sprintf("%s rtt=%v bw=%.0fM rx=%dMB", s.Name, s.SRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, s.RecvBytes>>20))
 	}
 	return strings.Join(p, "; ")
+}
+
+// background runs a bulk transfer (cmd 'S' or 'R') until the returned
+// function is called.
+func (b *bench) background(cmd byte) func() {
+	c := b.dial(cmd, 0)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64<<10)
+		for {
+			var err error
+			if cmd == 'S' {
+				_, err = c.Read(buf)
+			} else {
+				_, err = c.Write(buf)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(time.Second)
+	return func() { c.Close(); <-done }
 }
 
 func (b *bench) fct() {

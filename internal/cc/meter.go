@@ -30,6 +30,10 @@ type Metrics struct {
 	// StaleResets counts bandwidth estimates found stale (rate drop with a
 	// standing queue) and reset to the measured delivery rate.
 	StaleResets uint64
+	// RawBandwidth is the estimate without the rate cap (bytes/s).
+	RawBandwidth uint64
+	// AckedBytes counts bytes acknowledged so far.
+	AckedBytes uint64
 }
 
 // Meter wraps a BBR sender and publishes its state through atomics. All
@@ -50,6 +54,10 @@ type Meter struct {
 	sentPkts   atomic.Uint64
 	lostPkts   atomic.Uint64
 	stale      atomic.Uint64
+	rawBw      atomic.Uint64
+	acked      atomic.Uint64
+	rateCap    atomic.Uint64 // bytes/s, 0 = none
+	restart    atomic.Bool
 }
 
 // ProbeGate serialises BBR PROBE_RTT among the connections sharing it (the
@@ -80,6 +88,14 @@ func (m *Meter) gate(enter bool) bool {
 	g.Release(m)
 	return true
 }
+
+// SetRateCap bounds the controller's bandwidth estimate to bytesPerSec (0
+// removes the bound); see bbr.Sender.RateCap.
+func (m *Meter) SetRateCap(bytesPerSec uint64) { m.rateCap.Store(bytesPerSec) }
+
+// Restart asks the controller to re-enter STARTUP (on its next ACK) if it is
+// in PROBE_BW; see bbr.Sender.Restart.
+func (m *Meter) Restart() { m.restart.Store(true) }
 
 // SetAppLimited tells the controller whether the application currently has
 // nothing to send on this connection.
@@ -122,6 +138,7 @@ func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
 	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize(), profile)}
 	m.s.AppLimitedHint = m.appLimited.Load
 	m.s.ProbeRTTGate = m.gate
+	m.s.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
 	conn.SetCongestionControl(m)
 	return m
 }
@@ -136,9 +153,11 @@ func (m *Meter) Snapshot() Metrics {
 		Pacing:    m.pacing.Load(),
 		Mode:      m.modeName(),
 
-		PacketsSent: m.sentPkts.Load(),
-		PacketsLost: m.lostPkts.Load(),
-		StaleResets: m.stale.Load(),
+		PacketsSent:  m.sentPkts.Load(),
+		PacketsLost:  m.lostPkts.Load(),
+		StaleResets:  m.stale.Load(),
+		RawBandwidth: m.rawBw.Load(),
+		AckedBytes:   m.acked.Load(),
 	}
 }
 
@@ -152,6 +171,7 @@ func (m *Meter) modeName() string {
 func (m *Meter) publish() {
 	m.mode.Store(m.s.ModeName())
 	m.bw.Store(m.s.BandwidthEstimate())
+	m.rawBw.Store(m.s.RawBandwidthEstimate())
 	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))
 	m.stale.Store(m.s.StaleResets)
 	if m.hasRTT.Load() {
@@ -181,6 +201,9 @@ func (m *Meter) OnCongestionEvent(pn congestion.PacketNumber, lost, prior conges
 	m.s.OnCongestionEvent(pn, lost, prior)
 }
 func (m *Meter) OnCongestionEventEx(prior congestion.ByteCount, t monotime.Time, acked []congestion.AckedPacketInfo, lost []congestion.LostPacketInfo) {
+	if m.restart.Load() && m.restart.CompareAndSwap(true, false) {
+		m.s.Restart()
+	}
 	m.s.OnCongestionEventEx(prior, t, acked, lost)
 	var a, l congestion.ByteCount
 	for _, p := range acked {
@@ -191,6 +214,9 @@ func (m *Meter) OnCongestionEventEx(prior congestion.ByteCount, t monotime.Time,
 	}
 	if len(lost) > 0 {
 		m.lostPkts.Add(uint64(len(lost)))
+	}
+	if a > 0 {
+		m.acked.Add(uint64(a))
 	}
 	if prior > a+l {
 		m.inflight.Store(uint64(prior - a - l))

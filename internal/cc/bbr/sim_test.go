@@ -46,6 +46,7 @@ type simConfig struct {
 	cross     func(time.Duration) float64 // unresponsive cross traffic, bytes/s
 	reno      []bool                      // flows that use Reno instead of BBR
 	outage    func(time.Duration) bool    // link down (everything sent is dropped)
+	setup     func(i int, s *Sender)      // called for each flow's sender before the start
 }
 
 const simBucket = 100 * time.Millisecond
@@ -138,6 +139,9 @@ func runSim(cfg simConfig) simResult {
 		s.SetRTTStatsProvider(fakeRTT{cfg.rtt})
 		if i == 0 {
 			s.ProbeRTTGate = cfg.gate
+		}
+		if cfg.setup != nil {
+			cfg.setup(i, s)
 		}
 		f := &flow{s: s, pn: 1, cwnd: 10 * float64(size), ssthresh: 1e12}
 		f.reno = i < len(cfg.reno) && cfg.reno[i]
@@ -476,6 +480,41 @@ func TestSimSharedBottleneck(t *testing.T) {
 	}
 	if mq > 100*time.Millisecond {
 		t.Errorf("median queueing delay %v > 100ms", mq)
+	}
+}
+
+// Three flows share a bottleneck (three paths of a session behind one
+// uplink). Uncoupled, each probes for the whole link and together they keep
+// its buffer full. With each estimate capped at a third of the link (what
+// mpquic's shared-bottleneck coupling converges to), they leave STARTUP at
+// their share and keep the queue short, at the same utilisation.
+func TestSimRateCapSharedBottleneck(t *testing.T) {
+	run := func(capped bool) (float64, time.Duration, *Sender) {
+		cfg := simConfig{profile: ProfileStandard, duration: 15 * time.Second, rtt: 40 * time.Millisecond,
+			rate: func(time.Duration) float64 { return mbit(60) }, buffer: 100 * time.Millisecond, flows: 3}
+		if capped {
+			cfg.setup = func(_ int, s *Sender) {
+				s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
+			}
+		}
+		r := runSim(cfg)
+		var u float64
+		for i := range 3 {
+			u += r.flowGoodput(i, 3*time.Second, 15*time.Second) / mbit(60)
+		}
+		return u, r.medianQueue(3*time.Second, 15*time.Second), r.senders[0]
+	}
+	u0, q0, _ := run(false)
+	u1, q1, s := run(true)
+	t.Logf("uncoupled: utilization %.0f%%, median queue %v; capped: %.0f%%, %v", u0*100, q0, u1*100, q1)
+	if u1 < 0.9 {
+		t.Errorf("capped utilization %.0f%% < 90%%", u1*100)
+	}
+	if q1 > 10*time.Millisecond || q1 >= q0 {
+		t.Errorf("capped median queue %v (uncoupled %v)", q1, q0)
+	}
+	if bw := s.BandwidthEstimate(); float64(bw) > mbit(20)+1 {
+		t.Errorf("estimate %.1f Mbit/s above the cap", float64(bw)*8/1e6)
 	}
 }
 

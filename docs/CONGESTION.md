@@ -192,6 +192,9 @@ RTTs. A slow consumer (for example a slow SOCKS client) therefore stays at
   window of queue per drop, mostly at long RTTs.
 * Several streams or several paths add up. These per-stream limits apply to
   one TCP connection over one path.
+* **Paths that share a bottleneck** (e.g. the sender's uplink) are detected
+  and paced together at its capacity instead of each probing for all of it:
+  see docs/DESIGN.md, "Shared bottlenecks", and docs/BENCHMARKS.md.
 
 Reproduce: `scripts/cc-bench.py [--rtt 150] [--suite bandwidth,window,loss,burst,buffer,jitter,bloat]`,
 and `go test -v -run TestSim ./internal/cc/bbr/` for the simulator.

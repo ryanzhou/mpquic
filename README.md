@@ -284,6 +284,7 @@ MPQUIC-specific flags (and config keys):
 | `--stats N` | `stats_interval` | off | log per-path RTT/bandwidth/bytes every N s |
 | `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
+| `--no-coupling` | `no_coupling` | false | don't couple paths that share a bottleneck (e.g. the sender's uplink); see docs/DESIGN.md, "Shared bottlenecks" |
 | `--race-connect` | `race_connect` | false | remote only (incl. reverse), aggressive: open each outbound TCP connection by racing up to 5 attempts started at 0, 100, 300, 600 and 1000 ms (each from a new source port, rotating over the target's IPs, IPv6/IPv4 interleaved); the first to connect wins and the rest are aborted. For networks or NATs that drop connection setup, where a lost SYN otherwise stalls the connection for 1 s, 3 s or more. An attempt that fails outright starts the next at once |
 | `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see docs/DESIGN.md, "Packet sizes") |
 | `--cert/--key` | `cert`/`key` | self-signed | server TLS certificate (optional, see security notes) |

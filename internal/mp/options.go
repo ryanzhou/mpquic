@@ -37,6 +37,11 @@ type Options struct {
 	// NoDup disables opportunistic duplication of in-flight data onto idle
 	// faster paths (it is on by default; it only uses otherwise idle capacity).
 	NoDup bool
+	// NoCoupling disables shared-bottleneck coupling: by default, paths
+	// whose queueing delays show that they share a bottleneck (e.g. the
+	// sender's uplink) pace together at its capacity instead of each probing
+	// for all of it (see shared.go).
+	NoCoupling bool
 	// MTU, if > 0, is the path MTU (IP packet size) of every path: QUIC
 	// packets get a fixed size that fits it (UDP payload = MTU - 28 for IPv4
 	// paths, - 48 for IPv6; 1200..1452) and path MTU discovery is off.

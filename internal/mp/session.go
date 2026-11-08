@@ -66,6 +66,8 @@ type Session struct {
 	eagerTokens float64
 	eagerLast   time.Time
 
+	sb sbState // shared bottlenecks (shared.go)
+
 	lastSlowTick  time.Time
 	lastReAck     time.Time
 	lastStatsTick time.Time
@@ -540,6 +542,7 @@ func (s *Session) tick(now time.Time) bool {
 		}
 	}
 	s.updateBenchedLocked()
+	s.sharedTickLocked(now)
 	if debugWindows {
 		for _, st := range s.streams {
 			if len(st.oooRanges) > 0 && now.Sub(st.lastDeliverAt) > holDebugThreshold && now.Sub(st.lastHOLLog) > 100*time.Millisecond {
@@ -741,6 +744,14 @@ type PathStat struct {
 	Loss      float64 // estimated packet loss rate
 	// StaleResets: BBR bandwidth estimates reset after a rate drop
 	StaleResets uint64
+	// ReinjectBytes / DupBytes: chunk bytes sent again on this path, as
+	// reinjections (rescues of late or lost data, insurance copies) and
+	// opportunistic or eager duplicates. Included in SentBytes.
+	ReinjectBytes, DupBytes uint64
+	// SharedCap: the path shares a bottleneck with other paths of the
+	// session and its rate is capped at this share of it (bytes/s); 0: not
+	// capped.
+	SharedCap uint64
 }
 
 // Stats returns per-path statistics.
@@ -765,6 +776,12 @@ func (s *Session) statsStringLocked() string {
 			st.SRTT.Round(time.Millisecond), float64(st.Bandwidth)*8/1e6, st.SentBytes>>20, st.RecvBytes>>20, st.LostBytes>>10)
 		if st.StaleResets > 0 {
 			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
+		}
+		if g := p.sbs.group; g != nil {
+			fmt.Fprintf(&b, " shared=%.1fMbit/s", g.c*8/1e6)
+			if st.SharedCap > 0 {
+				fmt.Fprintf(&b, " cap=%.1fMbit/s", float64(st.SharedCap)*8/1e6)
+			}
 		}
 		b.WriteString("]")
 	}

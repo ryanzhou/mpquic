@@ -332,6 +332,80 @@ sampler) is not used by default: under ACK aggregation on low-RTT paths (ACKs
 in 10–40 ms bursts on a 5–10 ms path) it collapses the estimate to a few
 percent of the link.
 
+### Shared bottlenecks
+
+The relays are usually independent, but the paths often are not: every
+path leaves through the sending endpoint's uplink (a 150 Mbit/s home or
+office line in front of three 100 Mbit/s relay paths). Uncoupled, each
+path's BBR probes for the whole uplink. Their estimates then add up to
+1.2–1.3× its capacity, so together they keep its buffer full (+20–30 ms on
+every stream of the session), and with a shallow buffer they lose ~5% of
+their packets. Each loss costs a QUIC retransmission, often a session-level
+rescue on another path as well, and a head-of-line stall: in one 100 ms
+interval out of ten the download got less than 20 Mbit/s. A path whose
+share of the uplink shrinks also looks like a rate drop to the stale-estimate
+reset, and the regrowth STARTUP that follows overshoots again. The session
+therefore detects shared bottlenecks and couples the paths behind them
+(`internal/mp/shared.go`):
+
+* **Detection.** All paths through one FIFO see the same queueing delay at
+  the same time. Every 10 ms tick, while the session has a backlog (so the
+  paths are busy and their queues reflect the bottlenecks) and both paths of
+  a pair are past BBR STARTUP and drain (a STARTUP overshoot queues at a
+  path's own link as much as at a shared one), each path's queueing delay
+  (latest RTT − min RTT) is sampled. Per pair of paths, exponentially
+  weighted variances and covariances (2 s time constant) of the deviations
+  from a faster mean (1 s) are kept, so that a slow trend both paths happen
+  to share (each draining its own queue) doesn't count. A pair whose delays
+  vary (σ ≥ 0.7 ms) with a correlation ≥ 0.5 and similar means
+  (within 35% + 2 ms) for 1 s shares a bottleneck; a shared pair whose
+  correlation stays ≤ 0.25 for 2 s no longer does (a path also limited by
+  its own link adds a queue of its own, which weakens the correlation).
+  Without a varying delay a pair keeps its verdict. Shared pairs link paths
+  into groups. Detection takes about 1 s of load after STARTUP (~1.5 s at
+  20–60 ms RTT, ~4–5 s at 80–150 ms).
+* **Capacity.** A queue that every member of a group sees for a whole
+  window (2× the largest min RTT, 100–500 ms) means the bottleneck was busy,
+  so the group's aggregate ACK rate over the window is its capacity C (with
+  cross traffic: the group's share). C is the 2 s maximum of such samples,
+  and of higher samples once known. Until the bottleneck has been seen busy,
+  nothing is capped: what short transfers delivered says nothing about
+  capacity.
+* **Sharing.** C is shared out max-min fairly: a path whose own BBR
+  estimate is below an equal share is not capped, the others are capped at
+  equal shares of the rest. The cap (`bbr.Sender.RateCap`) bounds the
+  estimate that pacing, cwnd and STARTUP's full-bandwidth check use; the max
+  filter keeps the path's own samples. So the paths together pace at C, and
+  their gain cycles still probe, one share at a time. A capped path leaves
+  STARTUP, and doesn't re-enter it after a stale-estimate reset. Equal
+  shares keep every path loaded: a path in ProbeRTT or failing leaves only
+  its share to take over, and rescues have capacity everywhere. (Sharing out
+  by RTT, fastest path first, was tried: it halves throughput during the
+  fast path's ProbeRTT and starves rescues when the fast path is lossy.) The
+  scheduler still puts small transfers on the fastest path.
+* **Control.** As a maximum of noisy rates, C tends to be a little high, and
+  the paths' own short drain phases can't drain what the group then queues.
+  A standing queue (≥ max(3 ms, minRTT/10) on every member for a window)
+  makes the group pace at 0.85·C until it is gone; if it doesn't go within
+  three windows it isn't the group's (cross traffic filling the buffer), and
+  the group stops draining for 2 s rather than give up its share. A
+  bottleneck that delivers far below (< 75%) what the group sends, with a
+  deep queue (≥ max(10 ms, minRTT/2)), means the capacity dropped, and C
+  follows within a window (the thresholds of BBR's stale-estimate reset, so
+  that a competing flow's probes don't make the group give up its share; a
+  milder version kept ratcheting the group down against an uncoupled path).
+  No queue for two windows
+  while the paths send at their caps means spare capacity: C grows by 25%
+  per two windows until a queue builds.
+* **Membership changes.** A group that a path joins or leaves keeps C. When
+  a member fails (suspect or closed), the others, which are only limited by
+  their own estimates, i.e. their old shares, restart STARTUP to take over
+  its share quickly; so does a path that is no longer coupled.
+
+The session's stats log line shows a coupled path as
+`shared=<C> cap=<share>`. `no_coupling` turns this off. Measurements: see
+docs/BENCHMARKS.md, "Shared bottleneck".
+
 ### Lossy and misbehaving paths
 
 The rule is: **adding a path must never make the session worse than leaving
@@ -419,12 +493,13 @@ migration.
 | lossy / slow subflow | penalise, still head-of-line blocks | look-ahead placement, per-chunk streams or datagrams, deadline rescue |
 | path failure | RTO-driven, seconds | datagram pings, ~0.6 s, plus deadline rescue (~1 RTT) |
 | per-connection HOL | all data on a subflow is one byte stream | one QUIC stream per (path, connection) |
-| CC | coupled (LIA/OLIA) Reno | uncoupled BBR per path (relays are assumed to be independent bottlenecks) |
+| CC | coupled (LIA/OLIA) Reno | BBR per path; paths found to share a bottleneck (correlated queueing delay) pace together at its capacity |
 | middleboxes | must pass TCP options | plain UDP; relays are stateless forwarders |
 
-The congestion controllers aren't coupled because the paths are, by
-assumption, disjoint routes through different relays. If several paths share
-a bottleneck, they will together take more than one flow's fair share there.
+The congestion controllers are coupled only where the paths are measured to
+share a bottleneck (see "Shared bottlenecks"). Coupled, the paths together
+take about what one BBR flow would there; independent paths keep their own
+controllers.
 
 ## Tuning
 
@@ -441,6 +516,8 @@ a bottleneck, they will together take more than one flow's fair share there.
   low RTT, see above), `cubic` (quic-go's built-in loss-based controller, for
   comparison only: it collapses under random loss and fills deep buffers).
 * `no_dup`: disables duplication if the relay traffic is metered.
+* `no_coupling`: disables shared-bottleneck coupling (see "Shared
+  bottlenecks"); each path then probes for its bottleneck on its own.
 * `GOMAXPROCS` (environment): by default the local, remote and relay adapt
   the number of Go scheduler threads to the load (`internal/procs`). Each
   packet passes through several goroutines (socket reader, QUIC connection
@@ -456,7 +533,18 @@ a bottleneck, they will together take more than one flow's fair share there.
 
 ## Limitations / future work
 
-* No congestion coupling between paths that share a bottleneck.
+* Paths that are completely identical and independent (same delay and rate,
+  no jitter, started together, as only an emulator makes them) run their
+  BBR cycles in lockstep and can be coupled; that costs nothing measurable
+  (`independent-identical` in scripts/shared-bench.sh).
+* Shared-bottleneck detection needs a queue that varies by a millisecond or
+  more. Behind a policer, or a buffer so shallow that it drops before it
+  delays, paths that share a bottleneck aren't detected and behave as
+  uncoupled paths. Detection is RTT-based, so a queue in the ACK direction
+  (e.g. an upload saturating the receiver's uplink) correlates the paths too.
+  Coupling then costs little (the capacity follows what the group delivers
+  and is probed), and in the benchmark it helps the download, as it keeps
+  the upload's queue, which delays the ACKs, short.
 * A sudden rate drop still costs one window's worth of queue: what is already
   in flight (up to 2·BDP at the old rate) has to drain at the new rate before
   the queue is gone (~1 s for an 8× drop at 50 ms RTT), and smaller drops
