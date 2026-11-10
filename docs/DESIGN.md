@@ -120,17 +120,18 @@ As in shadowsocks, the first bytes of every stream are the target address in
 SOCKS5 format. That means there's no separate "open" message. The local
 replies to the SOCKS client immediately, and the request bytes follow the
 address with zero extra round trips. UDP (SOCKS5 UDP ASSOCIATE, the UDP
-tunnel, WireGuard) travels as QUIC DATAGRAM frames (`assoc_id ‖ socks_addr ‖
+tunnel, WireGuard, TUN) travels as QUIC DATAGRAM frames (`assoc_id ‖ socks_addr ‖
 payload`) on the lowest-latency path that can carry them (see "Packet sizes"
 for the limits), or over streams with reliable UDP (see "Reliable UDP").
 
 Two more datagram forms share that format:
 
 * `assoc_id` alone releases an association (the local sends it when a SOCKS
-  control connection closes or a WireGuard UDP flow idles out), so the
+  control connection closes or a WireGuard or TUN UDP flow idles out), so the
   remote closes its socket before its 2-minute idle timer. Older remotes
   fail to parse the address and ignore it.
-* association id 0 carries ICMP echo for the WireGuard listener:
+* association id 0 carries ICMP echo for the WireGuard listener and the
+  TUN interface:
   `0 ‖ socks_addr(ip, port 0) ‖ flow:u16 ‖ seq:u16 ‖ data`. The address is
   the target in requests and the replying host in replies; `flow` names an
   echo flow of the local (one per client, target and echo identifier). The
@@ -201,8 +202,8 @@ DNS responses, which an IP network would fragment).
 ### Reliable UDP
 
 With `reliable_udp` (`--reliable-udp`, local and tunnel roles) every UDP
-association (SOCKS5 UDP ASSOCIATE, UDP tunnel client, WireGuard UDP flow) is
-one multipath stream instead, opened on its first datagram:
+association (SOCKS5 UDP ASSOCIATE, UDP tunnel client, WireGuard or TUN UDP
+flow) is one multipath stream instead, opened on its first datagram:
 
 ```
 stream = 0x55 frame*          (0x55: not a SOCKS5 address type)
