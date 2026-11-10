@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 )
 
-// Building the IP packets the WireGuard front-end sends to its peers for
+// Building the IP packets a front-end sends to its clients for
 // relayed UDP and ICMP (TCP goes through the gVisor stack).
 
 const (
@@ -181,7 +181,7 @@ type echoRequest struct {
 	data     []byte
 }
 
-// parseEcho classifies an IP packet received from a peer. isEcho reports an
+// parseEcho classifies an IP packet received from a client. isEcho reports an
 // ICMP echo request; ok reports whether it can be relayed (it is not a
 // fragment and its checksum is valid). Fragmented echo requests are dropped:
 // they would otherwise reach gVisor, which answers pings itself.
