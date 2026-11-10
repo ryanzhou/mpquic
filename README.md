@@ -1,21 +1,17 @@
 # MPQUIC
 
-**Multipath QUIC tunnel proxy, shadowsocks-style.** `mpquic local` is a SOCKS5
-server (like `ss-local`), a network interface (TUN) and/or a userspace WireGuard server; `mpquic remote`
-forwards to the targets (like `ss-server`). The local instance reaches the remote over **several paths at
-once**: the direct address plus any number of plain UDP relays (`socat`, or
-the built-in `mpquic relay`). Every path is a QUIC connection, and all of them
-land on the same remote instance. A multipath scheduler built for this
-setting spreads proxied connections across them:
+**Multipath QUIC tunnel proxy, shadowsocks-style.** `mpquic local` takes
+traffic in (as a SOCKS5 proxy, a network interface or a WireGuard server) and
+`mpquic remote` sends it on to the internet. Between the two it travels over
+**several paths at once**: the direct address plus any number of plain UDP
+relays (`socat`, or the built-in `mpquic relay`). A scheduler built for this
+setting spreads the connections across the paths:
 
 * **bulk transfers** get close to the *sum* of all path capacities;
-* **small/interactive traffic** keeps the latency of the *best* path, and is
-  protected against loss and outages on individual paths (redundant copies on
-  idle paths, sub-second failover);
+* **small and interactive traffic** keeps the latency of the *best* path, and
+  is protected against loss and outages on individual paths (redundant
+  copies on idle paths, sub-second failover);
 * paths come and go transparently (relay restarts, NAT rebinding, blackouts).
-
-The focus is userspace multipath performance, not obfuscation. Traffic is
-QUIC/TLS 1.3, and peers authenticate each other with the shared password.
 
 ```
  browser ──SOCKS5──> mpquic local ═══ direct UDP ═══════════════╗
@@ -23,10 +19,20 @@ QUIC/TLS 1.3, and peers authenticate each other with the shared password.
                                   ═══ UDP ─> relay B (socat) ═══╝
 ```
 
-Read [docs/DESIGN.md](docs/DESIGN.md) for the protocol and the scheduling
-algorithm, [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for multipath measurements,
-and [docs/CONGESTION.md](docs/CONGESTION.md) for single-stream / congestion
-control results (for example, reachable throughput at 150 ms RTT).
+The focus is multipath performance, not obfuscation: the traffic is plain
+QUIC (TLS 1.3), and the two ends authenticate each other with a shared
+password.
+
+## Install
+
+Binaries for Linux (amd64, arm64, arm), macOS (arm64) and Windows (amd64,
+arm64) are on the [releases page](https://github.com/ryanzhou/mpquic/releases).
+Or build it (Go ≥ 1.26), or use Docker:
+
+```sh
+go build -o mpquic ./cmd/mpquic
+docker build -t mpquic .
+```
 
 ## Quick start
 
@@ -53,438 +59,76 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 
 All paths leave through the local's uplink and come back through its
 downlink, and a home or office line is usually slower than the relays.
-mpquic measures what all paths deliver *together* and shares that out among
-them, so the paths don't each probe for the whole line (see
-docs/DESIGN.md, "Session rate"). If you know the line's rates, say so, a
-little below the real ones, and it doesn't have to find them by filling the
+mpquic finds out what the line carries, but if you know its rates, say so (a
+little below the real ones) and it doesn't have to find them by filling the
 line:
 
 ```sh
 mpquic local ... --up 19mbit --down 95mbit     # a 100/20 Mbit/s line
 ```
 
-### Reverse mode (the local side has the public IP)
+## Ways in
 
-Sometimes the *local* host is the reachable one, and the remote (the egress
-side) sits behind NAT or a firewall. Set `--reverse` on **both** ends. The
-local then listens for QUIC on its public address, in addition to serving
-SOCKS5. The relays forward to the local, and the remote connects back to the
-local directly and through every relay. Everything else stays the same:
-SOCKS clients still connect to the local, and the remote still dials the
-targets.
+The local can take traffic in several ways, all at once if you like. Each
+carries TCP, and with `-u` on both ends also UDP (and ping, where it applies).
 
-```sh
-# local (public IP 198.51.100.7): QUIC listener on :8388 + SOCKS5 on 127.0.0.1:1080
-mpquic local --reverse -s 0.0.0.0 -p 8388 -l 1080 -k 'long-random-password' -u
-
-# relays: forward to the *local*
-socat UDP-LISTEN:9000,fork,reuseaddr UDP:198.51.100.7:8388
-
-# remote (behind NAT): dial the local directly and via each relay
-mpquic remote --reverse -s 198.51.100.7:8388 -s relay-a.example.net:9000 -s relay-b.example.net:9000 \
-              -k 'long-random-password' -u
-```
-
-In reverse mode `-s`/`-p` (`server`/`server_port`) are the local's QUIC bind
-address(es) on the local, and the list of paths on the remote; see
-`examples/reverse-*.json`. Keepalive pings hold the remote's NAT mappings
-open. Until the remote has connected, the local refuses SOCKS requests
-immediately. If the remote restarts, its new session immediately replaces
-the old one. `deploy/docker-compose.reverse.yml` is a reverse-mode testbed,
-and `mpbench --reverse` benchmarks this setup (performance matches normal
-mode).
-
-### WireGuard listener (transparent proxy)
-
-The local can also be a **userspace WireGuard server**, in addition to (or
-instead of) SOCKS5. Any standard WireGuard client (phones, routers, `wg-quick`)
-connects to it, and the traffic it routes into the tunnel is proxied
-transparently over the multipath connection, as if the remote were the
-WireGuard server:
-
-* **TCP** to any address: terminated by a userspace network stack (gVisor)
-  in the local and relayed like a SOCKS5 CONNECT;
-* **UDP** (with `-u` on both ends), including DNS and HTTP/3: relayed like
-  SOCKS5 UDP ASSOCIATE, full-cone per client socket;
-* **ping** (ICMP echo, IPv4 and IPv6, with `-u` on both ends): the remote
-  sends the pings and relays the replies.
-
-No root, TUN device or kernel module is needed on the local. Generate key
-pairs for the server and for each client:
-
-```sh
-mpquic wg-keygen       # PrivateKey = ... / PublicKey = ...
-```
-
-Then run the local with the server's private key and the clients' public keys:
-
-```sh
-# WireGuard on UDP 51820 plus SOCKS5 on 127.0.0.1:1080
-mpquic local -s remote.example.com:8388 -s relay-a.example.net:9000 -k 'long-random-password' -u \
-             --wg-listen 51820 --wg-private-key 'SERVER_PRIVATE_KEY' --wg-peer 'CLIENT_PUBLIC_KEY'
-# WireGuard only
-mpquic local ... --no-socks --wg-listen 51820 --wg-private-key ... --wg-peer ...
-```
-
-Client config (`wg-quick` format). `Address` can be any private address,
-since the local forwards everything and never routes between clients; set
-`DNS` to a public resolver, which is then reached through the tunnel:
-
-```ini
-[Interface]
-PrivateKey = CLIENT_PRIVATE_KEY
-Address = 10.66.0.2/32, fd66::2/128
-DNS = 1.1.1.1
-MTU = 1420
-
-[Peer]
-PublicKey = SERVER_PUBLIC_KEY   # also logged by the local at startup
-Endpoint = local-host.example.net:51820
-AllowedIPs = 0.0.0.0/0, ::/0
-```
-
-| flag | config key (`"wireguard": {...}`) | |
-|---|---|---|
-| `--wg-listen [HOST:]PORT` | `listen` | UDP listen address (default port 51820, all interfaces). Any `--wg-*` option enables the listener |
-| `--wg-private-key KEY` | `private_key` | the server's private key (base64, as `wg genkey`) |
-| `--wg-peer PUBKEY[,IP...]` | `peers: [{"public_key", "allowed_ips"}]` | a client, repeatable. Its allowed IPs (tunnel addresses) default to any; with several clients, give each one its own |
-| `--wg-psk KEY` | `peers[].preshared_key` | optional preshared key (the flag applies to every peer) |
-| `--wg-mtu BYTES` | `mtu` | interface MTU, 1280–9000 (default 1420) |
-| `--no-socks` | `no_socks` (top level) | do not run the SOCKS5 listener |
-
-See `examples/wireguard-local.json`. Keys given on the command line are
-visible to other local users (`ps`); prefer the config file on shared hosts.
-`mpquic wg-pubkey` prints the public key of a private key read on stdin.
-The Windows configurator keeps a `wireguard` section it finds in the config
-but does not edit it (edit the JSON file), and the service installer opens
-the WireGuard UDP port in the firewall.
-`scripts/smoke-wireguard.sh` tests the listener end to end against a real
-WireGuard client in Docker.
-
-Notes:
-
-* Without `-u`, the local answers UDP with ICMP port unreachable and drops
-  pings (and logs a warning at startup).
-* Pinging needs a remote of this version or later. The remote opens an
-  unprivileged ICMP socket (Linux: allowed by `net.ipv4.ping_group_range`,
-  which Docker enables in containers; macOS: always), or else a raw socket
-  (root / `CAP_NET_RAW`; Windows: Administrator). Otherwise it logs a
-  warning and pings time out. Only echo is relayed: ICMP errors from the
-  internet (for example for `traceroute`) are not.
-* As with SOCKS5 UDP, a datagram that the paths cannot carry is dropped (see
-  "Packet sizes" in docs/DESIGN.md); the local then sends the client an ICMP
-  "fragmentation needed"/"packet too big" with the tunnel's limit. With
-  `--reliable-udp`, UDP goes over streams and has no size limit.
-* TCP handshakes complete in the local right away (as SOCKS5 replies
-  immediately): a connection the remote cannot make is reset after
-  connecting instead of being refused.
-
-### TUN interface (transparent proxy on the machine or router itself)
-
-With `--tun`, the local creates a **network interface**, and whatever the
-system routes to it is proxied over the multipath connection exactly as for
-a WireGuard peer: TCP, UDP and ping (the last two with `-u` on both ends),
-IPv4 and IPv6, of the machine itself or forwarded for others. It is the
-WireGuard listener without WireGuard: for traffic that starts on the machine
-running the local, or that it routes, there is nothing to encrypt and
-decrypt on the way to the tunnel and no UDP hop through the loopback
-interface. (In an in-process benchmark the same transfer took about 40% less
-CPU than through the WireGuard listener and a userspace WireGuard client.)
-Use the WireGuard listener for other devices, and for Windows.
-
-It needs Linux (root or `CAP_NET_ADMIN`, and `/dev/net/tun`) or macOS (root;
-experimental there: built and unit-tested, not yet tried on a Mac).
-
-```sh
-# a few networks through the tunnel, the rest as before
-mpquic local -s remote.example.com:8388 -s relay-a.example.net:9000 -k 'long-random-password' -u \
-             --tun mpquic0 --tun-addr 10.99.0.1/24 --tun-route 10.0.0.0/8 --tun-route 192.0.2.0/24
-```
-
-mpquic creates the interface, assigns `--tun-addr`, brings it up and adds
-`--tun-route` to the main routing table; when it exits, the interface and
-with it the addresses and routes are gone. Anything more is ordinary
-routing, done by you or by the router software that starts mpquic.
-
-**Everything through the tunnel (Linux).** The QUIC packets of the paths
-must not be routed into the interface themselves. Give them a firewall mark
-and route everything *without* the mark through the interface, as `wg-quick`
-does:
-
-```sh
-mpquic local ... -u --no-socks --tun mpquic0 --tun-addr 10.99.0.1/24 --fwmark 0x4d51 &
-ip route add default dev mpquic0 table 51
-ip rule add not fwmark 0x4d51 table 51
-ip rule add table main suppress_prefixlength 0   # keep the LAN and other specific routes
-# the same three with "ip -6" for IPv6
-```
-
-`--fwmark` also marks the DNS queries for the servers' names (mpquic then
-resolves them itself, with the servers in `/etc/resolv.conf`). When mpquic
-exits, the interface and the route in table 51 disappear and traffic uses the
-normal default route again; see "persistent interface" below if that must
-not happen.
-
-**On a router.** Route the clients' traffic into the interface with a rule
-of your own; replies come back out of the interface as from the internet:
-
-```sh
-sysctl -w net.ipv4.ip_forward=1
-mpquic local ... -u --no-socks --tun mpquic0 &
-ip route add default dev mpquic0 table 77
-ip rule add iif br-lan lookup 77
-```
-
-The interface needs no address for this. With strict reverse-path filtering
-(`rp_filter=1`), relax it for the interface, as for any policy-routed tunnel.
-
-| flag | config key (`"tun": {...}`) | |
-|---|---|---|
-| `--tun NAME` | `name` | create the interface (Linux: any name, default `mpquic0`; macOS: `utun` or `utunN`). Any `--tun*` option, or a `tun` section, enables it |
-| `--tun-addr ADDR/BITS` | `addresses` | assign an address, repeatable |
-| `--tun-route ADDR/BITS` | `routes` | route a destination through the interface (main table), repeatable; `default` is `0.0.0.0/0` |
-| `--tun-mtu BYTES` | `mtu` | interface MTU, 1280–65535 (default 1500). Set it here, not with `ip link`: the local's TCP uses it |
-| `--fwmark MARK` | `fwmark` (top level) | Linux: firewall mark of the QUIC sockets, in any mode |
-| `--no-socks` | `no_socks` (top level) | do not run the SOCKS5 listener |
-
-See `examples/tun-local.json`. Notes:
-
-* **Persistent interface (Linux).** If an interface of that name already
-  exists as a persistent TUN device (`ip tuntap add dev mpquic0 mode tun`),
-  mpquic attaches to it instead and leaves it in place when it exits. Its
-  addresses, routes and firewall rules then survive restarts, and while
-  mpquic is not running the interface has no carrier and drops what is
-  routed to it: nothing leaks around the tunnel.
-* TCP is terminated at the interface, so the tunnel takes nothing from the
-  MTU and there is no MSS to clamp. UDP is relayed datagram by datagram:
-  what the paths cannot carry (about 1150 bytes of payload at a 1280-byte
-  path MTU) is dropped with an ICMP "fragmentation needed" unless
-  `--reliable-udp` is on. The notes of the WireGuard listener about `-u`,
-  ping and TCP resets apply here too.
-* The interface uses segmentation offload where the kernel has it: the
-  system hands over and receives TCP in large segments (GSO/GRO).
-* In Docker: `--cap-add NET_ADMIN --device /dev/net/tun`.
-* If the interface is deleted while mpquic runs, mpquic exits with an error.
-* `scripts/tun-test.sh` tests all of the above end to end in network
-  namespaces (as root): a router forwarding a client, and a host sending
-  everything through the tunnel.
-
-### Docker
-
-```sh
-docker build -t mpquic .
-docker run -d --name mpq-remote -p 8388:8388/udp mpquic remote -p 8388 -k secret -u
-docker run -d --name mpq-local  -p 127.0.0.1:1080:1080 mpquic local -b 0.0.0.0 -l 1080 \
-       -s remote.example.com:8388 -s relay.example.net:9000 -k secret -u
-docker run -d --name mpq-relay  -p 9000:9000/udp mpquic relay --listen :9000 --target remote.example.com:8388
-```
-
-`deploy/docker-compose.yml` is a self-contained testbed: a remote, three
-emulated relay paths (one of them a flaky "direct" path with periodic
-outages) and a local SOCKS5 endpoint on 127.0.0.1:1080.
-
-```sh
-docker compose -f deploy/docker-compose.yml up -d --build
-curl --socks5-hostname 127.0.0.1:1080 http://whoami/
-```
-
-The image also provides the names `ss-local`, `ss-server`, `ss-tunnel` and
-`mpquic-relay`. The mode is chosen from argv[0], just like the shadowsocks
-binaries.
-
-### Windows (service and configurator)
-
-The Windows release (`mpquic-windows-amd64.exe`, `mpquic-windows-arm64.exe`)
-is a single executable with three roles:
-
-* **Command line:** `mpquic.exe local|tunnel|remote|relay ...` works exactly
-  as on Linux (Ctrl-C to stop).
-* **Configurator:** double-click the exe (or run `mpquic.exe gui`) to open a
-  GUI that edits the settings, installs and updates the Windows service,
-  starts, stops and restarts it, and shows its log. It asks for administrator
-  rights (UAC) when it starts.
-* **Windows service:** each instance runs one role (`local`, `tunnel`,
-  `remote` or `relay`) from a config file, starts at boot, and is restarted
-  automatically if it fails.
-
-From an elevated prompt, the same can be scripted. `service install` takes
-the role and the same options as the foreground command:
-
-```bat
-mpquic.exe service install remote -p 8388 -k long-random-password -u
-mpquic.exe service install local -s remote.example.com:8388 -s relay-a.example.net:9000 -k long-random-password -u
-mpquic.exe service install --name relay relay --listen :9000 --target remote.example.com:8388
-:: or from an existing JSON config:
-mpquic.exe service install local -c C:\path\to\local.json
-mpquic.exe service status | start | stop | restart  [--name NAME]
-mpquic.exe service uninstall [--name NAME] [--purge]
-```
-
-| | |
-|---|---|
-| binary | `%ProgramFiles%\MPQUIC\mpquic.exe`. `install` copies the running exe there. To upgrade, run the new exe's `service install` (or *Save and apply* in the GUI) |
-| config | `%ProgramData%\MPQUIC\NAME.json` (the usual JSON format plus `"role"`). Readable only by Administrators, SYSTEM and the service |
-| log | `%ProgramData%\MPQUIC\logs\NAME.log`, rotated at 10 MB. Start failures also go to the Application event log |
-| account | `NT AUTHORITY\LocalService`. TLS `cert`/`key` files must be readable by it (for example, put them in `%ProgramData%\MPQUIC`) |
-| firewall | `install` adds an inbound Windows Firewall rule for the QUIC/relay UDP ports. For SOCKS5/tunnel listeners, only when bound to a non-loopback address |
-
-`NAME` defaults to `MPQUIC`. Use `--name` to run several instances, for
-example a relay next to a local. The Windows build is console-mode. On
-Windows 11 24H2 and later, double-clicking opens no console window. On
-earlier versions, a console window flashes briefly before the configurator
-appears.
-
-## Build
-
-Go ≥ 1.26:
-
-```sh
-go build -o mpquic ./cmd/mpquic      # the deployable binary (static with CGO_ENABLED=0)
-go build -o mpbench ./cmd/mpbench    # in-process benchmark/testbed
-go test ./...
-make dist                            # all release binaries, including Windows (dist/)
-```
-
-The Windows resources (manifest, icon, version info) live in
-`cmd/mpquic/winres` and are compiled into the committed
-`cmd/mpquic/rsrc_windows_*.syso` files by `make winres`.
-
-## Modes and options
-
-| mode | shadowsocks equivalent | purpose |
-|---|---|---|
-| `mpquic local` | `ss-local` / `sslocal` | SOCKS5 server (CONNECT + UDP ASSOCIATE with `-u`), optionally a TUN interface and a WireGuard server too |
-| `mpquic tunnel -L host:port` | `ss-tunnel` | fixed-target port forward: TCP, plus UDP on the same port with `-u` |
-| `mpquic remote` | `ss-server` / `ssserver` | accepts paths, dials targets |
-| `mpquic local --reverse` / `remote --reverse` | – | same, but the local accepts the paths and the remote dials them |
-| `mpquic relay` | `socat UDP-LISTEN,fork UDP:…` | UDP forwarder, optional link emulation |
-
-For example, a DNS forwarder (TCP and UDP on 127.0.0.1:5353), with UDP
-carried reliably over streams:
-
-```sh
-mpquic remote -k secret -u
-mpquic tunnel -s remote.example.com -k secret -u --reliable-udp -l 5353 -L 1.1.1.1:53
-```
-
-Shadowsocks-compatible flags:
-
-| flag | meaning |
-|---|---|
-| `-c FILE` | JSON config (shadowsocks-libev or shadowsocks-rust format) |
-| `-s HOST[:PORT]` | **repeatable**: one path per server address (local), or bind address (remote) |
-| `-p PORT` | default server port (8388) |
-| `-b ADDR` / `-l PORT` | local SOCKS5 listen address / port (127.0.0.1:1080) |
-| `-k PASSWORD` | shared password |
-| `-m METHOD` | accepted and ignored: QUIC (TLS 1.3) always encrypts |
-| `-t SECONDS` | idle timeout of proxied connections (300) |
-| `-u` / `-U` | enable UDP relay (SOCKS5 UDP ASSOCIATE; the UDP tunnel in tunnel mode); `mode: tcp_and_udp` in the config. Set it on both ends |
-| `-L HOST:PORT` | tunnel target (tunnel mode) |
-| `-v` | verbose logging |
-
-`--fast-open`, `--reuse-port`, `--no-delay`, `-a`, `-f`, `-n`, `-6`,
-`--mptcp` are accepted and ignored. SIP003 plugins are rejected.
-
-MPQUIC-specific flags (and config keys):
-
-| flag | config key | default | |
+| | for | enable with | guide |
 |---|---|---|---|
-| `--congestion` | `congestion` | `bbr` | `bbr`, `bbr-aggressive`, `bbr-conservative`, `cubic` (quic-go built-in, for comparison) |
-| `--window` | `window` | `64MB` | maximum per-stream window (auto-tuned from 4 MB); one stream's rate ≤ window / slowest RTT |
-| `--chunk` | `chunk_size` | `16KB` | scheduling unit |
-| `--stats N` | `stats_interval` | off | log the session rate and per-path RTT/bandwidth/bytes every N s |
-| `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
-| `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
-| `--up RATE` / `--down RATE` | `up` / `down` | measured | this endpoint's uplink / downlink rate, if known (`20mbit`, `"100 mbps"`; config numbers are bit/s). The session never sends more than `up` over all paths together and tells the peer to send no more than `down`; set them a little below the real rates (95%) and the line's buffer stays empty. Without them the session measures what it delivers over all paths and probes for more; see docs/DESIGN.md, "Session rate" |
-| `--no-coupling` | `no_coupling` | false | don't rate-control the paths together: each path's BBR probes for its bottleneck on its own, also when all paths share one (an endpoint's uplink or downlink) |
-| `--race-connect` | `race_connect` | false | remote only (incl. reverse), aggressive: open each outbound TCP connection by racing up to 5 attempts started at 0, 100, 300, 600 and 1000 ms (each from a new source port, rotating over the target's IPs, IPv6/IPv4 interleaved); the first to connect wins and the rest are aborted. For networks or NATs that drop connection setup, where a lost SYN otherwise stalls the connection for 1 s, 3 s or more. An attempt that fails outright starts the next at once |
-| `--reliable-udp` | `reliable_udp` | false | local/tunnel only, needs `-u`: relay all UDP over streams (retransmitted, congestion-controlled, any size; in order, so a loss delays later datagrams of the same association) instead of QUIC datagrams, which drop payloads the path MTU cannot carry. Datagrams sent faster than the tunnel carries them are dropped once ~200 ms are queued. The remote needs this version with `-u`. See docs/DESIGN.md, "Reliable UDP" |
-| `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see docs/DESIGN.md, "Packet sizes") |
-| `--cert/--key` | `cert`/`key` | self-signed | server TLS certificate (optional, see security notes) |
-| `--sni` | `sni` | `mpquic` | client TLS SNI |
-| `--no-socks`, `--wg-*` | `no_socks`, `wireguard` | off | WireGuard listener, see above |
-| `--tun*`, `--fwmark` | `tun`, `fwmark` | off | TUN interface, see above |
-
-### Config file
-
-Shadowsocks configs work unchanged; `server` may now be a list (one entry per
-path), and entries without a port use `server_port`:
-
-```json
-{
-  "server": ["203.0.113.10", "relay-a.example.net:9000", "relay-b.example.net:9000"],
-  "server_port": 8388,
-  "local_address": "127.0.0.1",
-  "local_port": 1080,
-  "password": "change-me",
-  "method": "chacha20-ietf-poly1305",
-  "mode": "tcp_and_udp",
-  "timeout": 300
-}
-```
-
-shadowsocks-rust's `"servers": [{"server": …, "server_port": …, "password": …}]`
-is accepted too; in MPQUIC all entries are paths to the *same* remote. See
-`examples/` for local, remote, relay and ss-rust-style configs.
-
-## Relays and the link emulator
-
-A relay is any UDP forwarder from a public port to the remote's UDP port.
-Each local→relay flow needs its own upstream socket, which socat's `fork` and
-`mpquic relay` both provide. Relays hold no keys and see only QUIC packets.
-If a relay restarts, QUIC migrates the connection to the new source port. If
-it stays down, the path is declared suspect within ~0.6 s, its in-flight data
-is reinjected on the other paths, and the path is re-dialed until the relay
-comes back.
-
-`mpquic relay` can also **emulate** network impairments per direction, which
-is useful to test deployments:
+| **SOCKS5 proxy** | programs that can use a proxy | on by default (`-b`, `-l`) | [configuration](docs/configuration.md) |
+| **Port forward** | one fixed target | `mpquic tunnel -L host:port` | [configuration](docs/configuration.md#modes) |
+| **Network interface** (TUN) | everything this machine, or a router, routes to it; Linux and macOS, needs root | `--tun mpquic0` | [tun](docs/tun.md) |
+| **WireGuard server** | other devices with any WireGuard client: phones, laptops, routers | `--wg-listen 51820` | [wireguard](docs/wireguard.md) |
 
 ```sh
-mpquic relay --listen :9000 --target 127.0.0.1:8388 \
-  --link delay=40ms,jitter=5ms,loss=1%,burst=3,rate=20mbit,queue=80ms,reorder=1%,outage=30s/2s
-# --fwd SPEC / --rev SPEC set client->server and server->client separately
+# an interface: route what you like into it
+mpquic local -s remote.example.com:8388 -k 'long-random-password' -u \
+             --tun mpquic0 --tun-addr 10.99.0.1/24 --tun-route 10.0.0.0/8
+
+# a WireGuard server for your devices (keys: mpquic wg-keygen)
+mpquic local -s remote.example.com:8388 -k 'long-random-password' -u \
+             --wg-listen 51820 --wg-private-key 'SERVER_PRIVATE_KEY' --wg-peer 'CLIENT_PUBLIC_KEY'
+
+# a DNS forwarder on 127.0.0.1:5353
+mpquic tunnel -s remote.example.com:8388 -k 'long-random-password' -u -l 5353 -L 1.1.1.1:53
 ```
 
-| key | meaning |
+## Options you are likely to need
+
+Flags and config files follow shadowsocks (`ss-local`, `ss-server`,
+`ss-tunnel`), so existing configs work; `server` may be a list, one entry
+per path.
+
+| flag | |
 |---|---|
-| `delay`, `jitter` | fixed one-way delay, plus uniform random extra delay |
-| `loss`, `burst` | random loss probability; `burst>1` gives Gilbert-Elliott bursty loss with that mean burst length |
-| `rate`, `queue` | shaping rate with a tail-drop queue (max queueing delay, default 100 ms) |
-| `police`, `police_burst` | token-bucket policer (drops instead of queueing) |
-| `reorder`, `reorder_delay` | probability that a packet is held back, and by how much |
-| `dup` | duplication probability |
-| `outage=EVERY/FOR` | periodic blackouts |
-| `rate2`, `flap` | alternate between `rate` and `rate2` every `flap` |
-| `mtu` | path MTU: drop packets larger than this (IPv4 size, UDP payload + 28) |
+| `-s HOST[:PORT]` | a path: the remote's address or a relay's (repeatable). On the remote: the address to listen on |
+| `-p PORT` | default port (8388) |
+| `-k PASSWORD` | the shared password |
+| `-u` | relay UDP (and ping) too; set it on both ends |
+| `-b ADDR`, `-l PORT` | where the SOCKS5 proxy listens (127.0.0.1:1080) |
+| `-c FILE` | JSON config file instead of flags; see [`examples/`](examples) |
+| `--up RATE`, `--down RATE` | the rates of this end's line, if known |
+| `--reliable-udp` | carry UDP reliably, for datagrams too large for the paths and for lossy paths |
+| `--reverse` | the local has the public address and the remote connects to it |
+| `--stats N` | log the state of the session and of every path every N seconds |
 
-## Benchmarking
+Everything else, with defaults and tuning advice, is in
+[docs/configuration.md](docs/configuration.md).
 
-`mpbench` builds a complete in-process testbed: a target server, a remote,
-one emulated relay per `--path`, and a local. It then measures echo latency,
-connection setup, bulk download/upload, flow completion times, latency under
-load, and failover (best path cut mid-transfer). It also runs every path alone
-as a baseline:
+## More setups
 
-```sh
-mpbench --path delay=10ms,rate=40mbit --path delay=30ms,rate=40mbit,loss=1%
-scripts/bench-matrix.sh        # the scenarios in docs/BENCHMARKS.md
-MPQUIC_TRACE=1 mpbench ...     # log every scheduling decision
-```
-
-## Upgrading
-
-The wire protocol has a version number that both ends check during the
-handshake. Version 2 sends the control plane (pings, ACKs) as QUIC datagrams
-and adds datagram-carried data on very lossy paths. Upgrade the local and the
-remote together: a version-1 peer is rejected.
-
-Within version 2, newer releases add optional datagram messages that older
-peers ignore: releasing a UDP association early, and ICMP echo for the
-WireGuard listener (which needs a remote that knows it). Reliable UDP needs a
-remote that knows it; an older one refuses the streams (the local warns).
-Oversized UDP datagrams are no longer sent reliably on the control stream:
-they are dropped, unless reliable UDP is on.
+* **Relays** hold no keys and see only QUIC packets; any UDP forwarder will
+  do. `mpquic relay` can also emulate a bad link (delay, loss, rate limits,
+  outages) to try a setup before relying on it. See
+  [deployment](docs/deployment.md#relays).
+* **Reverse mode**: when the local side is the reachable one and the remote
+  sits behind NAT. See
+  [deployment](docs/deployment.md#reverse-mode-the-local-side-has-the-public-ip).
+* **Docker**: the image runs every mode; `deploy/` has compose testbeds. See
+  [deployment](docs/deployment.md#docker).
+* **Windows**: one executable that is the command line, a configurator and a
+  Windows service. See [windows](docs/windows.md).
+* **Upgrading**: upgrade both ends together when the protocol version
+  changes. See [deployment](docs/deployment.md#upgrading).
 
 ## Security notes
 
@@ -499,23 +143,19 @@ they are dropped, unless reliable UDP is on.
 * Per-path keys come from separate TLS handshakes; relays see only
   ciphertext.
 
-## Project layout
+## Documentation
 
-```
-cmd/mpquic        CLI (local / tunnel / remote / relay), shadowsocks-compatible flags
-cmd/mpbench       in-process testbed & benchmarks
-internal/app      runs a role from a config (shared by the CLI, service and GUI)
-internal/winsvc   Windows service: install/update, run, firewall, ACLs
-internal/gui      Windows configurator (tailscale/walk)
-internal/logfile  rotating log file
-internal/mp       multipath session: paths, streams, scheduler, ACKs, auth
-internal/cc       congestion-control glue + vendored BBR (from Hysteria, MIT)
-internal/proxy    SOCKS5 / tunnel / remote dialer / UDP associate / ICMP echo
-internal/ipstack  userspace network stack (gVisor) that proxies the packet front-ends' TCP, UDP and ping
-internal/wg       WireGuard listener (wireguard-go in front of ipstack)
-internal/tundev   TUN interface (the system's interface in front of ipstack)
-internal/linkem   UDP relay with link emulation
-internal/procs    adapts GOMAXPROCS to the load (see docs/DESIGN.md, "Tuning")
-internal/config   shadowsocks-compatible JSON config
-deploy/           docker-compose testbed
-```
+[docs/](docs/README.md) has the full index.
+
+* **Using it**: [configuration](docs/configuration.md),
+  [deployment](docs/deployment.md), [TUN interface](docs/tun.md),
+  [WireGuard listener](docs/wireguard.md), [Windows](docs/windows.md),
+  [building and testing](docs/development.md).
+* **How it works**: the [design overview](docs/design/README.md), then one
+  page per layer: [wire protocol](docs/design/protocol.md),
+  [session and scheduler](docs/design/session.md),
+  [congestion control](docs/design/congestion.md),
+  [proxying](docs/design/proxy.md),
+  [packet front-ends](docs/design/packet-frontends.md).
+* **Measurements**: [multipath benchmarks](docs/benchmarks/multipath.md),
+  [congestion control](docs/benchmarks/congestion-control.md).

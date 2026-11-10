@@ -157,7 +157,7 @@ WireGuard peers, is proxied transparently; UDP and ping need -u on both ends):
   --tun-route ADDR/BITS
                     route a destination through the TUN interface
                     (repeatable). Routes that cover the servers' own
-                    addresses need --fwmark and a routing rule (see README)
+                    addresses need --fwmark and a routing rule (docs/tun.md)
   --tun-mtu BYTES   TUN interface MTU (default 1500)
   --fwmark MARK     Linux: firewall mark of the QUIC sockets (and of the DNS
                     queries for server names), for routing rules that keep
