@@ -48,8 +48,14 @@ type Config struct {
 	Key           string `json:"key,omitempty"`
 	SNI           string `json:"sni,omitempty"`
 	NoDup         bool   `json:"no_dup,omitempty"`
-	NoCoupling    bool   `json:"no_coupling,omitempty"` // no shared-bottleneck coupling of paths
-	MTU           int    `json:"mtu,omitempty"`         // path MTU (IP packet size) of every path; 0 discovers it
+	NoCoupling    bool   `json:"no_coupling,omitempty"` // paths are not rate-controlled together
+	// Up / Down: the rate of this endpoint's uplink / downlink ("20mbit";
+	// a number is bit/s), if known. The session then sends no more than Up
+	// over all paths together, and tells the peer to send no more than
+	// Down. Without them the rates are measured.
+	Up   Rate `json:"up,omitempty"`
+	Down Rate `json:"down,omitempty"`
+	MTU  int  `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
 	// RaceConnect (remote role): race staggered TCP connection attempts to
 	// each target and keep the first that connects.
 	RaceConnect bool `json:"race_connect,omitempty"`
@@ -182,6 +188,68 @@ func FormatSize(n int64) string {
 		}
 	}
 	return strconv.FormatInt(n, 10)
+}
+
+// Rate is a bit rate in bit/s. It accepts a number or a string like
+// "20mbit", "100 mbps", "1.5g" (decimal units, always bits).
+type Rate uint64
+
+func (r *Rate) UnmarshalJSON(b []byte) error {
+	var n uint64
+	if err := json.Unmarshal(b, &n); err == nil {
+		*r = Rate(n)
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(b, &str); err != nil {
+		return fmt.Errorf("bad rate %s", b)
+	}
+	v, err := ParseRate(str)
+	*r = v
+	return err
+}
+
+// MarshalJSON writes round rates as strings ("20mbit") and others as numbers.
+func (r Rate) MarshalJSON() ([]byte, error) {
+	for _, u := range []struct {
+		mult   uint64
+		suffix string
+	}{{1e9, "gbit"}, {1e6, "mbit"}, {1e3, "kbit"}} {
+		if r != 0 && uint64(r)%u.mult == 0 {
+			return json.Marshal(strconv.FormatUint(uint64(r)/u.mult, 10) + u.suffix)
+		}
+	}
+	return json.Marshal(uint64(r))
+}
+
+// BytesPerSecond converts the rate for mp.Options.
+func (r Rate) BytesPerSecond() uint64 { return uint64(r) / 8 }
+
+// ParseRate parses "20mbit", "100 Mbps", "1.5g", "500k", "8000000" (bit/s).
+func ParseRate(str string) (Rate, error) {
+	l := strings.ToLower(strings.TrimSpace(str))
+	l = strings.TrimSuffix(l, "/s")
+	for _, suf := range []string{"bits", "bit", "bps"} {
+		if t := strings.TrimSuffix(l, suf); t != l {
+			l = t
+			break
+		}
+	}
+	l = strings.TrimSpace(l)
+	mult := 1.0
+	switch {
+	case strings.HasSuffix(l, "k"):
+		mult, l = 1e3, strings.TrimSuffix(l, "k")
+	case strings.HasSuffix(l, "m"):
+		mult, l = 1e6, strings.TrimSuffix(l, "m")
+	case strings.HasSuffix(l, "g"):
+		mult, l = 1e9, strings.TrimSuffix(l, "g")
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(l), 64)
+	if err != nil || f < 0 || f*mult > 1e15 {
+		return 0, fmt.Errorf("bad rate %q (want e.g. 20mbit)", str)
+	}
+	return Rate(f * mult), nil
 }
 
 // ParseSize parses "16MB", "512k", "1048576".

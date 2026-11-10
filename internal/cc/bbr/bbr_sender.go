@@ -342,13 +342,18 @@ type bbrSender struct {
 	// probes at a time.
 	ProbeRTTGate func(enter bool) bool
 	// RateCap, if set, returns an upper bound for the bandwidth estimate
-	// (0: none). mpquic sets it when several paths of a session share a
-	// bottleneck (e.g. an endpoint's uplink): each path's share of the
-	// aggregate capacity, so that the paths together pace at that capacity
-	// instead of each probing for the whole of it. Pacing, cwnd and STARTUP's
+	// (0: none). mpquic sets it to the path's share of what the session
+	// delivers over all its paths together, so that paths behind a common
+	// bottleneck (e.g. an endpoint's uplink) pace at its capacity instead of
+	// each probing for the whole of it. Pacing, cwnd and STARTUP's
 	// full-bandwidth detection use the capped estimate; the max filter itself
 	// keeps the path's own samples.
 	RateCap func() Bandwidth
+	// RateGain, if set, returns a pacing gain that applies while RateCap
+	// limits the estimate (0 or 1: none). The session probes for more
+	// capacity, and drains the queue that leaves, on all capped paths at
+	// once: the path's own gain cycle only moves one share at a time.
+	RateGain func() float64
 	// holdsProbeGate: ProbeRTTGate(true) succeeded and has not been released
 	// yet. The gate must only be held while in PROBE_RTT.
 	holdsProbeGate bool
@@ -663,8 +668,8 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 
 	// Handle logic specific to STARTUP and DRAIN modes.
 	if b.mode == bbrModeStartup && b.capped() {
-		// mpquic: the session caps this path at its share of a bottleneck
-		// shared with other paths; growing further would only queue.
+		// mpquic: the session caps this path at its share of what all paths
+		// deliver together; growing further would only queue.
 		b.isAtFullBandwidth = true
 	}
 	if isRoundStart && !b.isAtFullBandwidth {
@@ -778,10 +783,20 @@ func (b *bbrSender) capped() bool {
 	return c > 0 && c < b.maxBandwidth.GetBest()
 }
 
-// Restart re-enters STARTUP from PROBE_BW (mpquic: a path's share of a
-// shared bottleneck grew, e.g. another path of the session went away, and
-// should be found within a few round trips rather than by 25% per gain
-// cycle).
+// sessionGain is the session's pacing gain for a capped path (see RateGain).
+func (b *bbrSender) sessionGain() float64 {
+	if b.RateGain == nil || !b.capped() {
+		return 1
+	}
+	if g := b.RateGain(); g > 0 {
+		return g
+	}
+	return 1
+}
+
+// Restart re-enters STARTUP from PROBE_BW (mpquic: another path of the
+// session went away, and what it carried should be taken over within a few
+// round trips rather than by 25% per gain cycle).
 func (b *bbrSender) Restart() {
 	if b.mode != bbrModeProbeBw {
 		return
@@ -951,7 +966,9 @@ func (b *bbrSender) resetStaleWindow(now monotime.Time) {
 }
 
 func (b *bbrSender) checkStaleBandwidth(now monotime.Time, rtt time.Duration, bw Bandwidth, appLimited bool) {
-	if b.staleStart.IsZero() {
+	if b.staleStart.IsZero() || b.sessionGain() < 1 {
+		// (While the session drains on purpose, delivering less than the
+		// estimate says nothing about the bottleneck.)
 		b.resetStaleWindow(now)
 	}
 	if rtt != infRTT {
@@ -1012,9 +1029,9 @@ func (b *bbrSender) maybeRegrowAfterStale(now monotime.Time) {
 		return
 	}
 	if b.capped() {
-		// The path's share of a shared bottleneck is what limits it: the
-		// session sets that share, and STARTUP would only fill the queue
-		// that the other paths of the session see too.
+		// The path's share of what the session delivers is what limits
+		// it: the session probes for more, and STARTUP would only fill
+		// the queue that the other paths of the session see too.
 		return
 	}
 	if float64(b.bandwidthEstimate()) >= 0.8*float64(b.staleOldBw) {
@@ -1045,7 +1062,7 @@ func (b *bbrSender) updateGainCyclePhase(now monotime.Time, priorInFlight conges
 	// pacing_gain * BDP.  Make sure that it actually reaches the target, as long
 	// as there are no losses suggesting that the buffers are not able to hold
 	// that much.
-	if b.pacingGain > 1.0 && !hasLosses && priorInFlight < b.getTargetCongestionWindow(b.pacingGain) {
+	if b.pacingGain > 1.0 && !hasLosses && priorInFlight < b.getTargetCongestionWindow(b.pacingGain) && !b.capped() {
 		shouldAdvanceGainCycling = false
 	}
 
@@ -1231,7 +1248,21 @@ func (b *bbrSender) calculatePacingRate(bytesLost congestion.ByteCount) {
 		return
 	}
 
-	targetRate := Bandwidth(b.pacingGain * float64(b.bandwidthEstimate()))
+	gain := b.pacingGain
+	if gain > 1 && b.mode == bbrModeProbeBw && b.capped() {
+		// mpquic: a capped path cannot find more capacity alone. The
+		// session probes on all capped paths at once (sessionGain); the
+		// path's own probes would only add to what a common bottleneck
+		// queues or drops. Its drain phases remain.
+		gain = 1
+	}
+	sg := b.sessionGain()
+	targetRate := Bandwidth(gain * sg * float64(b.bandwidthEstimate()))
+	if sg > 1 {
+		// ... but never drives the path harder than its own probes would:
+		// its cap may be all its own bottleneck carries.
+		targetRate = min(targetRate, Bandwidth(pacingGain[0]*float64(b.maxBandwidth.GetBest())))
+	}
 	if b.isAtFullBandwidth {
 		b.pacingRate = targetRate
 		return

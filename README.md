@@ -51,6 +51,18 @@ mpquic local -s remote.example.com:8388 -s relay-a.example.net:9000 -s relay-b.e
 curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
+All paths leave through the local's uplink and come back through its
+downlink, and a home or office line is usually slower than the relays.
+mpquic measures what all paths deliver *together* and shares that out among
+them, so the paths don't each probe for the whole line (see
+docs/DESIGN.md, "Session rate"). If you know the line's rates, say so, a
+little below the real ones, and it doesn't have to find them by filling the
+line:
+
+```sh
+mpquic local ... --up 19mbit --down 95mbit     # a 100/20 Mbit/s line
+```
+
 ### Reverse mode (the local side has the public IP)
 
 Sometimes the *local* host is the reachable one, and the remote (the egress
@@ -290,10 +302,11 @@ MPQUIC-specific flags (and config keys):
 | `--congestion` | `congestion` | `bbr` | `bbr`, `bbr-aggressive`, `bbr-conservative`, `cubic` (quic-go built-in, for comparison) |
 | `--window` | `window` | `64MB` | maximum per-stream window (auto-tuned from 4 MB); one stream's rate ≤ window / slowest RTT |
 | `--chunk` | `chunk_size` | `16KB` | scheduling unit |
-| `--stats N` | `stats_interval` | off | log per-path RTT/bandwidth/bytes every N s |
+| `--stats N` | `stats_interval` | off | log the session rate and per-path RTT/bandwidth/bytes every N s |
 | `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
-| `--no-coupling` | `no_coupling` | false | don't couple paths that share a bottleneck (e.g. the sender's uplink); see docs/DESIGN.md, "Shared bottlenecks" |
+| `--up RATE` / `--down RATE` | `up` / `down` | measured | this endpoint's uplink / downlink rate, if known (`20mbit`, `"100 mbps"`; config numbers are bit/s). The session never sends more than `up` over all paths together and tells the peer to send no more than `down`; set them a little below the real rates (95%) and the line's buffer stays empty. Without them the session measures what it delivers over all paths and probes for more; see docs/DESIGN.md, "Session rate" |
+| `--no-coupling` | `no_coupling` | false | don't rate-control the paths together: each path's BBR probes for its bottleneck on its own, also when all paths share one (an endpoint's uplink or downlink) |
 | `--race-connect` | `race_connect` | false | remote only (incl. reverse), aggressive: open each outbound TCP connection by racing up to 5 attempts started at 0, 100, 300, 600 and 1000 ms (each from a new source port, rotating over the target's IPs, IPv6/IPv4 interleaved); the first to connect wins and the rest are aborted. For networks or NATs that drop connection setup, where a lost SYN otherwise stalls the connection for 1 s, 3 s or more. An attempt that fails outright starts the next at once |
 | `--reliable-udp` | `reliable_udp` | false | local/tunnel only, needs `-u`: relay all UDP over streams (retransmitted, congestion-controlled, any size; in order, so a loss delays later datagrams of the same association) instead of QUIC datagrams, which drop payloads the path MTU cannot carry. Datagrams sent faster than the tunnel carries them are dropped once ~200 ms are queued. The remote needs this version with `-u`. See docs/DESIGN.md, "Reliable UDP" |
 | `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see docs/DESIGN.md, "Packet sizes") |

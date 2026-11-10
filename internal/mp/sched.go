@@ -425,7 +425,7 @@ func (s *Session) rescueLagLocked() float64 {
 			best = min(best, q.owdTail())
 		}
 	}
-	return s.opt.AckDelay.Seconds() + 2*best + 0.005
+	return s.ackWait.Seconds() + 2*best + 0.005
 }
 
 // streamBacklogLocked estimates how many bytes will be sent (by round-robin)
@@ -572,7 +572,7 @@ func (s *Session) sendAliveLocked(c *chunk, r sendRec, now time.Time, overdueFac
 		// more; a datagram is never retransmitted at all. Give up sooner.
 		f, v, slack = min(f, 1.25), 2*q.rttvar, 10*time.Millisecond
 	}
-	ackBy := r.at.Add(time.Duration(f*float64(q.srttOrDefault())) + v + tx + s.opt.AckDelay + slack)
+	ackBy := r.at.Add(time.Duration(f*float64(q.srttOrDefault())) + v + tx + s.ackWait + slack)
 	if known && now.After(ackBy) {
 		return time.Time{}, false
 	}
@@ -584,7 +584,7 @@ func (s *Session) sendAliveLocked(c *chunk, r sendRec, now time.Time, overdueFac
 	// a slow path is not needed, and not rescued, until the front catches
 	// up with it.)
 	if known && !r.dueBy.IsZero() && c.neededLocked() {
-		ackTrip := s.opt.AckDelay + time.Duration(s.bestOwdTailLocked()*float64(time.Second)) + 5*time.Millisecond
+		ackTrip := s.ackWait + time.Duration(s.bestOwdTailLocked()*float64(time.Second)) + 5*time.Millisecond
 		// The bound is re-evaluated with the path's current RTT: if a queue
 		// has built up since the send, everything sent is merely delayed
 		// (and rescuing all of it would only duplicate it).

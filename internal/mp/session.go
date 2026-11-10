@@ -66,7 +66,10 @@ type Session struct {
 	eagerTokens float64
 	eagerLast   time.Time
 
-	sb sbState // shared bottlenecks (shared.go)
+	cp coupling // session rate (coupling.go)
+	// ackWait: how long the peer may hold an acknowledgement back (its ACK
+	// interval, as we compute our own: see ackEveryLocked)
+	ackWait time.Duration
 
 	lastSlowTick  time.Time
 	lastReAck     time.Time
@@ -92,6 +95,7 @@ func newSession(opt *Options, id [16]byte, dialer bool, acceptFn func(*Stream)) 
 		created:   time.Now(),
 
 		lastStatsTick: time.Now(),
+		ackWait:       opt.AckDelay,
 	}
 	s.log = opt.Logger.With("session", hex.EncodeToString(id[:4]))
 	if !dialer {
@@ -171,6 +175,10 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	p.id = s.nextPID
 	p.state = stateActive
 	s.paths = append(s.paths, p)
+	if r := s.opt.MaxRecvRate; r > 0 {
+		// on every path's control stream (reliable); older peers ignore it
+		p.sendCtrl(encodeU64s(frLimit, r))
+	}
 	s.wakeAllLocked()
 	s.log.Info("path up", "path", p.name, "count", s.activeCountLocked())
 	return nil
@@ -423,6 +431,14 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 			s.closedIDs[v[0]] = time.Now()
 		}
 		s.mu.Unlock()
+	case frLimit:
+		v, err := decodeU64s(body, 1)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.cp.peerLimit = v[0]
+		s.mu.Unlock()
 	case frPathAck:
 		r := &byteReader{b: body}
 		idx, err := r.varint()
@@ -447,21 +463,47 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 	return nil
 }
 
+// ackEveryLocked is how often acknowledgements are sent while data keeps
+// arriving: four times per round trip of the fastest path (5 ms at 20 ms,
+// at most every 25 ms), and never less than AckDelay apart. Each ACK repeats
+// the stream's whole state (up to 200 SACK ranges, on two paths), so one
+// every 2 ms would be megabits of acknowledgements for a fast download,
+// competing for an uplink that is often much slower than the downlink. The
+// sender expects acknowledgements no sooner (see ackWait).
+func (s *Session) ackEveryLocked() time.Duration {
+	best := 4 * maxAckEvery
+	for _, p := range s.paths {
+		if p.state == stateActive {
+			best = min(best, p.srttOrDefault())
+		}
+	}
+	return max(min(best/4, maxAckEvery), s.opt.AckDelay)
+}
+
+const maxAckEvery = 25 * time.Millisecond
+
 func (s *Session) ackLoop() {
 	t := time.NewTimer(time.Hour)
 	t.Stop()
+	var last time.Time
 	for {
 		select {
 		case <-s.ackSig:
 		case <-s.ctx.Done():
 			return
 		}
-		t.Reset(s.opt.AckDelay)
+		// The first acknowledgement after a pause goes out after AckDelay,
+		// further ones at the session's ACK interval.
+		s.mu.Lock()
+		wait := max(s.opt.AckDelay, s.ackEveryLocked()-time.Since(last))
+		s.mu.Unlock()
+		t.Reset(wait)
 		select {
 		case <-t.C:
 		case <-s.ctx.Done():
 			return
 		}
+		last = time.Now()
 		s.mu.Lock()
 		entries := make([]ackEntry, 0, len(s.ackDirty)+len(s.ackAllIDs))
 		for st := range s.ackDirty {
@@ -472,26 +514,19 @@ func (s *Session) ackLoop() {
 			entries = append(entries, ackEntry{id: id, cum: ackAll})
 		}
 		s.ackAllIDs = s.ackAllIDs[:0]
-		var pathAcks [][]byte
+		var pathAcks []pathAck
 		for _, p := range s.paths {
 			if p.rxDirty {
 				p.rxDirty = false
-				pathAcks = append(pathAcks, append([]byte{dgCtrl}, p.pathAckFrameLocked()...))
+				pathAcks = append(pathAcks, pathAck{p.index, append([]byte{dgCtrl}, p.pathAckFrameLocked()...)})
 			}
 		}
 		paths := s.ackPathsLocked()
 		s.mu.Unlock()
-		for _, d := range pathAcks {
-			for _, p := range paths {
-				p.sendDgram(d)
-			}
-		}
 		// ACKs are unreliable datagrams (no head-of-line blocking behind lost
 		// packets), sent redundantly on two paths and refreshed periodically.
-		for _, d := range encodeAckDatagrams(entries) {
-			for _, p := range paths {
-				p.sendDgram(d)
-			}
+		for _, p := range paths {
+			p.queueAcks(entries, pathAcks)
 		}
 	}
 }
@@ -539,7 +574,8 @@ func (s *Session) tick(now time.Time) bool {
 		}
 	}
 	s.updateBenchedLocked()
-	s.sharedTickLocked(now)
+	s.ackWait = s.ackEveryLocked()
+	s.couplingTickLocked(now)
 	if debugWindows {
 		for _, st := range s.streams {
 			if len(st.oooRanges) > 0 && now.Sub(st.lastDeliverAt) > holDebugThreshold && now.Sub(st.lastHOLLog) > 100*time.Millisecond {
@@ -593,7 +629,14 @@ func (s *Session) tick(now time.Time) bool {
 	}
 	if s.opt.StatsInterval > 0 && now.Sub(s.lastStatsTick) >= s.opt.StatsInterval {
 		s.lastStatsTick = now
-		args := []any{"streams", len(s.streams), "backlog", s.backlog, "paths", s.statsStringLocked()}
+		args := []any{"streams", len(s.streams), "backlog", s.backlog}
+		if s.cp.bw > 0 {
+			args = append(args, "rate", fmt.Sprintf("%.1fMbit/s", s.cp.bw*8/1e6))
+		}
+		if l := s.rateLimitLocked(); l > 0 {
+			args = append(args, "limit", fmt.Sprintf("%.1fMbit/s", float64(l)*8/1e6))
+		}
+		args = append(args, "paths", s.statsStringLocked())
 		if s.oversizeDrops > 0 {
 			args = append(args, "udp_too_large", s.oversizeDrops)
 		}
@@ -698,9 +741,8 @@ type PathStat struct {
 	// reinjections (rescues of late or lost data, insurance copies) and
 	// opportunistic or eager duplicates. Included in SentBytes.
 	ReinjectBytes, DupBytes uint64
-	// SharedCap: the path shares a bottleneck with other paths of the
-	// session and its rate is capped at this share of it (bytes/s); 0: not
-	// capped.
+	// SharedCap: the path's share of the session rate (bytes/s), which caps
+	// its estimate; 0: not capped (its own estimate is below its share).
 	SharedCap uint64
 }
 
@@ -727,11 +769,9 @@ func (s *Session) statsStringLocked() string {
 		if st.StaleResets > 0 {
 			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
 		}
-		if g := p.sbs.group; g != nil {
-			fmt.Fprintf(&b, " shared=%.1fMbit/s", g.c*8/1e6)
-			if st.SharedCap > 0 {
-				fmt.Fprintf(&b, " cap=%.1fMbit/s", float64(st.SharedCap)*8/1e6)
-			}
+		if st.SharedCap > 0 && st.SharedCap < p.cps.rawBw {
+			// capped at its share of the session rate; its own estimate
+			fmt.Fprintf(&b, " own=%.1fMbit/s", float64(p.cps.rawBw)*8/1e6)
 		}
 		b.WriteString("]")
 	}

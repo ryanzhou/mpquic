@@ -16,8 +16,12 @@ type Relay struct {
 	// be shared by several relays to emulate a common bottleneck in front of
 	// all paths, e.g. the uplink of the sending endpoint.
 	SharedFwd, SharedRev *Link
-	Timeout              time.Duration
-	Log                  *slog.Logger
+	// SharedFwdOut / SharedRevOut, if set, are applied after Fwd / Rev: a
+	// common bottleneck behind all paths, e.g. the downlink of the receiving
+	// endpoint. What it drops has already crossed the relays.
+	SharedFwdOut, SharedRevOut *Link
+	Timeout                    time.Duration
+	Log                        *slog.Logger
 
 	target string
 	lc     *net.UDPConn
@@ -98,6 +102,10 @@ func (r *Relay) Serve() error {
 		}
 		up := f.up
 		out := func(b []byte) { up.Write(b) }
+		if l := r.SharedFwdOut; l != nil {
+			last := out
+			out = func(b []byte) { l.Send(b, last) }
+		}
 		if r.SharedFwd != nil {
 			r.SharedFwd.Send(buf[:n], func(b []byte) { r.Fwd.Send(b, out) })
 		} else {
@@ -137,6 +145,10 @@ func (r *Relay) flowFor(from *net.UDPAddr) (*flow, error) {
 			f.last = time.Now()
 			r.mu.Unlock()
 			out := func(p []byte) { r.lc.WriteToUDP(p, from) }
+			if l := r.SharedRevOut; l != nil {
+				last := out
+				out = func(p []byte) { l.Send(p, last) }
+			}
 			if r.SharedRev != nil {
 				r.SharedRev.Send(b[:n], func(p []byte) { r.Rev.Send(p, out) })
 			} else {

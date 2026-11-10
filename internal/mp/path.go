@@ -53,8 +53,14 @@ type Path struct {
 	ctrl   *quic.Stream
 	ctrlR  *bufio.Reader
 	ctrlQ  chan []byte
-	dgramQ chan []byte // control datagrams (unreliable: PING/PONG/ACK)
+	dgramQ chan []byte // control datagrams (unreliable: PING/PONG)
 	wake   chan struct{}
+	// Acknowledgements waiting to go out on this path: the latest state per
+	// stream and per path (see queueAcks).
+	ackMu       sync.Mutex
+	ackPend     map[uint64]ackEntry
+	pathAckPend map[uint64][]byte
+	ackSig      chan struct{}
 
 	// guarded by sess.mu
 	state        pathState
@@ -117,8 +123,8 @@ type Path struct {
 	// chunk bytes scheduled as copies of data already sent (sess.mu held):
 	// reinjections/rescues and opportunistic duplicates
 	reinjBytes, dupBytes uint64
-	// shared-bottleneck detection and coupling (see shared.go)
-	sbs sbPathState
+	// session rate (see coupling.go)
+	cps cpPath
 
 	// owned by the send loop
 	sendStreams map[uint64]*quic.SendStream
@@ -131,6 +137,7 @@ func newPath(s *Session, name string, index uint64, conn *quic.Conn, meter *cc.M
 		sess: s, name: name, index: index, conn: conn, meter: meter, ctrl: ctrl, ctrlR: ctrlR,
 		ctrlQ:       make(chan []byte, 1024),
 		dgramQ:      make(chan []byte, 256),
+		ackSig:      make(chan struct{}, 1),
 		dgramChunk:  dgramChunkDefault,
 		streamUses:  make(map[uint64]int),
 		wake:        make(chan struct{}, 1),
@@ -226,20 +233,82 @@ func (p *Path) sendDgram(b []byte) {
 }
 
 func (p *Path) sendDatagrams(ctx context.Context) {
+	send := func(b []byte) {
+		if err := p.conn.SendDatagram(b); err != nil {
+			// e.g. too large for the current packet size: fall back to
+			// the (reliable) control stream.
+			if len(b) > 0 && b[0] == dgCtrl {
+				p.sendCtrl(b[1:])
+			}
+		}
+	}
 	for {
 		select {
 		case b := <-p.dgramQ:
-			if err := p.conn.SendDatagram(b); err != nil {
-				// e.g. too large for the current packet size: fall back to
-				// the (reliable) control stream.
-				if len(b) > 0 && b[0] == dgCtrl {
-					p.sendCtrl(b[1:])
+			send(b)
+		case <-p.ackSig:
+			for {
+				entries, pathAcks := p.takeAcks()
+				if len(entries) == 0 && len(pathAcks) == 0 {
+					break
+				}
+				for _, b := range pathAcks {
+					send(b)
+				}
+				for _, b := range encodeAckDatagrams(entries) {
+					send(b)
 				}
 			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+type pathAck struct {
+	index uint64
+	frame []byte
+}
+
+// queueAcks hands acknowledgements to the path. They are cumulative, so only
+// the latest state of each stream (and of each path's datagram receipt) is
+// kept until the path can send: while the connection is busy or slow, newer
+// acknowledgements replace older ones instead of queueing behind them. A
+// queue of them once held 187 datagrams that the sender was waiting for, and
+// it resent everything they would have acknowledged.
+func (p *Path) queueAcks(entries []ackEntry, pathAcks []pathAck) {
+	if len(entries) == 0 && len(pathAcks) == 0 {
+		return
+	}
+	p.ackMu.Lock()
+	if p.ackPend == nil {
+		p.ackPend, p.pathAckPend = make(map[uint64]ackEntry), make(map[uint64][]byte)
+	}
+	for _, e := range entries {
+		p.ackPend[e.id] = e
+	}
+	for _, a := range pathAcks {
+		p.pathAckPend[a.index] = a.frame
+	}
+	p.ackMu.Unlock()
+	select {
+	case p.ackSig <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Path) takeAcks() (entries []ackEntry, pathAcks [][]byte) {
+	p.ackMu.Lock()
+	defer p.ackMu.Unlock()
+	for id, e := range p.ackPend {
+		entries = append(entries, e)
+		delete(p.ackPend, id)
+	}
+	for i, f := range p.pathAckPend {
+		pathAcks = append(pathAcks, f)
+		delete(p.pathAckPend, i)
+	}
+	return entries, pathAcks
 }
 
 func (p *Path) recvDatagrams(ctx context.Context) {
@@ -645,17 +714,30 @@ func (p *Path) canCarry(c *chunk) bool {
 // maxChunk is the largest chunk this path should carry: small enough that the
 // chance of losing any of its packets stays <= 25% (one packet at 20% loss,
 // two at 10%, five at 5%; unlimited below ~1%), and one datagram in dgramMode.
+// On a slow path it is also no more than the path sends in chunkTime: the
+// path's sender is busy with a chunk for that long, and whatever is due
+// next (a keystroke, a request, a rescue) waits behind it. A 16 KB chunk
+// takes 20 ms at 6.5 Mbit/s, a path's share of a 20 Mbit/s uplink.
 func (p *Path) maxChunk() int {
 	if p.dgramMode() {
 		return p.dgramChunk
 	}
+	n := 1 << 30
+	if p.bw > 0 {
+		n = max(int(p.rate()*chunkTime.Seconds()), minRateChunk)
+	}
 	l := p.loss()
 	if l < 0.002 {
-		return 1 << 30
+		return n
 	}
 	pkts := math.Floor(math.Log(0.75) / math.Log(1-l))
-	return max(int(pkts), 1) * 1150
+	return min(n, max(int(pkts), 1)*1150)
 }
+
+const (
+	chunkTime    = 5 * time.Millisecond
+	minRateChunk = 2 * 1150
+)
 
 // chunksPerStream is how many chunks share one QUIC stream before rotation.
 func (p *Path) chunksPerStream() int {
@@ -865,6 +947,6 @@ func (p *Path) statLocked() PathStat {
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
 		StaleResets: p.staleResets, ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
-		SharedCap: p.sbs.cap,
+		SharedCap: p.cps.cap,
 	}
 }

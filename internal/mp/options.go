@@ -37,11 +37,18 @@ type Options struct {
 	// NoDup disables opportunistic duplication of in-flight data onto idle
 	// faster paths (it is on by default; it only uses otherwise idle capacity).
 	NoDup bool
-	// NoCoupling disables shared-bottleneck coupling: by default, paths
-	// whose queueing delays show that they share a bottleneck (e.g. the
-	// sender's uplink) pace together at its capacity instead of each probing
-	// for all of it (see shared.go).
+	// NoCoupling disables the session rate: by default the paths' bandwidth
+	// estimates are capped so that they add up to what the session delivers
+	// over all of them together, which keeps paths behind a common
+	// bottleneck (an endpoint's uplink or downlink) from each probing for
+	// all of it (see coupling.go).
 	NoCoupling bool
+	// MaxSendRate / MaxRecvRate, if > 0, are ceilings for what the session
+	// sends and receives over all paths together, in bytes/s: the known
+	// rate of this endpoint's uplink and downlink. The receive limit is
+	// announced to the peer, which then sends no faster. The session still
+	// adapts below a limit; it never probes above it.
+	MaxSendRate, MaxRecvRate uint64
 	// MTU, if > 0, is the path MTU (IP packet size) of every path: QUIC
 	// packets get a fixed size that fits it (UDP payload = MTU - 28 for IPv4
 	// paths, - 48 for IPv6; 1200..1452) and path MTU discovery is off.

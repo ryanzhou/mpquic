@@ -58,6 +58,7 @@ const (
 	frReset = 4 // id, code
 	// 5 was frDgram (an oversized UDP datagram sent reliably); unused now
 	frPathAck = 6 // pathIndex, largest dseq, 32-byte bitmap of the 256 dseqs below
+	frLimit   = 7 // rate: the most the sender of the frame wants to receive over all paths (bytes/s, 0 = no limit)
 )
 
 // pathAckBits is how many datagram sequence numbers below the largest one a

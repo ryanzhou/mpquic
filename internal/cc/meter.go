@@ -5,6 +5,7 @@ package cc
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -32,8 +33,14 @@ type Metrics struct {
 	StaleResets uint64
 	// RawBandwidth is the estimate without the rate cap (bytes/s).
 	RawBandwidth uint64
-	// AckedBytes counts bytes acknowledged so far.
-	AckedBytes uint64
+	// AckedBytes / SentBytes count the bytes acknowledged and sent so far
+	// in ack-eliciting packets (including retransmissions and control
+	// traffic).
+	AckedBytes, SentBytes uint64
+	// LostBytes counts the bytes of packets declared lost.
+	LostBytes uint64
+	// AckedAt is when AckedBytes last grew (monotonic, since process start).
+	AckedAt time.Duration
 }
 
 // Meter wraps a BBR sender and publishes its state through atomics. All
@@ -56,8 +63,44 @@ type Meter struct {
 	stale      atomic.Uint64
 	rawBw      atomic.Uint64
 	acked      atomic.Uint64
+	sent       atomic.Uint64
+	lostBytes  atomic.Uint64
+	ackedAt    atomic.Int64
+	markAt     atomic.Int64 // pending mark (see Mark), 0 = none
+	markAcked  atomic.Uint64
+	markTime   atomic.Int64
 	rateCap    atomic.Uint64 // bytes/s, 0 = none
+	rateGain   atomic.Uint64 // math.Float64bits, 0 = none
 	restart    atomic.Bool
+}
+
+var processStart = time.Now()
+
+// Mono converts t to the clock of Metrics.AckedAt and Mark.
+func Mono(t time.Time) time.Duration { return t.Sub(processStart) }
+
+// Mark asks the meter to remember how many bytes were acknowledged as of
+// at (and when the last of them was): the state before the first
+// acknowledgement that arrives after at. The session uses it to measure
+// what was delivered of the bytes sent up to a moment, which is known one
+// round trip later.
+func (m *Meter) Mark(at time.Duration) { m.markAt.Store(max(int64(at), 1)) }
+
+// Marked returns the result of the last Mark. If nothing was acknowledged
+// since at, that is the current state.
+func (m *Meter) Marked() (acked uint64, at time.Duration) {
+	if m.markAt.Load() != 0 {
+		return m.acked.Load(), time.Duration(m.ackedAt.Load())
+	}
+	return m.markAcked.Load(), time.Duration(m.markTime.Load())
+}
+
+func (m *Meter) takeMark(now int64) {
+	if t := m.markAt.Load(); t != 0 && now >= t {
+		m.markAcked.Store(m.acked.Load())
+		m.markTime.Store(m.ackedAt.Load())
+		m.markAt.Store(0)
+	}
 }
 
 // ProbeGate serialises BBR PROBE_RTT among the connections sharing it (the
@@ -92,6 +135,10 @@ func (m *Meter) gate(enter bool) bool {
 // SetRateCap bounds the controller's bandwidth estimate to bytesPerSec (0
 // removes the bound); see bbr.Sender.RateCap.
 func (m *Meter) SetRateCap(bytesPerSec uint64) { m.rateCap.Store(bytesPerSec) }
+
+// SetRateGain sets the pacing gain that applies while the rate cap limits
+// the estimate (1: none); see bbr.Sender.RateGain.
+func (m *Meter) SetRateGain(g float64) { m.rateGain.Store(math.Float64bits(g)) }
 
 // Restart asks the controller to re-enter STARTUP (on its next ACK) if it is
 // in PROBE_BW; see bbr.Sender.Restart.
@@ -139,6 +186,7 @@ func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
 	m.s.AppLimitedHint = m.appLimited.Load
 	m.s.ProbeRTTGate = m.gate
 	m.s.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
+	m.s.RateGain = func() float64 { return math.Float64frombits(m.rateGain.Load()) }
 	conn.SetCongestionControl(m)
 	return m
 }
@@ -158,8 +206,30 @@ func (m *Meter) Snapshot() Metrics {
 		StaleResets:  m.stale.Load(),
 		RawBandwidth: m.rawBw.Load(),
 		AckedBytes:   m.acked.Load(),
+		SentBytes:    m.sent.Load(),
+		LostBytes:    m.lostBytes.Load(),
+		AckedAt:      time.Duration(m.ackedAt.Load()),
 	}
 }
+
+// Inject overwrites the counters and the raw estimate that Snapshot
+// reports. It is for tests of code that reads a Meter without a connection.
+func (m *Meter) Inject(x Metrics) {
+	if x.AckedBytes != m.acked.Load() {
+		m.takeMark(int64(x.AckedAt))
+	}
+	m.sentPkts.Store(x.PacketsSent)
+	m.lostPkts.Store(x.PacketsLost)
+	m.acked.Store(x.AckedBytes)
+	m.sent.Store(x.SentBytes)
+	m.lostBytes.Store(x.LostBytes)
+	m.ackedAt.Store(int64(x.AckedAt))
+	m.rawBw.Store(x.RawBandwidth)
+}
+
+// RateCap and RateGain return what SetRateCap and SetRateGain last set.
+func (m *Meter) RateCap() uint64   { return m.rateCap.Load() }
+func (m *Meter) RateGain() float64 { return math.Float64frombits(m.rateGain.Load()) }
 
 func (m *Meter) modeName() string {
 	if v, ok := m.mode.Load().(string); ok {
@@ -191,6 +261,9 @@ func (m *Meter) OnPacketSent(t monotime.Time, inflight congestion.ByteCount, pn 
 	m.s.OnPacketSent(t, inflight, pn, n, rtx)
 	m.inflight.Store(uint64(inflight + n))
 	m.sentPkts.Add(1)
+	if rtx {
+		m.sent.Add(uint64(n)) // ACK-only packets are never acknowledged
+	}
 }
 func (m *Meter) CanSend(b congestion.ByteCount) bool { return m.s.CanSend(b) }
 func (m *Meter) MaybeExitSlowStart()                 { m.s.MaybeExitSlowStart() }
@@ -214,9 +287,13 @@ func (m *Meter) OnCongestionEventEx(prior congestion.ByteCount, t monotime.Time,
 	}
 	if len(lost) > 0 {
 		m.lostPkts.Add(uint64(len(lost)))
+		m.lostBytes.Add(uint64(l))
 	}
 	if a > 0 {
+		now := int64(Mono(time.Now()))
+		m.takeMark(now)
 		m.acked.Add(uint64(a))
+		m.ackedAt.Store(now)
 	}
 	if prior > a+l {
 		m.inflight.Store(uint64(prior - a - l))

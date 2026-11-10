@@ -229,7 +229,8 @@ type Link struct {
 	closed      bool
 
 	// counters
-	Passed, Dropped uint64
+	Passed, Dropped           uint64
+	PassedBytes, DroppedBytes uint64
 }
 
 // NewLink creates a link and starts its delivery goroutine.
@@ -275,6 +276,13 @@ func (l *Link) Counters() (passed, dropped uint64) {
 	return l.Passed, l.Dropped
 }
 
+// Bytes returns the UDP payload bytes passed and dropped so far.
+func (l *Link) Bytes() (passed, dropped uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.PassedBytes, l.DroppedBytes
+}
+
 // Close stops the delivery goroutine.
 func (l *Link) Close() {
 	l.mu.Lock()
@@ -315,12 +323,12 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 	l.mu.Lock()
 	s := &l.spec
 	if l.down || l.closed {
-		l.Dropped++
+		l.Dropped, l.DroppedBytes = l.Dropped+1, l.DroppedBytes+uint64(len(b))
 		l.mu.Unlock()
 		return
 	}
 	if len(l.q) == 0 && s.passthrough() { // nothing queued: order is kept
-		l.Passed++
+		l.Passed, l.PassedBytes = l.Passed+1, l.PassedBytes+uint64(len(b))
 		l.mu.Unlock()
 		out(b)
 		return
@@ -328,7 +336,7 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 	if s.OutageEvery > 0 && s.OutageFor > 0 {
 		phase := now.Sub(l.start) % s.OutageEvery
 		if phase >= s.OutageEvery-s.OutageFor {
-			l.Dropped++
+			l.Dropped, l.DroppedBytes = l.Dropped+1, l.DroppedBytes+uint64(len(b))
 			l.mu.Unlock()
 			return
 		}
@@ -350,14 +358,14 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 			lost = l.rng.Float64() < s.Loss
 		}
 		if lost {
-			l.Dropped++
+			l.Dropped, l.DroppedBytes = l.Dropped+1, l.DroppedBytes+uint64(len(b))
 			l.mu.Unlock()
 			return
 		}
 	}
 	if s.MTU > 0 && len(b)+28 > s.MTU {
 		// too big for the path, and the sender set DF (as QUIC does)
-		l.Dropped++
+		l.Dropped, l.DroppedBytes = l.Dropped+1, l.DroppedBytes+uint64(len(b))
 		l.mu.Unlock()
 		return
 	}
@@ -369,7 +377,7 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 		}
 		l.lastTok = now
 		if l.tokens < size {
-			l.Dropped++
+			l.Dropped, l.DroppedBytes = l.Dropped+1, l.DroppedBytes+uint64(len(b))
 			l.mu.Unlock()
 			return
 		}
@@ -387,7 +395,7 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 			q = 100 * time.Millisecond
 		}
 		if done.Sub(now) > q {
-			l.Dropped++
+			l.Dropped, l.DroppedBytes = l.Dropped+1, l.DroppedBytes+uint64(len(b))
 			l.mu.Unlock()
 			return
 		}
@@ -419,7 +427,7 @@ func (l *Link) Send(b []byte, out func([]byte)) {
 		l.seq++
 		heap.Push(&l.q, &pkt{at: t, seq: l.seq, data: append([]byte(nil), b...), out: out})
 	}
-	l.Passed++
+	l.Passed, l.PassedBytes = l.Passed+1, l.PassedBytes+uint64(len(b))
 	l.mu.Unlock()
 	l.signal()
 }

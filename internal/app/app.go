@@ -205,6 +205,8 @@ func options(cfg *config.Config, log *slog.Logger) *mp.Options {
 		StatsInterval: time.Duration(cfg.StatsInterval) * time.Second,
 		NoDup:         cfg.NoDup,
 		NoCoupling:    cfg.NoCoupling,
+		MaxSendRate:   cfg.Up.BytesPerSecond(),
+		MaxRecvRate:   cfg.Down.BytesPerSecond(),
 		MTU:           cfg.MTU,
 		CertFile:      cfg.Cert,
 		KeyFile:       cfg.Key,

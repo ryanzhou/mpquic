@@ -93,7 +93,8 @@ path, which used to produce false "path suspect" events and late SACKs:
 | frame | contents | use |
 |---|---|---|
 | PING/PONG | seq | path liveness and ping-loss estimate; every 100 ms while streams are active (1 s when idle) |
-| ACK | per stream: cumulative offset, window, ≤200 SACK ranges (delta-encoded) | data-level acknowledgement + flow control; sent on the two best paths, re-sent every 30 ms while data is arriving |
+| ACK | per stream: cumulative offset, window, ≤200 SACK ranges (delta-encoded) | data-level acknowledgement + flow control; sent on the two best paths four times per RTT of the fastest path (every 2–25 ms), refreshed every 30 ms while data is arriving |
+| LIMIT | rate | the most the sender of the frame wants to receive over all paths together (its configured `down`); on the control stream |
 | PATHACK | path index, largest datagram seq, 256-bit bitmap | per-path receipt of data datagrams (loss detection on lossy paths) |
 | RESET | stream id, code | abort (dial failure, idle timeout, …) |
 
@@ -218,8 +219,11 @@ datagram arrived ~0.5 s after the sender stopped instead of ~2.9 s.
 
 ### Send side
 
-Each stream keeps an ordered list of chunks (up to 16 KB by default; small
-application writes are coalesced while a chunk is unsent). A chunk stays
+Each stream keeps an ordered list of chunks (up to 16 KB by default, and on
+a slow path no more than it sends in 5 ms: a path's sender is busy with a
+chunk for that long, and a keystroke or a rescue that is due next waits
+behind it, 20 ms for 16 KB at 6.5 Mbit/s; small application writes are
+coalesced while a chunk is unsent). A chunk stays
 until it is cumulatively acknowledged. Every chunk records each transmission
 as `(path, time)`. The receiver's ACK advertises `window = consumed +
 Window`, and the application's `Write` blocks once `Window` bytes are
@@ -228,11 +232,28 @@ outstanding. This gives end-to-end backpressure to the TCP socket.
 ### Receive side
 
 Chunks are inserted into a per-stream reorder buffer, de-duplicated by
-offset, and delivered in order. ACKs are coalesced for up to `AckDelay` (2 ms)
-and sent as datagrams on the **two** lowest-latency paths, so a single lossy
-or dead path can't delay acknowledgements; they are refreshed every 30 ms
-while data is arriving, since a datagram can be lost. Each ACK carries the
-cumulative point, the window and up to 200 SACK ranges.
+offset, and delivered in order. ACKs are sent as datagrams on the **two**
+lowest-latency paths, so a single lossy or dead path can't delay
+acknowledgements; they are refreshed every 30 ms while data is arriving,
+since a datagram can be lost. Each ACK carries the cumulative point, the
+window and up to 200 SACK ranges.
+
+ACKs travel against the data, through the receiver's uplink, which is often
+the slowest link of all (and may be busy with an upload):
+
+* **Cadence.** The first ACK after a pause goes out after `AckDelay` (2 ms).
+  While data keeps arriving, ACKs follow four times per round trip of the
+  fastest path: every 5 ms at 20 ms RTT, at most every 25 ms. The sender
+  allows for the same interval before it calls an acknowledgement late.
+  (One ACK every 2 ms on two paths, each repeating the stream's whole SACK
+  state, was megabits of acknowledgements for a fast download.)
+* **Only the latest state waits.** ACKs are cumulative, so a path keeps one
+  pending ACK state per stream (and per path, for datagram receipts), and
+  builds the datagram when its connection can send. While the connection is
+  busy or slow, newer state replaces older instead of queueing behind it.
+  With a plain queue, a receiver whose uplink was busy with an upload once
+  had 187 ACK datagrams waiting, each telling the sender about data it had
+  long since resent: over half of a download was sent twice.
 
 ### Pull-based scheduling
 
@@ -358,79 +379,129 @@ sampler) is not used by default: under ACK aggregation on low-RTT paths (ACKs
 in 10–40 ms bursts on a 5–10 ms path) it collapses the estimate to a few
 percent of the link.
 
-### Shared bottlenecks
+### Session rate: the paths are congestion-controlled as one flow
 
-The relays are usually independent, but the paths often are not: every
-path leaves through the sending endpoint's uplink (a 150 Mbit/s home or
-office line in front of three 100 Mbit/s relay paths). Uncoupled, each
-path's BBR probes for the whole uplink. Their estimates then add up to
-1.2–1.3× its capacity, so together they keep its buffer full (+20–30 ms on
-every stream of the session), and with a shallow buffer they lose ~5% of
-their packets. Each loss costs a QUIC retransmission, often a session-level
-rescue on another path as well, and a head-of-line stall: in one 100 ms
-interval out of ten the download got less than 20 Mbit/s. A path whose
-share of the uplink shrinks also looks like a rate drop to the stale-estimate
-reset, and the regrowth STARTUP that follows overshoots again. The session
-therefore detects shared bottlenecks and couples the paths behind them
-(`internal/mp/shared.go`):
+The relays are usually independent, but the paths are not: every path
+leaves through the sending endpoint's uplink and arrives through the
+receiving endpoint's downlink, and those are often slower than the relays (a
+100/20 Mbit/s home line in front of three relays in data centres). Each
+path's BBR measures its own delivery rate and keeps the highest it has seen.
+Behind a common bottleneck the paths see their best rates at different
+moments (one path gets more while another drains or probes its RTT), so the
+estimates add up to more than the bottleneck carries. Left alone, the paths
+keep its buffer full, which is latency for every stream of the session.
+Where it drops instead (a shallow buffer, a policer), they lose the excess
+all the time, and BBR ignores loss: behind a 50 Mbit/s policer three paths
+sent 60–160 Mbit/s by their estimates and lost a quarter of it. Every lost
+packet is retransmitted by QUIC, often rescued on another path as well, and
+stalls the stream that waits for it. If the bottleneck is the receiver's
+downlink, all of that crosses the relays first: they carried 47% more than
+the session delivered.
 
-* **Detection.** All paths through one FIFO see the same queueing delay at
-  the same time. Every 10 ms tick, while the session has a backlog (so the
-  paths are busy and their queues reflect the bottlenecks) and both paths of
-  a pair are past BBR STARTUP and drain (a STARTUP overshoot queues at a
-  path's own link as much as at a shared one), each path's queueing delay
-  (latest RTT − min RTT) is sampled. Per pair of paths, exponentially
-  weighted variances and covariances (2 s time constant) of the deviations
-  from a faster mean (1 s) are kept, so that a slow trend both paths happen
-  to share (each draining its own queue) doesn't count. A pair whose delays
-  vary (σ ≥ 0.7 ms) with a correlation ≥ 0.5 and similar means
-  (within 35% + 2 ms) for 1 s shares a bottleneck; a shared pair whose
-  correlation stays ≤ 0.25 for 2 s no longer does (a path also limited by
-  its own link adds a queue of its own, which weakens the correlation).
-  Without a varying delay a pair keeps its verdict. Shared pairs link paths
-  into groups. Detection takes about 1 s of load after STARTUP (~1.5 s at
-  20–60 ms RTT, ~4–5 s at 80–150 ms).
-* **Capacity.** A queue that every member of a group sees for a whole
-  window (2× the largest min RTT, 100–500 ms) means the bottleneck was busy,
-  so the group's aggregate ACK rate over the window is its capacity C (with
-  cross traffic: the group's share). C is the 2 s maximum of such samples,
-  and of higher samples once known. Until the bottleneck has been seen busy,
-  nothing is capped: what short transfers delivered says nothing about
-  capacity.
-* **Sharing.** C is shared out max-min fairly: a path whose own BBR
-  estimate is below an equal share is not capped, the others are capped at
-  equal shares of the rest. The cap (`bbr.Sender.RateCap`) bounds the
-  estimate that pacing, cwnd and STARTUP's full-bandwidth check use; the max
-  filter keeps the path's own samples. So the paths together pace at C, and
-  their gain cycles still probe, one share at a time. A capped path leaves
-  STARTUP, and doesn't re-enter it after a stale-estimate reset. Equal
-  shares keep every path loaded: a path in ProbeRTT or failing leaves only
-  its share to take over, and rescues have capacity everywhere. (Sharing out
-  by RTT, fastest path first, was tried: it halves throughput during the
-  fast path's ProbeRTT and starves rescues when the fast path is lossy.) The
-  scheduler still puts small transfers on the fastest path.
-* **Control.** As a maximum of noisy rates, C tends to be a little high, and
-  the paths' own short drain phases can't drain what the group then queues.
-  A standing queue (≥ max(3 ms, minRTT/10) on every member for a window)
-  makes the group pace at 0.85·C until it is gone; if it doesn't go within
-  three windows it isn't the group's (cross traffic filling the buffer), and
-  the group stops draining for 2 s rather than give up its share. A
-  bottleneck that delivers far below (< 75%) what the group sends, with a
-  deep queue (≥ max(10 ms, minRTT/2)), means the capacity dropped, and C
-  follows within a window (the thresholds of BBR's stale-estimate reset, so
-  that a competing flow's probes don't make the group give up its share; a
-  milder version kept ratcheting the group down against an uncoupled path).
-  No queue for two windows
-  while the paths send at their caps means spare capacity: C grows by 25%
-  per two windows until a queue builds.
-* **Membership changes.** A group that a path joins or leaves keeps C. When
-  a member fails (suspect or closed), the others, which are only limited by
-  their own estimates, i.e. their old shares, restart STARTUP to take over
-  its share quickly; so does a path that is no longer coupled.
+MPTCP solves this with coupled congestion control: at a common bottleneck
+the subflows together behave like one flow. Hysteria solves it by being told
+the rates of the two ends. The session does both
+(`internal/mp/coupling.go`). Like BBR, it works with delivery rates. Delay
+only supports what the rates say, because a round-trip time also grows with
+queues that are not the session's (the other direction's: a download's ACKs
+behind an upload on the same uplink; or other people's traffic), and loss
+is not judged at all, only what it leaves of the delivery rate. And
+congestion is only what *all* paths show at once: one path's own queue or
+loss is that path's business.
 
-The session's stats log line shows a coupled path as
-`shared=<C> cap=<share>`. `no_coupling` turns this off. Measurements: see
-docs/BENCHMARKS.md, "Shared bottleneck".
+* **Rounds and delivery rate.** The session works in rounds of the largest
+  smoothed RTT of its paths (50 ms to 1 s, at most twice a path's base RTT).
+  The delivery rate of a round is how fast the bytes *sent in it* came out
+  at the other end: per path, what was acknowledged between the round's
+  start and end, each shifted by that path's RTT and timed from ACK to ACK
+  (`cc.Meter.Mark`), and never more than was sent. It is known one round
+  later. (Counting the ACKs that happen to arrive during a round instead
+  mixes several rounds' sends when the paths' RTTs differ; a 25% probe then
+  showed as 6%.)
+* **Session rate.** *B* is the highest delivery rate seen. It stands while
+  what is sent is delivered: that only shows a lower bound (as do rounds in
+  which the paths had no data to send), and counting such rounds would let
+  *B* sink whenever the paths happen to send a little less than their
+  shares. Rounds in which *every* path delivered clearly less than it sent
+  (below 0.98) show what a bottleneck that all of them pass carries, and
+  *B* is the maximum of the last ten of those. That is all there is to
+  loss, as in BBR: a policer drops the same share from every path, so its
+  rate is found this way, and loss that all paths have costs nothing as
+  long as the probes (1.25) more than make up for it. One path's own loss,
+  however heavy, changes nothing.
+* **Shares.** *B* is shared out max-min fairly as a cap on each path's BBR
+  estimate (`bbr.Sender.RateCap`; pacing, cwnd and STARTUP's exit use the
+  capped estimate): a path whose own estimate is below an equal share keeps
+  it, since its own bottleneck limits it, and the others get equal shares of
+  the rest. So the estimates add up to what the session measurably
+  delivers. Equal shares keep every path loaded: a path in ProbeRTT or
+  failing leaves only its share to take over, and rescues have capacity
+  everywhere. (The scheduler still puts small transfers on the fastest
+  path.)
+* **When.** *B* is shared out for 32 rounds after the pipe was last seen
+  full: every path delivers less than it sends, or every path sees a queue
+  (below), while delivery has stopped growing (the session's by less than
+  25% per round, and no path in STARTUP is growing with the session's
+  total growing along: at the start all paths overshoot at the same
+  moment, and a slow one may still be ramping). A probe doesn't count, as
+  it fills every path's own bottleneck too. Paths behind a common
+  bottleneck keep showing this, so nothing has to be detected or
+  remembered. Independent paths stop showing it and are left alone again;
+  they must be, because BBR's estimate for a path with random loss is what
+  it *sends*, so the estimates of lossy paths never add up to what is
+  delivered, and capping them would take from the clean paths (four paths
+  with 20/10/5/1% loss lost a tenth of their throughput that way). Before
+  the first time, *B* only shows what has been sent so far, and it lags a
+  fast path that ramps up within one round of a slow one. A path in
+  STARTUP gets a share when the pipe is full, which ends its STARTUP;
+  otherwise it is left to find its rate.
+* **Probing.** A capped path can't find more capacity alone, and doesn't
+  try: its own 1.25 gain phases are off, its drain phases remain. Instead
+  the session probes on all capped paths at once (`bbr.Sender.RateGain`):
+  one round at 1.25·*B*, then one at 0.75·*B* while the ACKs come in, so
+  that whatever the probe queued is gone again by the time its result is
+  known. If the probe was delivered (*B* grew by half of what it added),
+  the session probes again right away, from the second success in a row at
+  1.5 and then 2 (one success may be a policer's burst allowance).
+  Otherwise it waits twice as long before the next probe: 2, 4, then every
+  8 rounds, which is as often as BBR itself probes. No path is driven
+  harder than its own probes would drive it (1.25 times its own estimate):
+  its share may be all that its own bottleneck carries.
+* **Queues.** When every path that carried data saw a queue for a whole
+  round (its lowest RTT sample at least `max(3 ms, shortest base RTT / 10)`
+  above its base RTT, the lowest of the last 15–30 s), the bottleneck they
+  all pass is congested.
+  * If such rounds also delivered clearly less than *B* (their average, of
+    up to three, is below 0.9·*B*), the capacity dropped, and *B* follows
+    at once. A queue with all of *B* delivered changes nothing: it may not
+    be ours, and following the delivery rate down for it would never end.
+  * A maximum of noisy samples is a few percent high, and the paths' own
+    drain phases then keep taking back what queues. So while *B* limits
+    every path and all of them see a queue, *B* is trimmed: if the session
+    delivered clearly less on average over 10 such rounds (below 0.98·*B*,
+    loss aside), *B* is that average.
+  * A queue that stays for two rounds is drained by a round at 0.75·*B*, at
+    most every 8 rounds. If the queue doesn't shrink, it isn't the
+    session's, and it becomes part of the paths' base RTT.
+* **Known rates** (`up` / `down`, the Hysteria part). If an endpoint's
+  uplink or downlink rate is configured, the session never sends more than
+  `up` over all paths together, and it announces `down` to the peer (a
+  control frame; older peers ignore it), which then sends no more than
+  that. The limit is a ceiling for *B*, obeyed from the first packet (also
+  in STARTUP, and with a single path) and never probed. Below it everything
+  above still applies, so a line that is slower than configured is handled
+  as without the option. Set them a little below the real rates (95%) and
+  the bottleneck's queue stays empty.
+* **Path failure.** When a path fails (suspect or closed), the others
+  restart STARTUP to take over what it carried.
+
+With a single path and no configured limit, the session rate is only
+measured, and the path's BBR is on its own.
+
+The session's stats log line shows `rate=<B>` (and `limit=`); a path whose
+estimate is capped shows its own estimate as `own=`. `no_coupling` turns the
+session rate off (configured limits still apply). Measurements: see
+docs/BENCHMARKS.md, "Common bottlenecks".
 
 ### Lossy and misbehaving paths
 
@@ -519,13 +590,12 @@ migration.
 | lossy / slow subflow | penalise, still head-of-line blocks | look-ahead placement, per-chunk streams or datagrams, deadline rescue |
 | path failure | RTO-driven, seconds | datagram pings, ~0.6 s, plus deadline rescue (~1 RTT) |
 | per-connection HOL | all data on a subflow is one byte stream | one QUIC stream per (path, connection) |
-| CC | coupled (LIA/OLIA) Reno | BBR per path; paths found to share a bottleneck (correlated queueing delay) pace together at its capacity |
+| CC | coupled (LIA/OLIA) Reno | BBR per path, capped so that the paths' estimates add up to what the session delivers over all of them; optional configured up/down rates |
 | middleboxes | must pass TCP options | plain UDP; relays are stateless forwarders |
 
-The congestion controllers are coupled only where the paths are measured to
-share a bottleneck (see "Shared bottlenecks"). Coupled, the paths together
-take about what one BBR flow would there; independent paths keep their own
-controllers.
+The congestion controllers are coupled through the session rate (see
+"Session rate"): behind a common bottleneck the paths together take about
+what one BBR flow would; independent paths are not limited by it.
 
 ## Tuning
 
@@ -542,8 +612,12 @@ controllers.
   low RTT, see above), `cubic` (quic-go's built-in loss-based controller, for
   comparison only: it collapses under random loss and fills deep buffers).
 * `no_dup`: disables duplication if the relay traffic is metered.
-* `no_coupling`: disables shared-bottleneck coupling (see "Shared
-  bottlenecks"); each path then probes for its bottleneck on its own.
+* `up` / `down` (e.g. `"20mbit"`): this endpoint's uplink and downlink
+  rates, if known. Ceilings for what the session sends and receives over
+  all paths together (see "Session rate"); the rates are measured without
+  them.
+* `no_coupling`: turns the session rate off; each path then probes for its
+  bottleneck on its own.
 * `GOMAXPROCS` (environment): by default the local, remote and relay adapt
   the number of Go scheduler threads to the load (`internal/procs`). Each
   packet passes through several goroutines (socket reader, QUIC connection
@@ -559,18 +633,31 @@ controllers.
 
 ## Limitations / future work
 
-* Paths that are completely identical and independent (same delay and rate,
-  no jitter, started together, as only an emulator makes them) run their
-  BBR cycles in lockstep and can be coupled; that costs nothing measurable
-  (`independent-identical` in scripts/shared-bench.sh).
-* Shared-bottleneck detection needs a queue that varies by a millisecond or
-  more. Behind a policer, or a buffer so shallow that it drops before it
-  delays, paths that share a bottleneck aren't detected and behave as
-  uncoupled paths. Detection is RTT-based, so a queue in the ACK direction
-  (e.g. an upload saturating the receiver's uplink) correlates the paths too.
-  Coupling then costs little (the capacity follows what the group delivers
-  and is probed), and in the benchmark it helps the download, as it keeps
-  the upload's queue, which delays the ACKs, short.
+* The session rate treats all paths of a session alike. If only some of
+  them share a bottleneck while another has spare capacity of its own, the
+  pipe is rarely "full" for all of them at once, and the paths behind the
+  common bottleneck behave as uncoupled paths.
+* Independent paths with heavy random loss or outages look full together
+  now and then, and their estimates are then capped for 32 rounds although
+  nothing is shared: about 5–8% less bulk throughput than with
+  `no_coupling` in the benchmarks (docs/BENCHMARKS.md). If the paths are
+  known to be independent, `no_coupling` avoids that.
+* A policer is followed the way BBR follows one: by the highest of the
+  delivery rates it lets through, which is a few percent above its rate,
+  and by probes every 8 rounds. About 9% of the packets were dropped at a
+  50 Mbit/s policer (24% before the session rate; a variant that judged
+  loss directly got to 4%, but took a tenth of the throughput from paths
+  with random loss). A buffer of a few milliseconds behaves alike. With
+  `down` (or `up`) set below the policed rate nothing is dropped.
+* A session probe adds a quarter of a round of queue at a bottleneck that
+  is already full, for two rounds in ten: tens of milliseconds for the
+  other streams, which the paths' own probes cost before as well. With
+  `up` / `down` set there are no probes.
+* Queues are judged by round-trip times, which also grow with a queue in
+  the ACK direction (an upload filling the receiver's uplink while it
+  downloads). The session rate therefore never comes down for a queue
+  alone, and a queue that draining doesn't shrink is taken into the base
+  RTT; until then (a few rounds) the pipe may look full when it isn't.
 * A sudden rate drop still costs one window's worth of queue: what is already
   in flight (up to 2·BDP at the old rate) has to drain at the new rate before
   the queue is gone (~1 s for an 8× drop at 50 ms RTT), and smaller drops

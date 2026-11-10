@@ -486,8 +486,8 @@ func TestSimSharedBottleneck(t *testing.T) {
 // Three flows share a bottleneck (three paths of a session behind one
 // uplink). Uncoupled, each probes for the whole link and together they keep
 // its buffer full. With each estimate capped at a third of the link (what
-// mpquic's shared-bottleneck coupling converges to), they leave STARTUP at
-// their share and keep the queue short, at the same utilisation.
+// mpquic's session rate converges to), they leave STARTUP at their share
+// and keep the queue short, at the same utilisation.
 func TestSimRateCapSharedBottleneck(t *testing.T) {
 	run := func(capped bool) (float64, time.Duration, *Sender) {
 		cfg := simConfig{profile: ProfileStandard, duration: 15 * time.Second, rtt: 40 * time.Millisecond,
@@ -515,6 +515,37 @@ func TestSimRateCapSharedBottleneck(t *testing.T) {
 	}
 	if bw := s.BandwidthEstimate(); float64(bw) > mbit(20)+1 {
 		t.Errorf("estimate %.1f Mbit/s above the cap", float64(bw)*8/1e6)
+	}
+}
+
+// A capped flow sends at its cap and does not probe above it on its own
+// (the session probes on all capped paths at once, with RateGain): on a link
+// with room to spare, three flows capped at 20 Mbit/s deliver 60 Mbit/s with
+// gain 1 and a quarter more with gain 1.25.
+func TestSimRateGain(t *testing.T) {
+	run := func(gain float64) float64 {
+		r := runSim(simConfig{profile: ProfileStandard, duration: 12 * time.Second, rtt: 40 * time.Millisecond,
+			rate: func(time.Duration) float64 { return mbit(120) }, buffer: 100 * time.Millisecond, flows: 3,
+			setup: func(_ int, s *Sender) {
+				s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
+				s.RateGain = func() float64 { return gain }
+			}})
+		var u float64
+		for i := range 3 {
+			u += r.flowGoodput(i, 4*time.Second, 12*time.Second)
+		}
+		return u * 8 / 1e6
+	}
+	g1, g125, g0 := run(1), run(1.25), run(0)
+	t.Logf("goodput with gain 1: %.1f, 1.25: %.1f, unset: %.1f Mbit/s", g1, g125, g0)
+	if g1 < 57 || g1 > 61 {
+		t.Errorf("gain 1: %.1f Mbit/s, want the caps' 60 (no probing above a cap)", g1)
+	}
+	if g125 < 1.18*g1 || g125 > 1.3*g1 {
+		t.Errorf("gain 1.25: %.1f Mbit/s, want 1.25 times the %.1f with gain 1", g125, g1)
+	}
+	if g0 < 57 || g0 > 61 {
+		t.Errorf("gain unset: %.1f Mbit/s, want 60", g0)
 	}
 }
 

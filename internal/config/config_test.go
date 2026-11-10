@@ -108,3 +108,32 @@ func TestWireGuardConfig(t *testing.T) {
 		t.Fatal("Clone shares the WireGuard config")
 	}
 }
+
+func TestRates(t *testing.T) {
+	for in, want := range map[string]Rate{
+		"20mbit": 20e6, "100 Mbps": 100e6, "1.5g": 1.5e9, "500k": 500e3, "8000000": 8e6, "2.5mbit/s": 2.5e6, "64kbps": 64e3, "0": 0,
+	} {
+		if got, err := ParseRate(in); err != nil || got != want {
+			t.Errorf("ParseRate(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "fast", "-1mbit", "20mb/h"} {
+		if _, err := ParseRate(in); err == nil {
+			t.Errorf("ParseRate(%q): no error", in)
+		}
+	}
+	var c Config
+	if err := json.Unmarshal([]byte(`{"up": "20mbit", "down": 100000000}`), &c); err != nil || c.Up != 20e6 || c.Down != 100e6 {
+		t.Fatalf("up/down = %d/%d, %v", c.Up, c.Down, err)
+	}
+	if c.Up.BytesPerSecond() != 2500000 {
+		t.Fatalf("bytes/s = %d", c.Up.BytesPerSecond())
+	}
+	b, _ := json.Marshal(struct{ A, B, C Rate }{20e6, 1500, 2e9})
+	if string(b) != `{"A":"20mbit","B":1500,"C":"2gbit"}` {
+		t.Fatalf("marshal: %s", b)
+	}
+	if err := json.Unmarshal([]byte(`{"up": "lots"}`), &c); err == nil {
+		t.Fatal("bad rate accepted")
+	}
+}

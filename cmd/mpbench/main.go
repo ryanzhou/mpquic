@@ -49,7 +49,10 @@ var (
 	subset    = flag.String("subset", "", "also run with only these path indexes (e.g. 0,1) as a baseline")
 	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
 	mtu       = flag.Int("mtu", 0, "fixed path MTU (0: discover)")
-	shared    = flag.String("shared", "", "link spec of a bottleneck shared by all paths ('fwd|rev' for asymmetric), e.g. the endpoints' uplinks: fwd = local->remote, rev = remote->local")
+	shared    = flag.String("shared", "", "link spec of a bottleneck shared by all paths in front of the relays, i.e. the sending endpoint's uplink ('fwd|rev': fwd = the local's uplink, rev = the remote's uplink)")
+	maxUp     = flag.String("up", "", "the local's configured uplink rate (max_up), e.g. 20mbit")
+	maxDown   = flag.String("down", "", "the local's configured downlink rate (max_down), e.g. 100mbit")
+	sharedRx  = flag.String("shared-rx", "", "link spec of a bottleneck shared by all paths behind the relays, i.e. the receiving endpoint's downlink ('fwd|rev': fwd = the remote's downlink, rev = the local's downlink)")
 )
 
 func main() {
@@ -76,6 +79,22 @@ func main() {
 	// The QUIC listener is the remote normally and the local in reverse mode;
 	// the relays always forward to the listener.
 	lopt, dopt := *opt, *opt
+	// The local's known uplink / downlink rates (it is the dialer normally
+	// and the listener in reverse mode).
+	localOpt := &dopt
+	if *reverse {
+		localOpt = &lopt
+	}
+	for _, x := range []struct {
+		v   string
+		dst *uint64
+	}{{*maxUp, &localOpt.MaxSendRate}, {*maxDown, &localOpt.MaxRecvRate}} {
+		if x.v != "" {
+			sp, err := linkem.ParseSpec("rate=" + x.v)
+			check(err)
+			*x.dst = uint64(sp.Rate)
+		}
+	}
 	if *reverse {
 		lopt.SingleSession = true
 		dopt.StreamHandler = proxy.RemoteHandler(log, proxy.RemoteOptions{DialTimeout: 5 * time.Second})
@@ -92,9 +111,12 @@ func main() {
 	go srv.Serve(udp)
 
 	var relays []*linkem.Relay
-	var sharedFwd, sharedRev *linkem.Link
-	if *shared != "" {
-		f, r, _ := strings.Cut(*shared, "|")
+	var sharedFwd, sharedRev, sharedFwdOut, sharedRevOut *linkem.Link
+	parseShared := func(spec, what string, seed int64) (*linkem.Link, *linkem.Link) {
+		if spec == "" {
+			return nil, nil
+		}
+		f, r, _ := strings.Cut(spec, "|")
 		if r == "" {
 			r = f
 		}
@@ -102,9 +124,11 @@ func main() {
 		check(err)
 		rs, err := linkem.ParseSpec(r)
 		check(err)
-		sharedFwd, sharedRev = linkem.NewLink(fs, 7), linkem.NewLink(rs, 8)
-		fmt.Printf("shared bottleneck: fwd[%s] rev[%s]\n", fs, rs)
+		fmt.Printf("shared bottleneck %s: fwd[%s] rev[%s]\n", what, fs, rs)
+		return linkem.NewLink(fs, seed), linkem.NewLink(rs, seed+1)
 	}
+	sharedFwd, sharedRev = parseShared(*shared, "before the relays (sender's uplink)", 7)
+	sharedFwdOut, sharedRevOut = parseShared(*sharedRx, "behind the relays (receiver's downlink)", 9)
 	for _, p := range paths {
 		f, r, _ := strings.Cut(p, "|")
 		if r == "" {
@@ -118,6 +142,7 @@ func main() {
 		check(err)
 		rl.Log = log
 		rl.SharedFwd, rl.SharedRev = sharedFwd, sharedRev
+		rl.SharedFwdOut, rl.SharedRevOut = sharedFwdOut, sharedRevOut
 		go rl.Serve()
 		relays = append(relays, rl)
 		fmt.Printf("path %d: fwd[%s] rev[%s]\n", len(relays)-1, fs, rs)
@@ -156,7 +181,7 @@ func main() {
 		check(err)
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		check(err)
-		b := &bench{relays: relays, idx: run.idx, sharedFwd: sharedFwd, sharedRev: sharedRev}
+		b := &bench{relays: relays, idx: run.idx, sharedFwd: sharedFwd, sharedRev: sharedRev, sharedFwdOut: sharedFwdOut, sharedRevOut: sharedRevOut}
 		var opener proxy.Opener = cl
 		b.local = cl.Session
 		b.remote = func() []mp.PathStat {
@@ -329,8 +354,41 @@ type bench struct {
 	local  func() *mp.Session   // the local (SOCKS/tunnel) side's session
 	remote func() []mp.PathStat // the remote side's path stats
 
-	sharedFwd, sharedRev *linkem.Link // shared bottleneck, if any
+	// shared bottlenecks, if any: in front of the relays (the sender's
+	// uplink) and behind them (the receiver's downlink)
+	sharedFwd, sharedRev, sharedFwdOut, sharedRevOut *linkem.Link
 }
+
+// hop counts the bytes that entered and were dropped at one stage of the
+// data direction (upload: local -> remote).
+type hop struct{ in, drop uint64 }
+
+func linkHop(l *linkem.Link) hop {
+	if l == nil {
+		return hop{}
+	}
+	p, d := l.Bytes()
+	return hop{p + d, d}
+}
+
+// hops returns the byte counters of the sender's uplink, the relays (all of
+// them together) and the receiver's downlink.
+func (b *bench) hops(upload bool) (up, relay, down hop) {
+	for _, r := range b.relays {
+		l := r.Rev
+		if upload {
+			l = r.Fwd
+		}
+		h := linkHop(l)
+		relay.in, relay.drop = relay.in+h.in, relay.drop+h.drop
+	}
+	if upload {
+		return linkHop(b.sharedFwd), relay, linkHop(b.sharedFwdOut)
+	}
+	return linkHop(b.sharedRev), relay, linkHop(b.sharedRevOut)
+}
+
+func (h hop) sub(o hop) hop { return hop{h.in - o.in, h.drop - o.drop} }
 
 type wireStat struct{ sent, lost, reinj, dup uint64 }
 
@@ -509,6 +567,9 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 	if shl != nil {
 		shPass0, shDrop0 = shl.Counters()
 	}
+	up0, relay0, down0 := b.hops(cmd == 'R')
+	_, back0, _ := b.hops(cmd != 'R') // the other direction: acknowledgements
+	var est []float64                 // the sender's bandwidth estimates added up, every 100 ms after the warm-up
 	start := time.Now()
 	var samples []float64
 	var fine []float64 // 100 ms buckets after the 2 s warm-up, for jitter
@@ -532,6 +593,13 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		if now.Sub(lastFineAt) >= 100*time.Millisecond {
 			if now.Sub(start) > 2*time.Second {
 				fine = append(fine, mbps(cur-lastFine, now.Sub(lastFineAt)))
+				var sum uint64
+				for _, st := range sender() {
+					if st.State == "active" {
+						sum += st.Bandwidth
+					}
+				}
+				est = append(est, float64(sum)*8/1e6)
 			}
 			lastFine, lastFineAt = cur, now
 		}
@@ -547,6 +615,9 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		shPass, shDrop = shl.Counters()
 		shPass, shDrop = shPass-shPass0, shDrop-shDrop0
 	}
+	up1, relay1, down1 := b.hops(cmd == 'R')
+	_, back1, _ := b.hops(cmd != 'R')
+	senderEnd := sender()
 	el := time.Since(start)
 	close(stop)
 	probe.Close()
@@ -580,6 +651,34 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 			line += fmt.Sprintf(" shared-link drops=%d (%.2f%%)", shDrop, float64(shDrop)/float64(max(shPass+shDrop, 1))*100)
 		}
 		fmt.Println(line)
+	}
+	// What the relays carried for that goodput (UDP payload bytes arriving
+	// at them, as an interface counter on a relay would show), and where
+	// packets were dropped. Everything dropped behind the relays, and every
+	// copy, is relay traffic that bought nothing.
+	if got > 0 {
+		up, relay, down := up1.sub(up0), relay1.sub(relay0), down1.sub(down0)
+		pc := func(h hop) float64 { return float64(h.drop) / float64(max(h.in, 1)) * 100 }
+		fmt.Printf("relays   carried %dMB for %dMB goodput (+%.1f%%); dropped: uplink %.2f%% relays %.2f%% downlink %.2f%%\n", relay.in>>20, got>>20,
+			(float64(relay.in)/float64(got)-1)*100, pc(up), pc(relay), pc(down))
+		// The other direction: acknowledgements (QUIC's and the session's),
+		// and whatever else runs there. On an asymmetric line they compete
+		// for the slower direction.
+		back := back1.sub(back0)
+		fmt.Printf("reverse  direction carried %.2f Mbit/s (%.1f%% of the goodput)\n", mbps(int64(back.in), el), float64(back.in)/float64(got)*100)
+	}
+	if len(est) > 0 {
+		sort.Float64s(est)
+		var per []string
+		for _, st := range senderEnd {
+			x := fmt.Sprintf("%.1f", float64(st.Bandwidth)*8/1e6)
+			if st.SharedCap > 0 {
+				x += "*"
+			}
+			per = append(per, x)
+		}
+		fmt.Printf("estimate sender's sum of path estimates: p10=%.1f p50=%.1f p90=%.1f max=%.1f Mbit/s (at the end: %s; *: capped) goodput %.1f\n",
+			est[len(est)/10], est[len(est)/2], est[len(est)*9/10], est[len(est)-1], strings.Join(per, " + "), ss)
 	}
 	if len(loaded) > 0 && len(idle) > 0 {
 		fmt.Printf("loaded   echo 100B during %s x%d: %s idle_p50=%v\n", name, len(loaded), fmtLat(loaded),

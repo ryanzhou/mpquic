@@ -122,7 +122,9 @@ mpquic options:
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths
-  --no-coupling     do not couple paths that share a bottleneck (e.g. an uplink)
+  --up RATE         this endpoint's uplink rate, if known (e.g. 20mbit): never send more
+  --down RATE       this endpoint's downlink rate (e.g. 100mbit): the peer never sends more
+  --no-coupling     do not rate-control the paths together (each path on its own)
   --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
                     size, no MTU discovery (default: start at 1200-byte
                     packets and discover each path's MTU)
@@ -175,6 +177,7 @@ type commonFlags struct {
 	verbose, noDup, race       bool
 	reliableUDP                bool
 	noCoupling                 bool
+	up, down                   string
 	cert, key, sni, logLevel   string
 	plugin                     string
 	udp, udpOnly, reverse      bool
@@ -206,7 +209,9 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
 	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
-	fs.BoolVar(&f.noCoupling, "no-coupling", false, "disable shared-bottleneck coupling of paths")
+	fs.BoolVar(&f.noCoupling, "no-coupling", false, "do not rate-control the paths together")
+	fs.StringVar(&f.up, "up", "", "uplink rate of this endpoint (e.g. 20mbit)")
+	fs.StringVar(&f.down, "down", "", "downlink rate of this endpoint (e.g. 100mbit)")
 	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")
 	fs.BoolVar(&f.reliableUDP, "reliable-udp", false, "relay UDP over streams (local/tunnel)")
 	fs.StringVar(&f.cert, "cert", "", "TLS certificate")
@@ -308,6 +313,18 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.noCoupling {
 		cfg.NoCoupling = true
+	}
+	for _, x := range []struct {
+		v   string
+		dst *config.Rate
+	}{{f.up, &cfg.Up}, {f.down, &cfg.Down}} {
+		if x.v != "" {
+			r, err := config.ParseRate(x.v)
+			if err != nil {
+				return nil, err
+			}
+			*x.dst = r
+		}
 	}
 	if f.race {
 		cfg.RaceConnect = true
