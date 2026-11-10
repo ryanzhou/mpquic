@@ -96,13 +96,16 @@ for i in range(3):
     sys.exit(0 if r == d and a[0] == host else "bad reply from %s" % (a,))
 sys.exit("no reply")
 PY
-bg $WAN python3 -m http.server -d "$T" -b ${V6:+::}${V6:-0.0.0.0} 8080 >/dev/null 2>&1
+BIND=0.0.0.0; [ -z "$V6" ] || BIND=:: # "::" also accepts IPv4
+bg $WAN python3 -m http.server -d "$T" -b $BIND 8080 >"$T/http.log" 2>&1
 bg $WAN python3 "$T/udpecho.py" 10.88.0.1
 bg $WAN python3 "$T/dns.py"
 mkdir -p /etc/netns/$RT; echo "nameserver 10.89.0.1" >/etc/netns/$RT/resolv.conf
 v6 bg $WAN python3 "$T/udpecho.py" fd88::1
 bg $WAN "$B" remote -s 10.89.0.1 -p 8388 -k test -u --log-level warn
-for _ in $(seq 100); do in_ $WAN curl -s --noproxy '*' -m 1 -o /dev/null http://10.88.0.1:8080/ && break; sleep 0.1; done
+up=
+for _ in $(seq 100); do in_ $WAN curl -s --noproxy '*' -m 1 -o /dev/null http://10.88.0.1:8080/ && { up=1; break; }; sleep 0.1; done
+[ -n "$up" ] || { echo "FAIL  the test's HTTP server did not come up"; cat "$T/http.log"; exit 1; }
 
 traffic() { # namespace label
   local n=$1 l=$2
