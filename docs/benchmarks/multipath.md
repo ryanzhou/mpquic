@@ -1,4 +1,4 @@
-# Benchmarks
+# Multipath benchmarks
 
 All numbers come from `scripts/bench-matrix.sh`, which runs `mpbench`. Each
 run is a complete in-process testbed on one Linux host (8 cores): a target
@@ -106,7 +106,7 @@ drops out or collapses. A very thin path can cost tail latency under load.
 Afterwards the session settles back, much as MPTCP does after a link change.
 No path is excluded by rule. Echo under load (p99) is ~47 ms; before the
 bufferbloat fixes in the congestion controller it was ~120 ms (see
-docs/CONGESTION.md).
+[congestion-control.md](congestion-control.md)).
 
 Four lossy paths only (`scripts/lossy-bench.sh`: 20 ms/20%, 30 ms/10%,
 40 ms/5%, 60 ms/1% loss, 50 Mbit/s each): about 145–150 Mbit/s download and
@@ -122,8 +122,9 @@ control plane moved to datagrams, this setup produced frequent false
 crossed the relays). The relays themselves are not limited unless noted;
 their RTTs are 20/50/80 ms. **before** is the previous release (pairwise
 shared-bottleneck detection); **after** is the session rate, the ACK pacing
-and the rate-sized chunks described in docs/DESIGN.md ("Session rate",
-"Receive side"). Single 12 s runs, so differences of a few percent mean
+and the rate-sized chunks described in the design
+([session rate](../design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow),
+[receive side](../design/session.md#receive-side)). Single 12 s runs, so differences of a few percent mean
 little.
 
 * **relays carried**: UDP payload arriving at the relays, over the goodput.
@@ -215,7 +216,7 @@ What the numbers say:
   9% of the packets are still dropped at the policer (24% before) and 2%
   at a 10–15 ms buffer (4–14% before). The session follows such a
   bottleneck as BBR does, by the highest rate it lets through and by
-  probing. See docs/DESIGN.md, "Limitations".
+  probing. See [limitations](../design/congestion.md#limitations).
 * **Known rates.** With `--up` / `--down` a little below the line's rates
   there is nothing to probe: 0.5% dropped at the policer (relays +4.7%),
   echo p90 38 ms with both directions loaded.
@@ -265,7 +266,7 @@ What the numbers say:
 * **Under full load**, interactive latency rises by only 4–14 ms over the
   idle echo (equal: 27 vs 22 ms, three-paths: 25 vs 18 ms). It used to
   double: stock BBRv1 kept a standing queue of one BDP on a saturated
-  bottleneck. See docs/CONGESTION.md.
+  bottleneck. See [congestion-control.md](congestion-control.md).
 
 ## CPU
 
@@ -281,7 +282,7 @@ downloading through SOCKS5 (one stream unless noted). CPU is measured over
 6 s after a 3 s warm-up, 100% = one core; the relay column is the first
 (emulating) relay. Average of 2 runs, Ryzen 7 5700X, all processes on one
 8-core host. "before" is commit 93843ef, "after" adds the GOMAXPROCS
-governor (`internal/procs`, see docs/DESIGN.md, "Tuning"), a pass-through
+governor (`internal/procs`, see [threads](../design/README.md#threads)), a pass-through
 fast path in the relay, and cheaper reinjection-queue and datagram-ACK
 bookkeeping:
 

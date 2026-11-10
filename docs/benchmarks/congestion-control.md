@@ -1,7 +1,7 @@
-# Congestion control
+# Congestion control benchmarks
 
 Each path runs its own BBRv1 sender (vendored from Hysteria, with mpquic's
-changes described in [DESIGN.md](DESIGN.md#congestion-control)). This page
+changes described in [design/congestion.md](../design/congestion.md#per-path-bbr)). This page
 measures it: **one bulk stream over one emulated path at 150 ms RTT** (75 ms
 each way), produced by `scripts/cc-bench.py`. It runs `mpbench` with a single
 `internal/linkem` path (the same impairment in both directions), 15 s per run.
@@ -35,7 +35,7 @@ however deep the bottleneck buffer; CUBIC fills the buffer (+250–500 ms with
 ## Bufferbloat: before and after
 
 Stock BBRv1 (mpquic ≤ v0.1.0) had three problems with queues, fixed in the
-default profile (details in [DESIGN.md](DESIGN.md#congestion-control)):
+default profile (details in [design/congestion.md](../design/congestion.md#per-path-bbr)):
 
 1. **A standing queue of one BDP** on a saturated path: the 0.75 drain phase
    ended after one min RTT whether or not the queue was gone, so BBR ended up
@@ -64,7 +64,7 @@ rate changes every 3 s at 150 ms RTT (20 RTTs per phase), each 8× drop still
 leaves a full window at the old rate to drain, which dominates p90: what was
 in flight cannot be recalled. On shorter RTTs the gain is much larger, e.g.
 a 50 ms RTT, 20 Mbit/s path with a 500 ms buffer: echo under load 105 → 59 ms
-(idle 52 ms). In the multipath benchmarks (docs/BENCHMARKS.md) echo under
+(idle 52 ms). In the [multipath benchmarks](multipath.md) echo under
 load dropped from ~2× the best path's RTT to +4–14 ms.
 
 ### Simulator
@@ -195,8 +195,9 @@ RTTs. A slow consumer (for example a slow SOCKS client) therefore stays at
 * **Paths behind a common bottleneck** (an endpoint's uplink or downlink)
   are rate-controlled as one flow: the paths' estimates are capped so that
   they add up to what the session delivers over all of them, instead of
-  each path probing for the whole bottleneck. See docs/DESIGN.md, "Session
-  rate", and docs/BENCHMARKS.md.
+  each path probing for the whole bottleneck. See the
+  [session rate](../design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow) and
+  [multipath.md](multipath.md#common-bottlenecks-an-endpoints-line-is-slower-than-the-relays).
 
 Reproduce: `scripts/cc-bench.py [--rtt 150] [--suite bandwidth,window,loss,burst,buffer,jitter,bloat]`,
 and `go test -v -run TestSim ./internal/cc/bbr/` for the simulator.
