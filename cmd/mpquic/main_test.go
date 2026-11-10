@@ -32,3 +32,22 @@ func TestWireGuardFlags(t *testing.T) {
 		t.Fatalf("plain local: %+v %v", cfg, err)
 	}
 }
+
+func TestTUNFlags(t *testing.T) {
+	cfg, err := parseRole("local", []string{"-s", "h:1", "-k", "pw", "--no-socks", "--tun", "mpq0", "--tun-mtu", "1400",
+		"--tun-addr", "10.99.0.1/24", "--tun-addr", "fd99::1/64", "--tun-route", "10.0.0.0/8", "--fwmark", "0x4d51"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &config.TUNConfig{Name: "mpq0", MTU: 1400, Addresses: config.StringList{"10.99.0.1/24", "fd99::1/64"}, Routes: config.StringList{"10.0.0.0/8"}}
+	if !reflect.DeepEqual(cfg.TUN, want) || cfg.FWMark != 0x4d51 {
+		t.Fatalf("got %+v fwmark %#x", cfg.TUN, cfg.FWMark)
+	}
+	if _, err := parseRole("local", []string{"-s", "h:1", "-k", "pw", "--fwmark", "blue"}); err == nil {
+		t.Fatal("--fwmark blue accepted")
+	}
+	cfg, err = parseRole("local", []string{"-s", "h:1", "-k", "pw"})
+	if err != nil || cfg.TUN != nil || cfg.FWMark != 0 {
+		t.Fatalf("plain local: %+v %v", cfg, err)
+	}
+}

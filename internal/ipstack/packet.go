@@ -1,4 +1,4 @@
-package wg
+package ipstack
 
 import (
 	"encoding/binary"

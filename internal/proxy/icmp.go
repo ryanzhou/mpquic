@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -17,7 +18,7 @@ import (
 	"mpquic/internal/mp"
 )
 
-// ICMP echo (ping) relaying, used by the WireGuard front-end. Echo requests
+// ICMP echo (ping) relaying, used by the packet front-ends (WireGuard, TUN). Echo requests
 // and replies travel as datagrams on the reserved association 0:
 //
 //	0:varint  ATYP IP PORT(=0)  flow:u16  seq:u16  data
@@ -35,6 +36,29 @@ const (
 	icmpAssoc = 0
 	icmpIdle  = time.Minute
 )
+
+// EchoFlows is the number of echo flow ids of one receiver of echo replies.
+const EchoFlows = 1 << 12
+
+// EchoReceiver registers recv for the body of the ICMP echo datagrams from
+// the remote that belong to its flows: the EchoFlows flow ids from base.
+// Several front-ends (the WireGuard listener, the TUN device) can so relay
+// pings over one session. release ends the registration.
+func (u *UDPLocal) EchoReceiver(recv func(b []byte)) (base uint16, release func(), err error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for i := range u.echo {
+		if u.echo[i] == nil {
+			u.echo[i] = recv
+			return uint16(i * EchoFlows), func() {
+				u.mu.Lock()
+				u.echo[i] = nil
+				u.mu.Unlock()
+			}, nil
+		}
+	}
+	return 0, nil, errors.New("too many receivers of ICMP echo replies")
+}
 
 // AppendEcho appends an ICMP echo datagram to b. hdrLen is the length of
 // everything before data.

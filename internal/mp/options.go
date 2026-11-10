@@ -2,12 +2,17 @@ package mp
 
 import (
 	"log/slog"
+	"syscall"
 	"time"
 )
 
 // Options configure both ends of a multipath session.
 type Options struct {
 	Password string
+	// Control, if set, is called on every socket of the multipath
+	// connection before it is used (the UDP sockets of the paths, and the
+	// DNS queries for the servers' names), e.g. to set a firewall mark.
+	Control func(network, address string, c syscall.RawConn) error
 	// Window is the maximum per-stream flow-control / reorder window in
 	// bytes. Each stream starts at 8 MB and auto-tunes up to Window when the
 	// window limits throughput. A single stream's rate is bounded by about

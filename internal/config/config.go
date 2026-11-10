@@ -65,11 +65,30 @@ type Config struct {
 	ReliableUDP bool          `json:"reliable_udp,omitempty"`
 	Relays      []RelayConfig `json:"relays,omitempty"`
 	// NoSOCKS (local role) disables the SOCKS5 listener, e.g. to serve
-	// only WireGuard.
+	// only WireGuard or the TUN interface.
 	NoSOCKS bool `json:"no_socks,omitempty"`
+	// TUN (local role), if set, creates a TUN network interface whose
+	// traffic is proxied transparently.
+	TUN *TUNConfig `json:"tun,omitempty"`
+	// FWMark (Linux) is the firewall mark of the sockets of the multipath
+	// connection, for routing rules that keep them out of the TUN
+	// interface.
+	FWMark uint32 `json:"fwmark,omitempty"`
 	// WireGuard (local role), if set, runs a userspace WireGuard server
 	// whose peers' traffic is proxied transparently.
 	WireGuard *WireGuardConfig `json:"wireguard,omitempty"`
+}
+
+// TUNConfig configures the TUN interface of the local role.
+type TUNConfig struct {
+	// Name of the interface (default: mpquic0; macOS: utun, the system
+	// chooses the number).
+	Name string `json:"name,omitempty"`
+	MTU  int    `json:"mtu,omitempty"` // interface MTU (default 1500)
+	// Addresses ("ADDR/BITS") to assign to the interface.
+	Addresses StringList `json:"addresses,omitempty"`
+	// Routes ("ADDR/BITS") to add through the interface.
+	Routes StringList `json:"routes,omitempty"`
 }
 
 // DefaultWireGuardPort is the default WireGuard listen port.
@@ -317,6 +336,12 @@ func (c *Config) Clone() *Config {
 	n.Server = append(StringList(nil), c.Server...)
 	n.Servers = append([]ServerEntry(nil), c.Servers...)
 	n.Relays = append([]RelayConfig(nil), c.Relays...)
+	if c.TUN != nil {
+		t := *c.TUN
+		t.Addresses = append(StringList(nil), c.TUN.Addresses...)
+		t.Routes = append(StringList(nil), c.TUN.Routes...)
+		n.TUN = &t
+	}
 	if c.WireGuard != nil {
 		w := *c.WireGuard
 		w.Peers = nil

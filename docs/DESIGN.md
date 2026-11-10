@@ -138,14 +138,30 @@ Two more datagram forms share that format:
   raw socket with an identifier per flow. An older remote would send it as
   UDP to port 0, which the OS rejects.
 
-The WireGuard listener (`internal/wg`) runs wireguard-go over a gVisor
-network stack in promiscuous mode with spoofing, so it accepts TCP
+The packet front-ends, the WireGuard listener (`internal/wg`, wireguard-go)
+and the TUN interface (`internal/tundev`, an interface of the operating
+system), hand their clients' IP packets to the same thing (`internal/ipstack`):
+a gVisor network stack in promiscuous mode with spoofing, so it accepts TCP
 connections to any address and replies as that address. TCP SYNs go to a
 forwarder that opens a stream (address first, as above) and then completes
 the handshake. UDP and ICMP bypass gVisor's sockets: UDP is taken from the
 stack after IP reassembly, one association per client socket; echo requests
 are intercepted before the stack (which would otherwise answer them itself);
 replies are built as raw IP packets, fragmented to the interface MTU.
+Each front-end has a stack of its own and a range of 4096 echo flow ids, by
+which the replies find their front-end.
+
+The TUN interface is the same data path minus WireGuard: a read loop injects
+what the system routes to the interface, a write loop returns the stack's
+packets in batches. On Linux the device is opened with a virtio-net header
+(wireguard-go's `tun` package), so the kernel hands over TCP in segments of
+up to 64 KB, which are split for the stack, and consecutive segments of a
+flow in a batch are coalesced on the way back (GSO/GRO): one system call
+moves many packets. mpquic configures only what goes away with the
+interface (addresses, link state, routes through it). Keeping the paths' own
+QUIC packets out of the interface is routing policy and left to the caller:
+`fwmark` marks the path sockets (`SO_MARK`) and the DNS lookups of the
+servers' names, for a rule such as wg-quick's `not fwmark … table …`.
 
 ### Packet sizes (MTU)
 

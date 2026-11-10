@@ -137,3 +137,22 @@ func TestRates(t *testing.T) {
 		t.Fatal("bad rate accepted")
 	}
 }
+
+func TestTUNConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	os.WriteFile(path, []byte(`{"server":"h","password":"p","no_socks":true,"fwmark":19793,
+		"tun":{"name":"mpq0","mtu":1400,"addresses":"10.99.0.1/24","routes":["10.0.0.0/8","fd00::/8"]}}`), 0o600)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.FWMark != 0x4d51 || c.TUN == nil || c.TUN.Name != "mpq0" || c.TUN.MTU != 1400 ||
+		len(c.TUN.Addresses) != 1 || c.TUN.Addresses[0] != "10.99.0.1/24" || len(c.TUN.Routes) != 2 {
+		t.Fatalf("%+v %+v", c, c.TUN)
+	}
+	n := c.Clone()
+	n.TUN.Routes[0], n.TUN.Addresses[0], n.TUN.Name = "x", "x", "x"
+	if c.TUN.Routes[0] != "10.0.0.0/8" || c.TUN.Addresses[0] != "10.99.0.1/24" || c.TUN.Name != "mpq0" {
+		t.Fatal("Clone shares the TUN config")
+	}
+}

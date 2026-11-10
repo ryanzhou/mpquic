@@ -97,7 +97,7 @@ func (c *Client) dialLoop(index uint64, addr string) {
 }
 
 func (c *Client) runPath(index uint64, addr string) error {
-	raddr, err := net.ResolveUDPAddr("udp", addr)
+	raddr, err := c.opt.resolveUDP(c.sess.ctx, addr)
 	if err != nil {
 		return err
 	}
@@ -105,7 +105,7 @@ func (c *Client) runPath(index uint64, addr string) error {
 	if raddr.IP.To4() == nil {
 		network = "udp6"
 	}
-	udp, err := net.ListenUDP(network, nil)
+	udp, err := c.opt.listenUDP(c.sess.ctx, network, "")
 	if err != nil {
 		return err
 	}
@@ -222,7 +222,7 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return err
 	}
-	udp, err := net.ListenUDP("udp", ua)
+	udp, err := s.opt.listenUDP(context.Background(), "udp", ua.String())
 	if err != nil {
 		return err
 	}

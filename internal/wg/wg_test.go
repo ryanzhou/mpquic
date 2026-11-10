@@ -40,7 +40,7 @@ func tlog() *slog.Logger {
 
 // hostIP returns a non-loopback IPv4 address of this host: the peers'
 // netstacks do not route loopback addresses into the tunnel.
-func hostIP(t *testing.T) netip.Addr {
+func hostIP(t testing.TB) netip.Addr {
 	addrs, _ := net.InterfaceAddrs()
 	for _, a := range addrs {
 		if n, ok := a.(*net.IPNet); ok {
@@ -143,7 +143,7 @@ func setupPing(t *testing.T, udpOn bool, listen func(string, string) (net.Packet
 
 // setupPeers starts the environment with n WireGuard peers; peer i has the
 // tunnel address 10.77.0.(2+i).
-func setupPeers(t *testing.T, udpOn, reliable bool, listen func(string, string) (net.PacketConn, error), n int) *testEnv {
+func setupPeers(t testing.TB, udpOn, reliable bool, listen func(string, string) (net.PacketConn, error), n int) *testEnv {
 	t.Helper()
 	log := tlog()
 	host := hostIP(t)
@@ -258,11 +258,11 @@ func setupPeers(t *testing.T, udpOn, reliable bool, listen func(string, string) 
 }
 
 // disableRACK gives a client stack the server's loss recovery (see
-// newNetTun): with gVisor's default RACK, a client whose burst of data was
+// ipstack.New): with gVisor's default RACK, a client whose burst of data was
 // lost (the server's UDP socket overflowing, likely with several peers on a
 // slow machine) recovered at one or two segments per 200 ms and timed out.
 // wireguard-go's netstack does not expose its gVisor stack.
-func disableRACK(t *testing.T, n *netstack.Net) {
+func disableRACK(t testing.TB, n *netstack.Net) {
 	t.Helper()
 	f := reflect.ValueOf(n).Elem().FieldByName("stack")
 	if !f.IsValid() {
@@ -272,21 +272,6 @@ func disableRACK(t *testing.T, n *netstack.Net) {
 	opt := tcpip.TCPRecovery(0)
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestServerLossRecovery(t *testing.T) {
-	nt, err := newNetTun(DefaultMTU, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer nt.Close()
-	var rec tcpip.TCPRecovery
-	if err := nt.stack.TransportProtocolOption(tcp.ProtocolNumber, &rec); err != nil {
-		t.Fatal(err)
-	}
-	if rec != 0 {
-		t.Fatalf("TCP recovery %v, want 0 (classic SACK recovery, not RACK)", rec)
 	}
 }
 
@@ -309,7 +294,7 @@ func TestTCPPeers(t *testing.T) {
 	wg.Wait()
 }
 
-func tcpEcho(t *testing.T, tnet *netstack.Net, target netip.AddrPort, size int) {
+func tcpEcho(t testing.TB, tnet *netstack.Net, target netip.AddrPort, size int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	c, err := tnet.DialContextTCPAddrPort(ctx, target)
@@ -486,5 +471,18 @@ func ping(t *testing.T, e *testEnv, target netip.Addr, id int) {
 			t.Errorf("no echo reply from %v for seq %d", target, seq)
 			return
 		}
+	}
+}
+
+// BenchmarkTCP echoes data through a WireGuard peer (both directions at
+// once); compare with the same benchmark of package tundev, which has no
+// WireGuard in the way.
+func BenchmarkTCP(b *testing.B) {
+	e := setupPeers(b, false, false, dgramPing, 1)
+	const size = 8 << 20
+	b.SetBytes(2 * size)
+	b.ResetTimer()
+	for range b.N {
+		tcpEcho(b, e.tnet, e.tcpEcho, size)
 	}
 }

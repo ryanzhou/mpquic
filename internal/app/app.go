@@ -20,6 +20,7 @@ import (
 	"mpquic/internal/mp"
 	"mpquic/internal/procs"
 	"mpquic/internal/proxy"
+	"mpquic/internal/tundev"
 	"mpquic/internal/wg"
 )
 
@@ -121,6 +122,12 @@ func Validate(role string, cfg *config.Config) error {
 	if r != "local" && cfg.WireGuard != nil {
 		return errors.New("the WireGuard listener (--wg-*) is only available in local mode")
 	}
+	if r != "local" && cfg.TUN != nil {
+		return errors.New("the TUN interface (--tun) is only available in local mode")
+	}
+	if cfg.FWMark != 0 && socketMark(cfg.FWMark) == nil {
+		return errors.New("--fwmark is only available on Linux")
+	}
 	if cfg.ReliableUDP {
 		if r != "local" && r != "tunnel" {
 			return errors.New("--reliable-udp applies to local and tunnel modes (the remote accepts both kinds of UDP relaying)")
@@ -133,8 +140,14 @@ func Validate(role string, cfg *config.Config) error {
 		return errors.New("--no-socks applies to local mode only")
 	}
 	if r == "local" {
-		if cfg.NoSOCKS && cfg.WireGuard == nil {
-			return errors.New("--no-socks leaves no listener: enable WireGuard (--wg-listen) or drop --no-socks")
+		if cfg.NoSOCKS && cfg.WireGuard == nil && cfg.TUN == nil {
+			return errors.New("--no-socks leaves no listener: enable the TUN interface (--tun) or WireGuard (--wg-listen), or drop --no-socks")
+		}
+		if cfg.TUN != nil {
+			o := tunOptions(cfg)
+			if err := o.Check(); err != nil {
+				return err
+			}
 		}
 		if cfg.WireGuard != nil {
 			o := wgOptions(cfg)
@@ -208,6 +221,7 @@ func options(cfg *config.Config, log *slog.Logger) *mp.Options {
 		MaxSendRate:   cfg.Up.BytesPerSecond(),
 		MaxRecvRate:   cfg.Down.BytesPerSecond(),
 		MTU:           cfg.MTU,
+		Control:       socketMark(cfg.FWMark),
 		CertFile:      cfg.Cert,
 		KeyFile:       cfg.Key,
 		SNI:           cfg.SNI,
@@ -236,7 +250,7 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 		udp.Reliable = cfg.ReliableUDP
 		opt.DatagramHandler = udp.HandleDatagram
 	}
-	errc := make(chan error, 2+len(cfg.Server)) // listeners + QUIC binds
+	errc := make(chan error, 3+len(cfg.Server)) // listeners + TUN + QUIC binds
 	var opener proxy.Opener
 	var shutdown func()
 	var pathDesc string
@@ -334,7 +348,31 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 			log.Warn("UDP relaying is off: WireGuard peers get no UDP (including DNS) and no ping; enable it with -u (on both ends)")
 		}
 	}
-	log.Info("mpquic local started", "version", Version, "listen", what, "wireguard", wgs != nil, "udp", udp != nil, "reliable_udp", udp != nil && udp.Reliable, "paths", pathDesc)
+	var tund *tundev.Device
+	if cfg.TUN != nil {
+		o := tunOptions(cfg)
+		o.Opener, o.UDP, o.Log = opener, udp, log
+		var err error
+		tund, err = tundev.Start(o)
+		if err != nil {
+			closeListeners()
+			if wgs != nil {
+				wgs.Close()
+			}
+			shutdown()
+			return err
+		}
+		log.Info("tun interface started", "interface", tund.Name(), "mtu", tund.MTU(), "addresses", strings.Join(o.Addresses, ","), "routes", strings.Join(o.Routes, ","), "udp_and_ping", udp != nil)
+		if udp == nil {
+			log.Warn("UDP relaying is off: the TUN interface carries no UDP (including DNS) and no ping; enable it with -u (on both ends)")
+		}
+		go func() {
+			if err := tund.Wait(); err != nil {
+				errc <- err
+			}
+		}()
+	}
+	log.Info("mpquic local started", "version", Version, "listen", what, "wireguard", wgs != nil, "tun", tund != nil, "udp", udp != nil, "reliable_udp", udp != nil && udp.Reliable, "paths", pathDesc)
 	var err error
 	select {
 	case <-ctx.Done():
@@ -344,8 +382,17 @@ func runLocal(ctx context.Context, mode string, cfg *config.Config, log *slog.Lo
 	if wgs != nil {
 		wgs.Close()
 	}
+	if tund != nil {
+		tund.Close()
+	}
 	shutdown()
 	return err
+}
+
+// tunOptions converts the TUN config (cfg.TUN must be set).
+func tunOptions(cfg *config.Config) tundev.Options {
+	t := cfg.TUN
+	return tundev.Options{Name: strings.TrimSpace(t.Name), MTU: t.MTU, Addresses: t.Addresses, Routes: t.Routes}
 }
 
 // wgOptions converts the WireGuard config (cfg.WireGuard must be set).

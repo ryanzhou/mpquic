@@ -1,0 +1,14 @@
+{
+  "server": ["203.0.113.10", "relay-a.example.net:9000", "relay-b.example.net:9000"],
+  "server_port": 8388,
+  "password": "change-me",
+  "mode": "tcp_and_udp",
+  "no_socks": true,
+  "fwmark": 19793,
+  "tun": {
+    "name": "mpquic0",
+    "mtu": 1500,
+    "addresses": ["10.99.0.1/24", "fd99::1/64"],
+    "routes": ["10.0.0.0/8"]
+  }
+}
