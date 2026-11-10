@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -141,10 +142,26 @@ mpquic options:
   --cert/--key FILE TLS certificate for the server (optional)
   --sni NAME        TLS server name sent by the client
 
-Local listeners (SOCKS5 on -b/-l is on unless --no-socks; any --wg-* option
-enables a userspace WireGuard server whose peers' TCP, UDP and ping traffic
-is proxied transparently; UDP and ping need -u on both ends):
+Local listeners (SOCKS5 on -b/-l is on unless --no-socks; --tun creates a
+network interface, and any --wg-* option enables a userspace WireGuard
+server; the TCP, UDP and ping traffic routed to the interface, or of the
+WireGuard peers, is proxied transparently; UDP and ping need -u on both ends):
   --no-socks        do not run the SOCKS5 listener
+  --tun NAME        create the TUN interface NAME (Linux, e.g. mpquic0; macOS:
+                    utun or utunN) and relay what the system routes to it.
+                    Needs root (Linux: CAP_NET_ADMIN). The interface is
+                    brought up; addresses and routes beyond --tun-addr and
+                    --tun-route are the caller's (ip, a router daemon)
+  --tun-addr ADDR/BITS
+                    assign an address to the TUN interface (repeatable)
+  --tun-route ADDR/BITS
+                    route a destination through the TUN interface
+                    (repeatable). Routes that cover the servers' own
+                    addresses need --fwmark and a routing rule (see README)
+  --tun-mtu BYTES   TUN interface MTU (default 1500)
+  --fwmark MARK     Linux: firewall mark of the QUIC sockets (and of the DNS
+                    queries for server names), for routing rules that keep
+                    them out of the TUN interface
   --wg-listen [HOST:]PORT
                     WireGuard UDP listen address (default: port 51820 on
                     all interfaces)
@@ -185,6 +202,9 @@ type commonFlags struct {
 	wgListen, wgKey, wgPSK     string
 	wgPeers                    multi
 	wgMTU                      int
+	tunName, fwmark            string
+	tunAddrs, tunRoutes        multi
+	tunMTU                     int
 }
 
 func parseCommon(name string, args []string) (*commonFlags, error) {
@@ -225,6 +245,11 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.Var(&f.wgPeers, "wg-peer", "WireGuard peer PUBKEY[,ALLOWED_IP...] (repeatable)")
 	fs.StringVar(&f.wgPSK, "wg-psk", "", "WireGuard preshared key of every peer")
 	fs.IntVar(&f.wgMTU, "wg-mtu", 0, "WireGuard interface MTU")
+	fs.StringVar(&f.tunName, "tun", "", "create a TUN interface of this name (local)")
+	fs.Var(&f.tunAddrs, "tun-addr", "TUN interface address ADDR/BITS (repeatable)")
+	fs.Var(&f.tunRoutes, "tun-route", "route ADDR/BITS through the TUN interface (repeatable)")
+	fs.IntVar(&f.tunMTU, "tun-mtu", 0, "TUN interface MTU")
+	fs.StringVar(&f.fwmark, "fwmark", "", "firewall mark of the QUIC sockets (Linux)")
 	// Accepted for shadowsocks compatibility, ignored.
 	var ign string
 	var ignb bool
@@ -349,6 +374,31 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.noSOCKS {
 		cfg.NoSOCKS = true
+	}
+	if f.tunName != "" || len(f.tunAddrs) > 0 || len(f.tunRoutes) > 0 || f.tunMTU != 0 {
+		if cfg.TUN == nil {
+			cfg.TUN = &config.TUNConfig{}
+		}
+		t := cfg.TUN
+		if f.tunName != "" {
+			t.Name = f.tunName
+		}
+		if len(f.tunAddrs) > 0 {
+			t.Addresses = config.StringList(f.tunAddrs)
+		}
+		if len(f.tunRoutes) > 0 {
+			t.Routes = config.StringList(f.tunRoutes)
+		}
+		if f.tunMTU != 0 {
+			t.MTU = f.tunMTU
+		}
+	}
+	if f.fwmark != "" {
+		m, err := strconv.ParseUint(f.fwmark, 0, 32)
+		if err != nil {
+			return nil, fmt.Errorf("--fwmark %q: want a number (e.g. 0x4d51)", f.fwmark)
+		}
+		cfg.FWMark = uint32(m)
 	}
 	if f.wgListen != "" || f.wgKey != "" || len(f.wgPeers) > 0 || f.wgPSK != "" || f.wgMTU != 0 {
 		if cfg.WireGuard == nil {

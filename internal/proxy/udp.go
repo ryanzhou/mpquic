@@ -30,12 +30,11 @@ const udpIdle = 2 * time.Minute
 
 // UDPLocal handles the local side of UDP associations. Besides SOCKS5 UDP
 // ASSOCIATE it serves other front-ends (the WireGuard listener) through
-// Register, and dispatches ICMP echo replies (association 0) to ICMP.
+// Register, and dispatches ICMP echo replies (association 0) to the
+// front-end whose echo flow they belong to (EchoReceiver).
 type UDPLocal struct {
 	Client Opener
 	Log    *slog.Logger
-	// ICMP receives the body of ICMP echo datagrams (see icmp.go).
-	ICMP func(b []byte)
 	// Reliable relays every association over a stream (see reliable.go)
 	// instead of QUIC DATAGRAMs. Set it before registering associations.
 	Reliable bool
@@ -43,6 +42,7 @@ type UDPLocal struct {
 	mu     sync.Mutex
 	assocs map[uint64]*localAssoc
 	nextID atomic.Uint64
+	echo   [1 << 16 / EchoFlows]func(b []byte)
 	// reliable mode: datagrams dropped (congestion), streams refused
 	drops, refused rateLog
 }
@@ -123,8 +123,13 @@ func (u *UDPLocal) HandleDatagram(_ *mp.Session, b []byte) {
 	}
 	rest := b[len(b)-r.Len():]
 	if id == icmpAssoc {
-		if u.ICMP != nil {
-			u.ICMP(rest)
+		if _, flow, _, _, ok := ParseEcho(rest); ok {
+			u.mu.Lock()
+			recv := u.echo[flow/EchoFlows]
+			u.mu.Unlock()
+			if recv != nil {
+				recv(rest)
+			}
 		}
 		return
 	}
