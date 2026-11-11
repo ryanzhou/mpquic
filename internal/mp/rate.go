@@ -66,10 +66,14 @@ const (
 	cpMaxBackoff   = 3 // probes at least every 2^3 rounds
 
 	cpLossExcess  = 0.02 // loss beyond the baseline that counts
+	cpBurst       = 4    // random loss comes in bursts of about this many packets
+	cpStartLoss   = 0.05 // loss beyond the baselines that ends a start-up
 	cpMargin      = 0.98 // B after such loss: this much of what was delivered
 	cpProbeMargin = 0.96 // ... or of what a probe's lossy second round delivered
 	cpLossRounds  = 2    // rounds in a row with it at B before B comes down ...
 	cpProbation   = 4    // rounds without loss after which a higher B is taken to hold
+	cpBaseKeep    = 0.75 // a baseline: what an older calm round counts for after each newer one
+	cpBasePkts    = 200  // ... and the packets it takes to know one
 	cpCommon      = 0.75 // "every path": the paths that lost carried this much of the round
 	cpHold        = 16   // rounds without a probe after that, doubled each time it happens at about the same B ...
 	cpMaxHold     = 128  // ... up to this
@@ -211,8 +215,9 @@ type cpPath struct {
 
 	// lossBase is the share the path loses whatever the rate (random
 	// loss), as the rounds that send less than B show it.
-	lossBase float64
-	lossOK   bool
+	lossBase     float64
+	lossOK       bool
+	calmN, calmX float64 // packets sent and lost in the calm rounds (older ones fading)
 
 	// limit is what the path carries on its own account (bytes/s, 0: no
 	// limit known): it alone queued or lost at more.
@@ -232,26 +237,30 @@ type cpPath struct {
 const cpPkt = 1200
 
 // cpExcess reports whether lost of sent bytes is more than the share base
-// by cpLossExcess/div, and by more than chance explains.
+// by cpLossExcess/div, and by more than chance explains: three standard
+// deviations, of losses that come in bursts of cpBurst packets (random loss
+// on real links does; counting every packet as its own draw would take
+// every burst for the pipe's doing).
 func cpExcess(sent, lost uint64, base, div float64) bool {
 	n, x := float64(sent)/cpPkt, float64(lost)/cpPkt
 	d := x - n*base
-	return d >= cpLossExcess/div*n && d >= 3*math.Sqrt(n*base+1)
+	return d >= cpLossExcess/div*n && d >= 3*math.Sqrt(cpBurst*(n*base+1))
 }
 
-// learn updates the path's baseline with a round's loss. A round below B
-// (drain) shows it; another round can only show that it is less.
-func (c *cpPath) learn(sent, lost uint64, drain bool) {
-	loss := float64(lost) / float64(sent)
-	n := float64(sent) / cpPkt
-	switch {
-	case drain && (!c.lossOK || n*(c.lossBase-loss) >= 2*math.Sqrt(n*c.lossBase+1)):
-		c.lossBase, c.lossOK = loss, true // the first, or clearly less than was known
-	case drain:
-		c.lossBase += (loss - c.lossBase) / 4
-	case n*(c.lossBase-loss) >= 2*math.Sqrt(n*c.lossBase+1):
-		c.lossBase += (loss - c.lossBase) / 4
+// learn updates the path's baseline with a round's loss. A calm round (one
+// that sent clearly less than the pipe takes) shows what the path loses
+// anyway; another round can only show that it is less. The baseline is the
+// loss of the calm rounds together, the later ones counting more: one round
+// of a few dozen packets says little (two lost of a hundred is as likely as
+// none), and a baseline of nothing from such a round would make every later
+// loss look like the pipe's.
+func (c *cpPath) learn(sent, lost uint64, calm bool) {
+	n, x := float64(sent)/cpPkt, float64(lost)/cpPkt
+	if !calm && !(c.lossOK && n*c.lossBase-x >= 2*math.Sqrt(n*c.lossBase+1)) {
+		return
 	}
+	c.calmN, c.calmX = c.calmN*cpBaseKeep+n, c.calmX*cpBaseKeep+x
+	c.lossBase, c.lossOK = c.calmX/c.calmN, c.calmN >= cpBasePkts
 }
 
 // limitAt is the path's own limit in a round (0: none): the limit, or more
@@ -460,7 +469,7 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 			break
 		}
 		if !r1.thin && known > 0 && float64(lossy) >= cpCommon*float64(known) &&
-			cpExcess(known, lost, expected/float64(known), 1) {
+			float64(lost)-expected >= cpStartLoss*float64(known) && cpExcess(known, lost, expected/float64(known), 1) {
 			cp.gain, cp.startOver, cp.startLoss = 1, true, true
 		} else if busy && cp.qTicks >= cpQueueTicks {
 			cp.gain, cp.startOver = 1, true
@@ -750,9 +759,10 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		case r1.thin || !ok1:
 			// A session with little to send (the acknowledgements of a
 			// download) learns nothing about the pipe, whatever it loses.
-		case common1 && known1:
-			// Loss on every path beyond what the paths lose anyway (which
-			// the first rounds have shown): more than the pipe takes.
+		case common1 && known1 && float64(l1)-e1 >= cpStartLoss*float64(s1):
+			// Loss on every path, clearly beyond what the paths lose anyway
+			// (which the first rounds have shown): more than the pipe
+			// takes.
 			over = true
 		case !r1.busy:
 		case cp.bw >= cpStartGrowth*cp.best:

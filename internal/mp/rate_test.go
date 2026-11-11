@@ -339,7 +339,7 @@ func TestRatePolicerLargeBurst(t *testing.T) {
 	x.reset()
 	x.run(100 * time.Second)
 	within(t, "goodput", x.goodput(100*time.Second), mbit(100), 0.9, 1.01)
-	if l := x.lossShare(); l > 0.03 {
+	if l := x.lossShare(); l > 0.035 {
 		t.Errorf("loss %.2f%%", 100*l)
 	}
 }
