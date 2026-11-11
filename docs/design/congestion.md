@@ -123,8 +123,10 @@ quarters of the round. Loss on one path only is that path's own business
   arriving (measured continuously, over the last round), so it doubles
   about every round trip, like TCP's slow start. It ends
   * when a round loses 5% more than the paths' baselines explain, on every
-    path (the first rounds have shown the baselines by then, so random
-    loss does not end it): the pipe takes no more;
+    path, and at least 40 packets more (the first rounds have shown the
+    baselines by then, so random loss does not end it; one burst of
+    random loss before that, eight packets of 150, does not either): the
+    pipe takes no more;
   * or when a tenth of a round did not come out (judged on the paths that
     have no limit of their own, below), or *B* has not grown by a quarter
     for two rounds while every path sees a queue. (Without a queue on every
@@ -261,10 +263,12 @@ controller's: small transfers still go to the fastest path.
 
 A path that is not usable (suspect, benched) keeps a minimal share for its
 pings. Before the session has a rate, every path has a window of 32 packets
-and is paced at twice that per round trip (taken to be 50 ms until the
-path's first RTT sample: the window bounds what is in flight anyway, and a
-slower pace would delay the first datagrams of a session over a short
-path).
+and is paced at twice that per round trip: the path's shortest one (the
+smoothed RTT begins with the handshake's, which may be many times the
+path's), or 50 ms until there is a sample. The window bounds what is in
+flight anyway, and a slower pace would delay the first datagrams of a
+session over a short path. A path gets its share when it joins, not at the
+session's next tick (up to 100 ms away while the session is idle).
 
 The session's stats log line shows `rate=<B>` (and `limit=` if configured);
 a path with a limit of its own shows it as `own=`. `MPQUIC_RATE_DEBUG=1`
