@@ -14,9 +14,11 @@ import (
 // rateSim is a fluid model of a session's paths: every path sends at the
 // rate the session gives it (as far as the application has data and the
 // path's window allows), through a bottleneck of its own if it has one and
-// then through one that all share: a queue with a buffer, or a policer with
-// a burst allowance. What a path sent in a tick is acknowledged, or known to
-// be lost, one round trip later (plus the time it queued).
+// then, half a round trip later, through one that all share: a queue with a
+// buffer, or a policer with a burst allowance. What a path sent in a step is
+// acknowledged, or known to be lost, another half round trip later (plus
+// the time it queued). The paths' round trips differ, so what they send in
+// the same moment reaches the common bottleneck at different times.
 type rateSim struct {
 	s        *Session
 	now      time.Time
@@ -47,16 +49,19 @@ type simPath struct {
 	loss     float64 // random loss
 	pn       int64
 	inflight float64
+	transit  []simAck
 	pend     []simAck
 	rtt      simRTT
 	sent     float64 // since reset
 }
 
+// simAck is what a path sent in a step, on its way: to the common
+// bottleneck (transit), then back as an acknowledgement (pend).
 type simAck struct {
-	at          time.Duration
+	at          time.Duration // when it arrives
+	sent        time.Duration
 	pn          int64
 	acked, lost float64
-	rtt         time.Duration
 }
 
 type simRTT struct{ min, latest time.Duration }
@@ -112,18 +117,15 @@ func (x *rateSim) run(d time.Duration) {
 	for end := x.el + d; x.el < end; x.el += simStep {
 		x.now = x.now.Add(simStep)
 		t := monotime.Time(int64(time.Hour) + int64(x.el))
-		// what the application has, shared out as the rates are
 		var total float64
-		for i, p := range x.s.paths {
+		for _, p := range x.s.paths {
 			if p.state == stateActive {
 				total += float64(max(p.meter.Rate(), 1))
 			}
-			_ = i
 		}
-		adm := make([]float64, len(x.paths)) // admitted to the common bottleneck
-		drop := make([]float64, len(x.paths))
-		delay := make([]time.Duration, len(x.paths))
-		var in float64
+		// The paths send, each through its own bottleneck. What gets
+		// through reaches the common one half a round trip later.
+		var tick float64
 		for i, p := range x.s.paths {
 			sp := x.paths[i]
 			if p.state != stateActive {
@@ -134,32 +136,52 @@ func (x *rateSim) run(d time.Duration) {
 				rate = 64 << 10
 			}
 			want := rate * dt
-			if x.demand > 0 {
+			if x.demand > 0 { // what the application has, shared out as the rates are
 				want = min(want, x.demand*dt*rate/total)
 			}
 			if !p.meter.CanSend(congestion.ByteCount(sp.inflight)) {
 				want = 0
 			}
-			sp.sent += want
-			x.sent += want
-			drop[i] = want * sp.loss
-			adm[i] = want - drop[i]
-			delay[i] = sp.base + x.extra
+			if want < 1 {
+				continue
+			}
+			drop := want * sp.loss
+			adm := want - drop
+			delay := x.extra
 			if sp.own > 0 {
-				sp.q += adm[i]
+				sp.q += adm
 				sp.q -= min(sp.q, sp.own*dt)
 				if limit := sp.ownBuf * sp.own; sp.q > limit {
-					d := min(sp.q-limit, adm[i])
+					d := min(sp.q-limit, adm)
 					sp.q -= d
-					adm[i] -= d
-					drop[i] += d
+					adm -= d
+					drop += d
 				}
-				delay[i] += time.Duration(sp.q / sp.own * float64(time.Second))
+				delay += time.Duration(sp.q / sp.own * float64(time.Second))
 			}
-			in += adm[i]
+			// two "packets": what gets through, and what does not
+			p.meter.OnPacketSent(t, congestion.ByteCount(sp.inflight), congestion.PacketNumber(sp.pn), congestion.ByteCount(adm), true)
+			p.meter.OnPacketSent(t, congestion.ByteCount(sp.inflight+adm), congestion.PacketNumber(sp.pn+1), congestion.ByteCount(drop), true)
+			sp.transit = append(sp.transit, simAck{at: x.el + delay + sp.base/2, pn: sp.pn, acked: adm, lost: drop, sent: x.el})
+			sp.pn += 2
+			sp.inflight += want
+			sp.sent += want
+			x.sent += want
+			tick += want
 		}
-		if x.capacity > 0 && in > 0 {
-			var over float64
+		// The common bottleneck takes what arrives now.
+		var in float64
+		for _, sp := range x.paths {
+			for _, a := range sp.transit {
+				if a.at > x.el {
+					break
+				}
+				in += a.acked
+			}
+		}
+		var over float64
+		var qd time.Duration
+		if x.capacity > 0 {
 			if x.bucket > 0 {
 				x.tokens = min(x.tokens+x.capacity*dt, x.bucket*x.capacity)
 				pass := min(in, x.tokens)
@@ -172,33 +194,25 @@ func (x *rateSim) run(d time.Duration) {
 					over = min(x.q-limit, in)
 					x.q -= over
 				}
-			}
-			qd := time.Duration(x.q / x.capacity * float64(time.Second))
-			for i := range adm {
-				d := over * adm[i] / in
-				adm[i] -= d
-				drop[i] += d
-				delay[i] += qd
+				qd = time.Duration(x.q / x.capacity * float64(time.Second))
 			}
 			x.qsum += qd
-		} else if x.capacity > 0 {
-			x.tokens = min(x.tokens+x.capacity*dt, x.bucket*x.capacity)
-			x.q -= min(x.q, x.capacity*dt)
 		}
 		x.ticks++
-		var tick float64
 		for i, p := range x.s.paths {
 			sp := x.paths[i]
-			tick += adm[i] + drop[i]
-			if n := adm[i] + drop[i]; n >= 1 {
-				// two "packets": what gets through, and what does not
-				p.meter.OnPacketSent(t, congestion.ByteCount(sp.inflight), congestion.PacketNumber(sp.pn), congestion.ByteCount(adm[i]), true)
-				p.meter.OnPacketSent(t, congestion.ByteCount(sp.inflight+adm[i]), congestion.PacketNumber(sp.pn+1), congestion.ByteCount(drop[i]), true)
-				sp.pend = append(sp.pend, simAck{x.el + delay[i], sp.pn, adm[i], drop[i], delay[i]})
-				sp.pn += 2
-				sp.inflight += n
-				x.lost += drop[i]
-				x.dlv += adm[i]
+			for len(sp.transit) > 0 && sp.transit[0].at <= x.el {
+				a := sp.transit[0]
+				sp.transit = sp.transit[1:]
+				if in > 0 {
+					d := over * a.acked / in
+					a.acked -= d
+					a.lost += d
+				}
+				a.at = x.el + qd + sp.base/2
+				x.lost += a.lost
+				x.dlv += a.acked
+				sp.pend = append(sp.pend, a)
 			}
 			for len(sp.pend) > 0 && sp.pend[0].at <= x.el {
 				a := sp.pend[0]
@@ -213,11 +227,12 @@ func (x *rateSim) run(d time.Duration) {
 				}
 				p.meter.OnCongestionEventEx(congestion.ByteCount(sp.inflight), t, acked, lost)
 				sp.inflight -= a.acked + a.lost
-				sp.rtt.latest = a.rtt
-				if sp.rtt.min == 0 || a.rtt < sp.rtt.min {
-					sp.rtt.min = a.rtt
+				rtt := x.el - a.sent
+				sp.rtt.latest = rtt
+				if sp.rtt.min == 0 || rtt < sp.rtt.min {
+					sp.rtt.min = rtt
 				}
-				p.latestRTT, p.srtt = a.rtt, a.rtt
+				p.latestRTT, p.srtt = rtt, rtt
 			}
 		}
 		x.winSum += tick
@@ -493,7 +508,7 @@ func TestRateFlap(t *testing.T) {
 		x.run(4 * time.Second)
 	}
 	within(t, "goodput", x.goodput(80*time.Second), mbit(70), 0.85, 1.0)
-	if l := x.lossShare(); l > 0.03 {
+	if l := x.lossShare(); l > 0.04 { // each drop overflows the buffer for two rounds
 		t.Errorf("loss %.2f%%", 100*l)
 	}
 	if q := x.meanQueue(); q > ms(30) {

@@ -51,8 +51,11 @@ func (f *follower) rate() congestion.ByteCount {
 }
 
 func (f *follower) window() congestion.ByteCount {
-	var rtt time.Duration
-	if f.rtt != nil {
+	// The session's base RTT if it has one: the connection's minimum is
+	// for its lifetime, and a path whose round trip got longer (a new
+	// route, a queue that is not ours) would be held below its rate by it.
+	rtt := time.Duration(f.m.baseRTT.Load())
+	if rtt <= 0 && f.rtt != nil {
 		rtt = f.rtt.MinRTT()
 	}
 	if rtt <= 0 {

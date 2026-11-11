@@ -69,7 +69,8 @@ type Meter struct {
 	acked      atomic.Uint64
 	rateCap    atomic.Uint64 // bytes/s, 0 = none
 	restart    atomic.Bool
-	blocked    atomic.Bool // follower: in flight reached the window
+	blocked    atomic.Bool  // follower: in flight reached the window
+	baseRTT    atomic.Int64 // follower: see SetBaseRTT
 }
 
 // Rounds: what became of the packets sent in each of the session's rounds.
@@ -264,6 +265,14 @@ func (m *Meter) SetRate(bytesPerSec uint64) {
 	if m.Follows() { // what Snapshot reports must not wait for the next ACK
 		m.bw.Store(bytesPerSec)
 		m.pacing.Store(bytesPerSec)
+	}
+}
+
+// SetBaseRTT tells a follower the path's round-trip time without queues,
+// which bounds what it may have in flight (0: the connection's minimum).
+func (m *Meter) SetBaseRTT(d time.Duration) {
+	if m.baseRTT.Load() != int64(d) {
+		m.baseRTT.Store(int64(d))
 	}
 }
 
