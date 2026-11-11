@@ -387,7 +387,7 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 		}
 		pk, pl := t0.Acked+t0.Lost+t1.Acked+t1.Lost, t0.Lost+t1.Lost
 		known, lost, expected = known+pk, lost+pl, expected+float64(pk)*c.lossBase
-		if cpExcess(pk, pl, c.lossBase, 8) {
+		if c.lossOK && cpExcess(pk, pl, c.lossBase, 8) {
 			lossy += pk
 		}
 		if base := c.baseRTT(); t0.Sent+t1.Sent >= cpLoadedBytes && base > 0 {
@@ -416,10 +416,11 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 		return
 	}
 	r := float64(total-cp.acks[0].n) / d.Seconds()
-	// A queue only says something about B while the session sends at B. It
-	// may be anybody's: the other direction's, for one, which delays this
-	// direction's acknowledgements just the same. A session with little to
-	// send (the acknowledgements of a download) must not take it for its own.
+	// A queue or loss only says something about B while the session sends
+	// at B. A queue may be anybody's: the other direction's, for one, which
+	// delays this direction's acknowledgements just the same. A session
+	// with little to send (the acknowledgements of a download) must not
+	// take it for its own, or end its start-up for a few lost packets.
 	r1 := &cp.hist[((k-1)%8+8)%8]
 	busy := r1.busy && el >= w.Seconds()/4 && used >= cpBusyFrac*allowed
 	switch {
@@ -431,7 +432,7 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 		if cp.gain <= 1 {
 			break
 		}
-		if known > 0 && float64(lossy) >= cpCommon*float64(known) &&
+		if (busy || r1.busy) && known > 0 && float64(lossy) >= cpCommon*float64(known) &&
 			float64(lost)-expected >= cpStartLoss/2*float64(known) && cpExcess(known, lost, expected/float64(known), 1) {
 			cp.gain, cp.startOver, cp.startLoss = 1, true, true
 		} else if busy && cp.qTicks >= cpQueueTicks {
@@ -483,6 +484,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	var rate, rate2 float64            // the rate at which rounds k-1 (so far) and k-2 were delivered
 	var out float64                    // the rate at which acknowledgements came in during round k
 	loaded, queued := 0, 0
+	known1 := true               // the baselines of the paths that sent in round k-1 are known
 	var lossy1, lossy2 uint64    // ... and what the paths sent that lost more than their baseline
 	commonQ := time.Duration(-1) // the queue all loaded paths saw
 	for _, p := range s.paths {
@@ -521,6 +523,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			out += c.rate
 		}
 		if ps1 >= cpLoadedBytes {
+			known1 = known1 && c.lossOK
 			s1, a1, l1, e1 = s1+ps1, a1+pa1, l1+pl1, e1+float64(ps1)*c.lossBase
 			if cpExcess(ps1, pl1, c.lossBase, 8) {
 				lossy1 += ps1
@@ -554,6 +557,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		return r.gain < 1 && r.dt > 0 && float64(sent)/r.dt.Seconds() <= cpHoldQ*before
 	}
 	calm := below(r2, s2, max(h(k-3).out, h(k-4).out))
+	if r2.dt > 0 && float64(s2)/r2.dt.Seconds() <= 0.8*max(r1.out, out) {
+		// ... or than it put out afterwards: the rate was still growing
+		// (a start-up's rounds, before the pipe is full).
+		calm = true
+	}
 	for _, p := range s.paths {
 		if c := &p.cps; p.meter != nil && p.state != stateDead && c.sent2 >= cpLoadedBytes {
 			c.learn(c.sent2, c.lost2, calm)
@@ -609,7 +617,10 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if !steady || !c.full {
 			continue // nothing to learn from this round
 		}
-		alone := c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && !common2
+		// (A path that puts out what it is given is not in trouble,
+		// whatever its queue or loss looks like.)
+		alone := (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
+			c.rate <= cpTrim*float64(c.cap)
 		switch {
 		case c.tryFrom > 0:
 			switch {
@@ -668,12 +679,14 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		cp.startOver, cp.startLoss = false, false
 		switch {
 		case over:
-		case ok1 && common1 && float64(l1)-e1 >= cpStartLoss*float64(s1):
-			// A fifth of what was sent is lost: this is beyond what the
-			// pipe takes, whether or not there was data all the time (a
-			// stream that waits for lost data has none).
-			over = true
 		case !r1.busy || !ok1:
+			// A session with little to send (the acknowledgements of a
+			// download) learns nothing about the pipe, whatever it loses.
+		case common1 && known1 && float64(l1)-e1 >= cpStartLoss*float64(s1):
+			// A fifth of what was sent is lost, beyond what the paths lose
+			// anyway (which the first rounds have shown): more than the
+			// pipe takes.
+			over = true
 		case cp.bw >= cpStartGrowth*cp.best:
 			cp.best, cp.stall = cp.bw, 0
 		default:

@@ -561,6 +561,9 @@ func TestRatePolicedRelays(t *testing.T) {
 func TestRateThinDirection(t *testing.T) {
 	x := newRateSim(mbit(100), 0.05, ms(16), ms(40), ms(70), ms(120))
 	x.demand = mbit(1)
+	for i, sp := range x.paths { // and the paths lose
+		sp.loss = []float64{0.2, 0.1, 0.05, 0.01}[i]
+	}
 	x.run(2 * time.Second)
 	for i := 0; i < 40; i++ { // the foreign queue comes and goes
 		x.extra = ms(10 + 10*(i%5))
@@ -578,6 +581,9 @@ func TestRateThinDirection(t *testing.T) {
 	}
 	// and when there is data, it gets the line
 	x.demand, x.extra = 0, 0
+	for _, sp := range x.paths {
+		sp.loss = 0
+	}
 	x.run(2 * time.Second)
 	x.reset()
 	x.run(5 * time.Second)
