@@ -147,11 +147,14 @@ quarters of the round. Loss on one path only is that path's own business
   queued is gone again by the time its result is known.
   * If at least half of what the probe added was delivered, *B* is what
     the probe round delivered, and the next probe follows at once. If the
-    probe did not queue either (no path saw a queue during it or after),
-    there is clearly room: the next probe is at 1.5·*B*, and from the
-    second such success in a row at 2·*B*. If it queued, the pipe is
-    nearly full, and the next probe stays at 1.25: a larger one would
-    mostly add to the queue.
+    probe did not queue either (not every path saw a queue during it or
+    after), there is clearly room: the next probe is at 1.5·*B*, and after
+    a second such success in a row the session goes back to the start-up,
+    which doubles every round and stops within a round, where probes take
+    three rounds a step (the capacity came back after a drop, or a
+    start-up ended early). If the probe queued, the pipe is nearly full,
+    and the next probe stays at 1.25: a larger one would mostly add to the
+    queue.
   * Otherwise *B* stays. A probe's delivery cannot be measured exactly
     (the paths' parts of the pulse reach a common queue at different
     times, which makes it look a few percent better than it was), so less
@@ -193,9 +196,9 @@ quarters of the round. Loss on one path only is that path's own business
     be ours.
   * Over three queued rounds, *B* is what was put out on average if that
     is less than 0.98·*B*.
-  * A queue that stays for two rounds is drained: rounds at 0.75·*B* until
-    some path sees no queue any more (at most 8 rounds, and at most every
-    8 rounds). After *B* came down for a capacity drop the drain starts at
+  * A queue that stays for two rounds is drained: rounds at 0.75·*B* (at
+    0.5·*B* if the queue is longer than half a round) until some path sees
+    no queue any more (at most 8 rounds, and at most every 8 rounds). After *B* came down for a capacity drop the drain starts at
     once: what queued while the session was still sending at the old rate
     can be a whole buffer's worth, and it is latency for every stream and
     for the other direction's acknowledgements until it is gone. A full
@@ -220,7 +223,8 @@ quarters of the round. Loss on one path only is that path's own business
 own limit, and the others share the rest.
 
 A path has a **limit of its own** when it cannot take its share (a relay
-slower than its share): its window holds it back, it has a queue or loses
+slower than its share) while there are other paths that can: its window
+holds it back, it has a queue or loses
 beyond its baseline, and it puts out less than 0.9 of its share while the
 other paths put out theirs. (A window alone is a path waiting for its
 acknowledgements; and when all paths fall short, it is the session's rate
