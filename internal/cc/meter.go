@@ -43,10 +43,26 @@ type Metrics struct {
 	AckedAt time.Duration
 }
 
-// Meter wraps a BBR sender and publishes its state through atomics. All
-// CongestionControl methods are invoked from the quic-go connection goroutine.
+// sender is a path's congestion controller: a follower of the session's
+// rate, or a BBR of its own.
+type sender interface {
+	congestion.CongestionControlEx
+	ModeName() string
+	BandwidthEstimate() uint64
+	RawBandwidthEstimate() uint64
+	PacingRateBytes() uint64
+	MinRTT() time.Duration
+	Restart()
+}
+
+// Meter wraps a path's congestion controller and publishes its state, and
+// the path's counters, through atomics. All CongestionControl methods are
+// invoked from the quic-go connection goroutine.
 type Meter struct {
-	s      *bbr.Sender
+	s      sender
+	rate   atomic.Uint64 // bytes/s, for a follower (see SetRate)
+	round  atomic.Int64
+	rounds [meterRounds]meterRound
 	hasRTT atomic.Bool
 
 	bw       atomic.Uint64
@@ -73,6 +89,7 @@ type Meter struct {
 	rateCap    atomic.Uint64 // bytes/s, 0 = none
 	rateGain   atomic.Uint64 // math.Float64bits, 0 = none
 	restart    atomic.Bool
+	blocked    atomic.Bool // follower: in flight reached the window
 }
 
 var processStart = time.Now()
@@ -104,6 +121,102 @@ func (m *Meter) takeMark(now int64) {
 		// must stay, or that round would read this one's result again
 		m.markAt.CompareAndSwap(t, 0)
 	}
+}
+
+// Rounds: what became of the packets sent in each of the session's rounds.
+// Every acknowledgement and loss is counted for the round its packet was
+// sent in, however much later it is known, so what a round delivered and
+// lost is exact (the session reads it a round or two later) and does not
+// depend on when the sender was sending or idle.
+
+const meterRounds = 16
+
+type meterRound struct {
+	id                atomic.Int64 // round, +1 (0: unused)
+	first             atomic.Int64 // its first packet number
+	sent, acked, lost atomic.Uint64
+	firstAck, lastAck atomic.Int64  // when its first and latest acknowledgements came (Mono; 0: none)
+	firstBytes        atomic.Uint64 // what the first one acknowledged
+}
+
+// RoundStat is what became of the packets a path sent in a round.
+type RoundStat struct {
+	Sent, Acked, Lost uint64 // bytes; acknowledged and declared lost so far
+	// The acknowledgements after the first came over AckSpan and were for
+	// SpanBytes. Behind a queue that is longer than the round was, and
+	// SpanBytes/AckSpan is the rate at which the queue let them through.
+	AckSpan   time.Duration
+	SpanBytes uint64
+}
+
+// Rate is the rate (bytes/s) at which the round's packets were delivered:
+// what was acknowledged over the round's length dt, or over the time the
+// acknowledgements took if that was longer (they queued).
+func (r RoundStat) Rate(dt time.Duration) float64 {
+	if dt <= 0 {
+		return 0
+	}
+	if r.AckSpan > dt && r.SpanBytes > 0 {
+		return float64(r.SpanBytes) / r.AckSpan.Seconds()
+	}
+	return float64(r.Acked) / dt.Seconds()
+}
+
+// StartRound begins round id: packets sent from now on belong to it.
+func (m *Meter) StartRound(id int64) { m.round.Store(id) }
+
+// Acked returns the bytes acknowledged so far.
+func (m *Meter) Acked() uint64 { return m.acked.Load() }
+
+// TakeBlocked reports whether a follower had as much in flight as it may
+// have since the last call: the path was not delivering what it was given.
+func (m *Meter) TakeBlocked() bool { return m.blocked.Swap(false) }
+
+// RoundStats returns what is known of the packets sent in round id. Rounds
+// older than a dozen are forgotten.
+func (m *Meter) RoundStats(id int64) (st RoundStat) {
+	if id < 0 {
+		return
+	}
+	r := &m.rounds[id%meterRounds]
+	if r.id.Load() != id+1 {
+		return // nothing was sent in it
+	}
+	st.Sent, st.Acked, st.Lost = r.sent.Load(), r.acked.Load(), r.lost.Load()
+	if f, l, fb := r.firstAck.Load(), r.lastAck.Load(), r.firstBytes.Load(); l > f && st.Acked > fb {
+		st.AckSpan, st.SpanBytes = time.Duration(l-f), st.Acked-fb
+	}
+	return
+}
+
+// roundSent counts a packet for the current round (connection goroutine).
+func (m *Meter) roundSent(pn int64, n uint64) {
+	id := m.round.Load()
+	r := &m.rounds[id%meterRounds]
+	if r.id.Load() != id+1 {
+		r.sent.Store(0)
+		r.acked.Store(0)
+		r.lost.Store(0)
+		r.firstAck.Store(0)
+		r.lastAck.Store(0)
+		r.firstBytes.Store(0)
+		r.first.Store(pn)
+		r.id.Store(id + 1)
+	}
+	r.sent.Add(n)
+}
+
+// roundOf returns the round in which packet pn was sent (connection
+// goroutine), or nil if it is forgotten.
+func (m *Meter) roundOf(pn int64) *meterRound {
+	cur := m.round.Load()
+	for id := cur; id >= 0 && id > cur-meterRounds; id-- {
+		r := &m.rounds[id%meterRounds]
+		if r.id.Load() == id+1 && r.first.Load() <= pn {
+			return r
+		}
+	}
+	return nil
 }
 
 // ProbeGate serialises BBR PROBE_RTT among the connections sharing it (the
@@ -176,23 +289,55 @@ func ParseProfile(s string) (bbr.Profile, error) {
 // ProfileCubic keeps quic-go's built-in CUBIC controller (for comparison).
 const ProfileCubic bbr.Profile = "cubic"
 
-// Install replaces the connection's congestion controller with a metered BBR.
-// It returns nil (keeping quic-go's built-in CUBIC) for ProfileCubic.
-func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
+// Install replaces the connection's congestion controller. With follow, the
+// path paces at the rate its session gives it (SetRate); otherwise it runs a
+// BBR of its own with the given profile. It returns nil (keeping quic-go's
+// built-in CUBIC) for ProfileCubic.
+func Install(conn *quic.Conn, profile bbr.Profile, follow bool) *Meter {
 	if profile == ProfileCubic {
 		return nil
 	}
 	// Seed with the connection's own initial packet size (see quic-go's
 	// Conn.InitialPacketSize): it is what quic-go sends until path MTU
 	// discovery reports more, and all it sends with a fixed MTU.
-	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize(), profile)}
-	m.s.AppLimitedHint = m.appLimited.Load
-	m.s.ProbeRTTGate = m.gate
-	m.s.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
-	m.s.RateGain = func() float64 { return math.Float64frombits(m.rateGain.Load()) }
+	m := &Meter{}
+	if follow {
+		m.s = newFollower(m, conn.InitialPacketSize())
+	} else {
+		b := bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize(), profile)
+		b.AppLimitedHint = m.appLimited.Load
+		b.ProbeRTTGate = m.gate
+		b.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
+		b.RateGain = func() float64 { return math.Float64frombits(m.rateGain.Load()) }
+		m.s = b
+	}
 	conn.SetCongestionControl(m)
 	return m
 }
+
+// NewFollower returns a Meter with a follower that is not attached to a
+// connection (tests).
+func NewFollower() *Meter {
+	m := &Meter{}
+	m.s = newFollower(m, congestion.InitialPacketSize)
+	return m
+}
+
+// SetRate sets the rate a follower paces at (bytes/s).
+func (m *Meter) SetRate(bytesPerSec uint64) {
+	m.rate.Store(bytesPerSec)
+	if m.Follows() { // what Snapshot reports must not wait for the next ACK
+		m.bw.Store(bytesPerSec)
+		m.rawBw.Store(bytesPerSec)
+		m.pacing.Store(bytesPerSec)
+	}
+}
+
+// Rate returns the rate set with SetRate.
+func (m *Meter) Rate() uint64 { return m.rate.Load() }
+
+// Follows reports whether the path's rate is the session's to set.
+func (m *Meter) Follows() bool { _, ok := m.s.(*follower); return ok }
 
 // Snapshot returns the latest metrics.
 func (m *Meter) Snapshot() Metrics {
@@ -251,7 +396,9 @@ func (m *Meter) publish() {
 	m.bw.Store(m.s.BandwidthEstimate())
 	m.rawBw.Store(m.s.RawBandwidthEstimate())
 	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))
-	m.stale.Store(m.s.StaleResets)
+	if b, ok := m.s.(*bbr.Sender); ok {
+		m.stale.Store(b.StaleResets)
+	}
 	if m.hasRTT.Load() {
 		m.minRTT.Store(int64(m.s.MinRTT()))
 		m.pacing.Store(m.s.PacingRateBytes())
@@ -271,6 +418,7 @@ func (m *Meter) OnPacketSent(t monotime.Time, inflight congestion.ByteCount, pn 
 	m.sentPkts.Add(1)
 	if rtx {
 		m.sent.Add(uint64(n)) // ACK-only packets are never acknowledged
+		m.roundSent(int64(pn), uint64(n))
 	}
 }
 func (m *Meter) CanSend(b congestion.ByteCount) bool { return m.s.CanSend(b) }
@@ -287,18 +435,35 @@ func (m *Meter) OnCongestionEventEx(prior congestion.ByteCount, t monotime.Time,
 	}
 	m.s.OnCongestionEventEx(prior, t, acked, lost)
 	var a, l congestion.ByteCount
+	now := int64(Mono(time.Now()))
+	var last *meterRound
 	for _, p := range acked {
 		a += p.BytesAcked
+		if r := m.roundOf(int64(p.PacketNumber)); r != nil {
+			r.acked.Add(uint64(p.BytesAcked))
+			if r != last {
+				last = r
+				if r.firstAck.Load() == 0 {
+					r.firstAck.Store(now)
+				}
+				r.lastAck.Store(now)
+			}
+			if r.firstAck.Load() == now {
+				r.firstBytes.Add(uint64(p.BytesAcked))
+			}
+		}
 	}
 	for _, p := range lost {
 		l += p.BytesLost
+		if r := m.roundOf(int64(p.PacketNumber)); r != nil {
+			r.lost.Add(uint64(p.BytesLost))
+		}
 	}
 	if len(lost) > 0 {
 		m.lostPkts.Add(uint64(len(lost)))
 		m.lostBytes.Add(uint64(l))
 	}
 	if a > 0 {
-		now := int64(Mono(time.Now()))
 		m.takeMark(now)
 		m.acked.Add(uint64(a))
 		m.ackedAt.Store(now)

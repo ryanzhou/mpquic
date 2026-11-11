@@ -124,7 +124,7 @@ func (c *Client) runPath(index uint64, addr string) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	meter := cc.Install(conn, c.profile)
+	meter := cc.Install(conn, c.profile, !cpDisabled && !c.opt.NoCoupling)
 	ctrl, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		conn.CloseWithError(errCodeShutdown, "")
@@ -268,7 +268,7 @@ func (s *Server) Close() {
 }
 
 func (s *Server) handleConn(conn *quic.Conn) {
-	meter := cc.Install(conn, s.profile)
+	meter := cc.Install(conn, s.profile, !cpDisabled && !s.opt.NoCoupling)
 	ctx, cancel := context.WithTimeout(context.Background(), s.opt.HandshakeTimeout)
 	defer cancel()
 	ctrl, err := conn.AcceptStream(ctx)
