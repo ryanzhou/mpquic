@@ -11,14 +11,26 @@ import (
 
 // follower is the congestion controller of a path whose rate is decided
 // elsewhere: by the session, for all its paths together (see Meter.SetRate).
-// It has no estimate, start-up or probing of its own. It paces at the rate
-// it is given and bounds what is in flight, so a path that stops delivering
-// stops sending. (Hysteria's Brutal does the same with a configured rate.)
+// It has no start-up or probing of its own, and its rate is not its
+// decision. It paces at the rate it is given, and it bounds what is in
+// flight to what the path itself delivers in two round trips, so a path
+// that delivers less than it is given (a slow relay) queues one round trip's
+// worth and no more, and a path that stops delivering stops sending.
+// (Hysteria's Brutal paces at a configured rate in the same way; the window
+// is BBR's.)
 type follower struct {
 	m     *Meter
 	rtt   congestion.RTTStatsProvider
 	pacer *common.Pacer
 	mds   congestion.ByteCount
+
+	// The path's delivery rate: bytes acknowledged per second, the highest
+	// of the last followWindows measuring windows in which the path had
+	// data to send (a window in which it had none says nothing).
+	winAt    monotime.Time
+	winBytes congestion.ByteCount
+	winIdle  bool
+	rates    [followWindows]float64
 }
 
 const (
@@ -28,11 +40,15 @@ const (
 	followMinRate = 8 << 10
 	// followInitial is the rate before the session has assigned one.
 	followInitial = 64 << 10
-	// A path may have this much in flight: twice what its rate sends in a
-	// round trip, and at least what it sends in followSlack on top of one
-	// (short paths: acknowledgements come in bunches).
-	followSlack     = 50 * time.Millisecond
-	followMinWindow = 16 // packets
+	// A path may have in flight what it delivers in two round trips, and at
+	// least what it delivers in followSlack on top of one (short paths:
+	// acknowledgements come in bunches), and never less than
+	// followMinWindow packets (the start, and a path that carried little).
+	followSlack     = 25 * time.Millisecond
+	followMinWindow = 32 // packets
+	followWindows   = 4
+	// A measuring window is a round trip long, and at least this.
+	followMinMeasure = 25 * time.Millisecond
 )
 
 func newFollower(m *Meter, mds congestion.ByteCount) *follower {
@@ -50,19 +66,55 @@ func (f *follower) rate() congestion.ByteCount {
 	return congestion.ByteCount(max(r, followMinRate))
 }
 
-func (f *follower) window() congestion.ByteCount {
-	// The session's base RTT if it has one: the connection's minimum is
-	// for its lifetime, and a path whose round trip got longer (a new
-	// route, a queue that is not ours) would be held below its rate by it.
+// baseRTT is the path's round trip without queues: the session's figure if
+// it has one. The connection's minimum is for its lifetime, and a path
+// whose round trip got longer (a new route, a queue that is not ours) would
+// be held back by it.
+func (f *follower) baseRTT() time.Duration {
 	rtt := time.Duration(f.m.baseRTT.Load())
 	if rtt <= 0 && f.rtt != nil {
 		rtt = f.rtt.MinRTT()
 	}
+	return rtt
+}
+
+// delivered is the path's delivery rate (bytes/s, 0: not known yet).
+func (f *follower) delivered() float64 {
+	var r float64
+	for _, v := range f.rates {
+		r = max(r, v)
+	}
+	return r
+}
+
+// onAcked counts n bytes acknowledged at t.
+func (f *follower) onAcked(t monotime.Time, n congestion.ByteCount) {
+	if f.winAt == 0 {
+		f.winAt = t
+	}
+	f.winBytes += n
+	f.winIdle = f.winIdle || f.m.appLimited.Load()
+	d := t.Sub(f.winAt)
+	if d < max(f.baseRTT(), followMinMeasure) {
+		return
+	}
+	// A window in which the path had nothing to send for a while only
+	// counts if it shows more than is known.
+	if r := float64(f.winBytes) / d.Seconds(); !f.winIdle || r > f.delivered() {
+		copy(f.rates[1:], f.rates[:])
+		f.rates[0] = r
+	}
+	f.winAt, f.winBytes, f.winIdle = t, 0, false
+}
+
+func (f *follower) window() congestion.ByteCount {
+	floor := followMinWindow * f.mds
+	rtt := f.baseRTT()
 	if rtt <= 0 {
-		return 2 * followMinWindow * f.mds
+		return floor
 	}
 	d := max(2*rtt, rtt+followSlack)
-	return max(congestion.ByteCount(float64(f.rate())*d.Seconds()), followMinWindow*f.mds)
+	return max(congestion.ByteCount(f.delivered()*d.Seconds()), floor)
 }
 
 func (f *follower) SetRTTStatsProvider(p congestion.RTTStatsProvider) { f.rtt = p }
@@ -85,7 +137,14 @@ func (f *follower) OnPacketAcked(congestion.PacketNumber, congestion.ByteCount, 
 }
 func (f *follower) OnCongestionEvent(congestion.PacketNumber, congestion.ByteCount, congestion.ByteCount) {
 }
-func (f *follower) OnCongestionEventEx(congestion.ByteCount, monotime.Time, []congestion.AckedPacketInfo, []congestion.LostPacketInfo) {
+func (f *follower) OnCongestionEventEx(_ congestion.ByteCount, t monotime.Time, acked []congestion.AckedPacketInfo, _ []congestion.LostPacketInfo) {
+	var n congestion.ByteCount
+	for _, p := range acked {
+		n += p.BytesAcked
+	}
+	if n > 0 {
+		f.onAcked(t, n)
+	}
 }
 func (f *follower) OnRetransmissionTimeout(bool) {}
 func (f *follower) SetMaxDatagramSize(s congestion.ByteCount) {

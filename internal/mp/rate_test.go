@@ -52,7 +52,9 @@ type simPath struct {
 	transit  []simAck
 	pend     []simAck
 	rtt      simRTT
-	sent     float64 // since reset
+	sent     float64       // since reset
+	qsum     time.Duration // its own queue\'s delay, summed over the steps it sent in since reset
+	qn       int
 }
 
 // simAck is what a path sent in a step, on its way: to the common
@@ -158,6 +160,8 @@ func (x *rateSim) run(d time.Duration) {
 					drop += d
 				}
 				delay += time.Duration(sp.q / sp.own * float64(time.Second))
+				sp.qsum += time.Duration(sp.q / sp.own * float64(time.Second))
+				sp.qn++
 			}
 			// two "packets": what gets through, and what does not
 			p.meter.OnPacketSent(t, congestion.ByteCount(sp.inflight), congestion.PacketNumber(sp.pn), congestion.ByteCount(adm), true)
@@ -261,7 +265,7 @@ func (x *rateSim) reset() {
 	x.sent, x.lost, x.dlv, x.peak, x.qsum, x.ticks = 0, 0, 0, 0, 0, 0
 	x.win = x.win[:0]
 	for _, sp := range x.paths {
-		sp.sent = 0
+		sp.sent, sp.qsum, sp.qn = 0, 0, 0
 	}
 }
 
@@ -525,6 +529,11 @@ func TestRateSlowRelay(t *testing.T) {
 	x.run(30 * time.Second)
 	within(t, "goodput", x.goodput(30*time.Second), mbit(100), 0.9, 1.0)
 	within(t, "slow relay", x.paths[0].sent/30, mbit(20), 0.75, 1.1)
+	// It has the shortest round trip, so small transfers go there: its
+	// queue is their latency.
+	if q := x.paths[0].qsum / time.Duration(max(x.paths[0].qn, 1)); q > ms(8) {
+		t.Errorf("the slow relay's queue: %v on average", q)
+	}
 	if l := x.lossShare(); l > 0.01 {
 		t.Errorf("loss %.2f%%", 100*l)
 	}

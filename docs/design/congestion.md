@@ -34,15 +34,25 @@ coupled ones), with the second as an option (`up` / `down`).
 
 ## The paths follow
 
-A path's congestion controller (`cc.follower`) has no estimate, start-up or
-probing of its own. It does two things:
+A path's congestion controller (`cc.follower`) has no start-up or probing of
+its own, and its rate is not its decision. It does two things:
 
 * it **paces** at the rate the session assigns (`Meter.SetRate`), and
-* it bounds what is **in flight** to what that rate sends in two round
-  trips (at least one round trip plus 50 ms; the session's base RTT for
-  the path, below), so a path that stops delivering stops sending.
+* it bounds what is **in flight** to what the path itself delivers in two
+  round trips (at least one round trip plus 25 ms, and 32 packets). The
+  delivery rate is the highest of the last four measuring windows (a round
+  trip each) in which the path had data to send; the round trip is the
+  session's base RTT for the path (below).
 
-Hysteria's Brutal does the same with a configured rate. The path also
+The window is BBR's, and it is what protects a path from its share: a relay
+that is given twice what it carries queues one round trip's worth and is
+then clocked by its own acknowledgements, long before the session has
+worked out a limit for it. A path that stops delivering stops sending. And
+in the start-up, where the session doubles the rate every round, a path can
+only send twice what it delivers per round trip, so the window does for one
+path what the session does for all.
+
+Hysteria's Brutal paces at a configured rate in the same way. The path also
 counts, for the session: every packet is booked on the session round it was
 sent in, and its acknowledgement or loss is counted for that round however
 much later it is known (`Meter.RoundStats`).
@@ -68,12 +78,21 @@ round *k* it knows:
 * **Whether it had data**: a round counts as *busy* if the paths sent at
   least 85% of their shares, or could not because their windows were full.
   Rounds in which the application had less to send say nothing about the
-  pipe and change nothing.
+  pipe and change nothing: not *B*, and not the phase. That matters most
+  for the direction that only carries acknowledgements. Its round trips
+  grow with the *other* direction's queue, and it loses packets like any
+  other traffic; if it took either for its own congestion, it would end
+  its start-up at the trickle it happens to send, and acknowledgements and
+  pings would then be paced at that.
 
 **Loss is judged against a baseline.** Every path has a baseline loss: the
-share it loses whatever the rate (a radio link, a bad cable). The rounds
-that send *less* than the session rate show it (there is one after every
-probe); other rounds can only lower it. A round is *lossy* if the paths
+share it loses whatever the rate (a radio link, a bad cable). A round shows
+it if the pipe was clearly not full: the round sent less than 0.9 of what
+the pipe was putting out before it (the round after a probe), or less than
+0.8 of what it put out afterwards (a start-up's rounds while the rate still
+grows). Other rounds can only lower it. A round merely below *B* is not
+enough: after the capacity has dropped, three quarters of *B* may still be
+twice what the pipe takes. A round is *lossy* if the paths
 lost clearly more than their baselines (by 2% of what they sent, and by
 more than chance explains), and if that is so for the paths that carried
 three quarters of the round. Loss on one path only is that path's own
@@ -89,7 +108,8 @@ business (below); random loss, however heavy, is in the baseline.
   growing by a quarter per round (two rounds in a row, or at once if a
   tenth of a round did not come out). It also ends within a round, at the
   next tick, as soon as it has gone too far: a tenth of what the last two
-  rounds are known to have delivered or lost is lost, or every path's
+  rounds are known to have delivered or lost is lost beyond the baselines
+  (which the first rounds have shown by then), or every path's
   round-trip time is clearly above its base (a queue; by a quarter of the
   base RTT, at least 3 ms). From then on the session sends no more than is
   being delivered. What reaches the receiver is never more than the line
@@ -165,9 +185,12 @@ own limit, and the others share the rest.
 A path has a **limit of its own** when it alone has trouble: for two rounds
 its queue is clearly longer than what all paths see, or it loses beyond its
 baseline while the others do not (a relay slower than its share). The limit
-is what the path put out then. This is only learned while the session sends
-steadily and the path gets its share; after a start-up or while the rate
-changes, a path's output says little about what it can carry. Every 8
+is 98% of what the path put out then, if that is less than it was given (a
+path that puts out its share is not in trouble, whatever its queue looks
+like), and the path sends half of it for one round, so its queue is gone.
+This is only learned while the session sends steadily and the path gets its
+share; after a start-up or while the rate changes, a path's output says
+little about what it can carry. Every 8
 rounds (doubling when it fails, up to 64) the limit is raised by a quarter
 for three rounds, and stays raised if the path then puts out more.
 

@@ -191,6 +191,7 @@ type cpPath struct {
 
 	acked0 uint64  // bytes acknowledged when the round began
 	rate   float64 // the rate at which acknowledgements came in during the last round (bytes/s)
+	rate2  float64 // the rate at which what it sent in the round before last was delivered
 	sent   float64 // how fast it sent in the round before that (bytes/s)
 	lossy  bool    // the round before that lost more than the path's baseline
 	sent2  uint64  // ... of this much sent
@@ -205,10 +206,11 @@ type cpPath struct {
 	// limit is what the path carries on its own account (bytes/s, 0: no
 	// limit known): it alone queued or lost at more.
 	limit     float64
-	short     int     // rounds in a row in which it did
-	tryFrom   float64 // a try for more is under way: the limit before it (0: none)
-	tryAt     int64   // ... and the round it began in
-	limitNext int64   // round of the next try
+	short     int   // rounds in a row in which it did
+	drainAt   int64 // the round in which its queue is drained (after the limit was found)
+	tryAt     int64 // the round in which it is tried for more (0: no try under way)
+	tryFull   bool  // ... and whether it sent what it could in it
+	limitNext int64 // round of the next try
 	limitBack int
 
 	cap   uint64 // the share it paces at (bytes/s)
@@ -232,13 +234,27 @@ func (c *cpPath) learn(sent, lost uint64, drain bool) {
 	loss := float64(lost) / float64(sent)
 	n := float64(sent) / cpPkt
 	switch {
-	case drain && !c.lossOK:
+	case drain && (!c.lossOK || loss < c.lossBase):
 		c.lossBase, c.lossOK = loss, true
 	case drain:
 		c.lossBase += (loss - c.lossBase) / 4
 	case n*(c.lossBase-loss) >= 2*math.Sqrt(n*c.lossBase+1):
 		c.lossBase += (loss - c.lossBase) / 4
 	}
+}
+
+// limitAt is the path's own limit in a round (0: none): the limit, or more
+// and then less of it while the path is tried for more.
+func (c *cpPath) limitAt(round int64) float64 {
+	switch {
+	case c.drainAt > 0 && round == c.drainAt:
+		return c.limit / 2
+	case c.tryAt > 0 && round == c.tryAt:
+		return c.limit * cpProbeGain
+	case c.tryAt > 0 && round == c.tryAt+1:
+		return c.limit * (2 - cpProbeGain)
+	}
+	return c.limit
 }
 
 func (c *cpPath) sampleRTT(now time.Time, rtt time.Duration) {
@@ -514,8 +530,9 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if r1.dt > 0 {
 			c.sent = float64(ps1) / r1.dt.Seconds()
 		}
+		c.rate2 = t2.Rate(t3, r2.dt)
 		rate += t1.Rate(t2, r1.dt)
-		rate2 += t2.Rate(t3, r2.dt)
+		rate2 += c.rate2
 		// What the path put out during the round, whatever round it was
 		// sent in.
 		if acked := p.meter.Acked(); acked >= c.acked0 {
@@ -606,43 +623,54 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	// That is only known while the session sends steadily and the path
 	// gets its share: after a start-up, or while the rate changes, a
 	// path's output says little about what it can carry. Now and then the
-	// limit is raised by a quarter for three rounds, and stays raised if
-	// the path then puts out more.
+	// path is tried for more the way the session probes: one round at 1.25
+	// times its limit, the next at 0.75, and the limit goes up if at least
+	// half of what the round added was delivered.
 	for _, p := range s.paths {
 		c := &p.cps
 		if p.meter == nil || p.state == stateDead {
 			continue
 		}
-		c.rawBw = uint64(c.limit)
-		if !steady || !c.full {
-			continue // nothing to learn from this round
-		}
-		// (A path that puts out what it is given is not in trouble,
-		// whatever its queue or loss looks like.)
-		alone := (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
-			c.rate <= cpTrim*float64(c.cap)
 		switch {
-		case c.tryFrom > 0:
-			switch {
-			case k < c.tryAt+3 && !alone:
-				// under way
-			case !alone && c.rate >= c.tryFrom*(1+cpProbeShow*(cpProbeGain-1)):
-				c.tryFrom, c.limitBack, c.limitNext = 0, 0, k+2 // it carries more: again soon
-			default:
-				c.limit = max(min(c.rate, c.limit), c.tryFrom/cpProbeGain, cpMinShare)
-				c.limitBack = min(c.limitBack+1, cpMaxBackoff)
-				c.tryFrom, c.limitNext = 0, k+cpPathProbe<<c.limitBack
+		case c.tryAt > 0:
+			if k == c.tryAt {
+				c.tryFull = c.full
 			}
-		case alone:
+			if k < c.tryAt+2 {
+				break // under way
+			}
+			if c.tryFull && c.rate2 >= c.limit*(1+cpProbeShow*(cpProbeGain-1)) {
+				c.limit = min(c.rate2, c.limit*cpProbeGain)
+				c.limitBack, c.limitNext = 0, k+1 // it carries more: again soon
+			} else {
+				c.limitBack = min(c.limitBack+1, cpMaxBackoff)
+				c.limitNext = k + cpPathProbe<<c.limitBack
+			}
+			c.tryAt = 0
+		case cp.phase == cpStartup && r1.busy && c.full && c.sent > 0 && c.rate <= cpHoldQ*c.sent &&
+			c.queue() >= max(target, c.baseRTT()/4) && out-c.rate >= cpKept*(sentPrev-c.sent):
+			// In the start-up every path gets twice as much every round. One
+			// that has a queue and puts out clearly less than it was sent a
+			// round ago, while the others put out what they were sent, is
+			// full: no need to fill it further.
+			c.limit = max(cpMargin*c.rate, cpMinShare)
+			c.short, c.limitNext, c.drainAt = 0, k+cpPathProbe<<c.limitBack, k+1
+		case !steady || !c.full:
+			// nothing to learn from this round
+		case (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
+			c.rate <= cpTrim*float64(c.cap):
+			// (A path that puts out what it is given is not in trouble,
+			// whatever its queue or loss looks like.)
 			if c.short++; c.short >= cpPathRounds {
-				c.limit = max(c.rate, cpMinShare)
-				c.short, c.limitNext = 0, k+cpPathProbe<<c.limitBack
+				// A little less than it puts out, and half of that for a
+				// round: its queue is still as long as its share made it.
+				c.limit = max(cpMargin*c.rate, cpMinShare)
+				c.short, c.limitNext, c.drainAt = 0, k+cpPathProbe<<c.limitBack, k+1
 			}
 		default:
 			c.short = 0
 			if c.limit > 0 && k >= c.limitNext && c.sent >= 0.9*c.limit {
-				c.tryFrom, c.tryAt = c.limit, k
-				c.limit *= cpProbeGain
+				c.tryAt = k + 1
 			}
 		}
 		c.rawBw = uint64(c.limit)
@@ -719,7 +747,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			cp.setLocked(min(cp.bw, sample))
 			cp.ceil = cp.bw
 		case r2.phase == cpStartup && r1.phase == cpDrain && common2 && r2.full && !r2.queue:
-			cp.setLocked(min(cp.bw, cpMargin*sample2))
+			cp.setLocked(min(cp.bw, cpProbeMargin*sample2))
 			cp.ceil = cp.bw
 		}
 		// A probe, once all of it is accounted for (its last round is
@@ -727,7 +755,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if r2.phase == cpProbe && r1.phase != cpProbe {
 			lost := ok2 && float64(lossy2) >= cpCommon*float64(s2) && cpExcess(s2, l2, e2/float64(s2), 4)
 			switch {
-			case !ok2 || !r2.full:
+			case !ok2 || !r2.busy:
 				cp.nextProbe = k + 2 // there was not the data for it
 			case lost && !r2.queue && !r1.queue:
 				// The ceiling. The second round of a probe of two shows
@@ -788,7 +816,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		// the second round delivered is what the pipe takes. A round
 		// below B follows, to see what loss is there anyway.
 		switch {
-		case !ok2 || !r2.full || r2.phase != cpCruise || k-2 <= cp.cutRound:
+		case !ok2 || !r2.busy || r2.phase != cpCruise || k-2 <= cp.cutRound:
 		case common2:
 			if cp.lossN++; cp.lossN >= cpLossRounds {
 				v := sample2
@@ -972,7 +1000,7 @@ func (s *Session) cpShareLocked(limit uint64) {
 		fair := left / float64(len(open))
 		k := 0
 		for _, p := range open {
-			if l := p.cps.limit; l > 0 && l <= fair {
+			if l := p.cps.limitAt(cp.roundNo); l > 0 && l <= fair {
 				s.setShareLocked(p, uint64(max(l, minShare)))
 				left -= l
 				changed = true
