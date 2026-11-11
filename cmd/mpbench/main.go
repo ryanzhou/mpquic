@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"runtime/pprof"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -570,6 +571,10 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 	up0, relay0, down0 := b.hops(cmd == 'R')
 	_, back0, _ := b.hops(cmd != 'R') // the other direction: acknowledgements
 	var est []float64                 // the sender's bandwidth estimates added up, every 100 ms after the warm-up
+	// What the sender puts out, and what the relays pass on, per 100 ms from
+	// the start (the start-up included: that is where the peaks are).
+	var sentFine, relayedFine []float64
+	lastRelay := relay0
 	start := time.Now()
 	var samples []float64
 	var fine []float64 // 100 ms buckets after the 2 s warm-up, for jitter
@@ -591,6 +596,11 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 			maxStall = g
 		}
 		if now.Sub(lastFineAt) >= 100*time.Millisecond {
+			_, r, _ := b.hops(cmd == 'R')
+			d := r.sub(lastRelay)
+			lastRelay = r
+			sentFine = append(sentFine, mbps(int64(d.in), now.Sub(lastFineAt)))
+			relayedFine = append(relayedFine, mbps(int64(d.in-d.drop), now.Sub(lastFineAt)))
 			if now.Sub(start) > 2*time.Second {
 				fine = append(fine, mbps(cur-lastFine, now.Sub(lastFineAt)))
 				var sum uint64
@@ -661,6 +671,34 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		pc := func(h hop) float64 { return float64(h.drop) / float64(max(h.in, 1)) * 100 }
 		fmt.Printf("relays   carried %dMB for %dMB goodput (+%.1f%%); dropped: uplink %.2f%% relays %.2f%% downlink %.2f%%\n", relay.in>>20, got>>20,
 			(float64(relay.in)/float64(got)-1)*100, pc(up), pc(relay), pc(down))
+		// The sender's output over time: its peaks are what the relays (and
+		// whoever pays for their traffic) see, whatever arrives in the end.
+		if len(sentFine) > 0 {
+			peak1s := func(v []float64) float64 {
+				best := 0.0
+				for i := 0; i+10 <= len(v); i++ {
+					sum := 0.0
+					for _, x := range v[i : i+10] {
+						sum += x
+					}
+					best = max(best, sum/10)
+				}
+				return best
+			}
+			steady := slices.Clone(sentFine[min(len(sentFine), 20):])
+			sort.Float64s(steady)
+			q := func(f float64) float64 {
+				if len(steady) == 0 {
+					return 0
+				}
+				return steady[min(int(f*float64(len(steady))), len(steady)-1)]
+			}
+			fmt.Printf("sent     sender's output into the relays: peak %.0f Mbit/s over 100 ms, %.0f over 1 s (relays passed on: peak %.0f over 1 s); after 2 s: p50=%.0f p90=%.0f max=%.0f Mbit/s\n",
+				slices.Max(sentFine), peak1s(sentFine), peak1s(relayedFine), q(.5), q(.9), q(1))
+			if os.Getenv("MPBENCH_FINE") != "" {
+				fmt.Printf("         sent per 100 ms: %s\n", fmtSamples(sentFine))
+			}
+		}
 		// The other direction: acknowledgements (QUIC's and the session's),
 		// and whatever else runs there. On an asymmetric line they compete
 		// for the slower direction.
