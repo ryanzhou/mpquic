@@ -48,14 +48,14 @@ Reverse mode is described in [deployment.md](deployment.md#reverse-mode-the-loca
 
 | flag | config key | default | |
 |---|---|---|---|
-| `--congestion` | `congestion` | `bbr` | `bbr`, `bbr-aggressive`, `bbr-conservative`, `cubic` (quic-go built-in, for comparison) |
+| `--congestion` | `congestion` | `bbr` | only with `--no-coupling`: the per-path controller, `bbr`, `bbr-aggressive`, `bbr-conservative`; or `cubic` (quic-go built-in, for comparison; it bypasses the session rate) |
 | `--window` | `window` | `64MB` | maximum per-stream window (auto-tuned from 4 MB); one stream's rate ≤ window / slowest RTT |
 | `--chunk` | `chunk_size` | `16KB` | scheduling unit |
 | `--stats N` | `stats_interval` | off | log the session rate and per-path RTT/bandwidth/bytes every N s |
 | `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
-| `--up RATE` / `--down RATE` | `up` / `down` | measured | this endpoint's uplink / downlink rate, if known (`20mbit`, `"100 mbps"`; config numbers are bit/s). The session never sends more than `up` over all paths together and tells the peer to send no more than `down`; set them a little below the real rates (95%) and the line's buffer stays empty. Without them the session measures what it delivers over all paths and probes for more; see [session rate](design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow) |
-| `--no-coupling` | `no_coupling` | false | don't rate-control the paths together: each path's BBR probes for its bottleneck on its own, also when all paths share one (an endpoint's uplink or downlink) |
+| `--up RATE` / `--down RATE` | `up` / `down` | measured | this endpoint's uplink / downlink rate, if known (`20mbit`, `"100 mbps"`; config numbers are bit/s). The session never sends more than `up` over all paths together and tells the peer to send no more than `down`; set them a little below the real rates (95%) and the line's buffer stays empty. Without them the session measures what it delivers over all paths and probes for more; see [session rate](design/congestion.md#the-session-rate) |
+| `--no-coupling` | `no_coupling` | false | no session rate: every path runs a BBR of its own and probes for its bottleneck alone, also when all paths share one (an endpoint's uplink or downlink). For comparison, and as a fallback |
 | `--race-connect` | `race_connect` | false | remote only (incl. reverse), aggressive: open each outbound TCP connection by racing up to 5 attempts started at 0, 100, 300, 600 and 1000 ms (each from a new source port, rotating over the target's IPs, IPv6/IPv4 interleaved); the first to connect wins and the rest are aborted. For networks or NATs that drop connection setup, where a lost SYN otherwise stalls the connection for 1 s, 3 s or more. An attempt that fails outright starts the next at once |
 | `--reliable-udp` | `reliable_udp` | false | local/tunnel only, needs `-u`: relay all UDP over streams (retransmitted, congestion-controlled, any size; in order, so a loss delays later datagrams of the same association) instead of QUIC datagrams, which drop payloads the path MTU cannot carry. Datagrams sent faster than the tunnel carries them are dropped once ~200 ms are queued. The remote needs `-u` too. See [reliable UDP](design/proxy.md#reliable-udp) |
 | `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see [packet sizes](design/protocol.md#packet-sizes-mtu)) |
@@ -102,21 +102,23 @@ the deployment.
   ~1.3 Gbit/s at 150 ms (see
   [benchmarks/congestion-control.md](benchmarks/congestion-control.md)).
 * `chunk_size` (16 KB) is the scheduling granularity.
-* `congestion`: `bbr` (default), `bbr-aggressive` (faster startup),
-  `bbr-conservative` (gentler startup; avoid on Wi-Fi/cellular paths with
-  low RTT, see [per-path BBR](design/congestion.md#per-path-bbr)), `cubic` (quic-go's built-in loss-based controller, for
-  comparison only: it collapses under random loss and fills deep buffers).
+* `congestion`: the per-path controller that `no_coupling` uses: `bbr`
+  (default), `bbr-aggressive` (faster startup), `bbr-conservative` (gentler
+  startup; avoid on Wi-Fi/cellular paths with low RTT). `cubic` is quic-go's
+  built-in loss-based controller, for comparison only: it collapses under
+  random loss and fills deep buffers, and it bypasses the session rate. See
+  [BBR per path](design/congestion.md#without-the-session-rate-bbr-per-path).
 * `no_dup`: disables duplication if the relay traffic is metered.
 * `up` / `down` (e.g. `"20mbit"`): this endpoint's uplink and downlink
   rates, if known. Ceilings for what the session sends and receives over
   all paths together; the rates are measured without them. Set them a
   little below the real rates (95%) and the line's buffer stays empty. See
-  [session rate](design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow).
-* `no_coupling`: turns the session rate off; each path then probes for its
-  bottleneck on its own.
+  [session rate](design/congestion.md#the-session-rate).
+* `no_coupling`: turns the session rate off; each path then runs a BBR of
+  its own and probes for its bottleneck alone.
 * `stats_interval` (`--stats N`): logs the session rate (`rate=`, `limit=`)
-  and, per path, RTT, bandwidth estimate (`own=` when capped by the session
-  rate), bytes and `rate_drops` every N seconds: the first thing to look at
-  when a path misbehaves.
+  and, per path, RTT, the rate it paces at (`own=`: its own limit, if it
+  has one below its share), bytes and loss every N seconds: the first
+  thing to look at when a path misbehaves.
 * `GOMAXPROCS` (environment): the number of threads is adapted to the load;
   setting it pins the number (see [design/README.md](design/README.md#threads)).

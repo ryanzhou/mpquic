@@ -93,11 +93,10 @@ func (f *follower) InSlowStart() bool                         { return false }
 func (f *follower) InRecovery() bool                          { return false }
 func (f *follower) GetCongestionWindow() congestion.ByteCount { return f.window() }
 
-func (f *follower) ModeName() string             { return "follow" }
-func (f *follower) BandwidthEstimate() uint64    { return uint64(f.rate()) }
-func (f *follower) RawBandwidthEstimate() uint64 { return uint64(f.rate()) }
-func (f *follower) PacingRateBytes() uint64      { return uint64(f.rate()) }
-func (f *follower) Restart()                     {}
+func (f *follower) ModeName() string          { return "follow" }
+func (f *follower) BandwidthEstimate() uint64 { return uint64(f.rate()) }
+func (f *follower) PacingRateBytes() uint64   { return uint64(f.rate()) }
+func (f *follower) Restart()                  {}
 func (f *follower) MinRTT() time.Duration {
 	if f.rtt == nil {
 		return 0

@@ -122,6 +122,7 @@ type cpRound struct {
 	dt    time.Duration
 	busy  bool // the session was not waiting for data: it sent what it could, or the paths took no more
 	full  bool // ... and it did send what it could: what the round delivered and lost says what the pipe takes
+	queue bool // a path saw a queue
 }
 
 // coupling is the session's part (sess.mu held).
@@ -177,9 +178,10 @@ type cpPath struct {
 	base   [2]time.Duration
 	baseAt time.Time
 
-	rate  float64 // the rate at which the path's sends of the round before last were delivered (bytes/s)
-	lossy bool    // ... which lost more than the path's baseline
-	sent  float64 // how fast it sent in the last round (bytes/s)
+	acked0 uint64  // bytes acknowledged when the round began
+	rate   float64 // the rate at which acknowledgements came in during the last round (bytes/s)
+	sent   float64 // how fast it sent in the round before that (bytes/s)
+	lossy  bool    // the round before that lost more than the path's baseline
 
 	// lossBase is the share the path loses whatever the rate (random
 	// loss), as the rounds that send less than B show it.
@@ -326,6 +328,7 @@ func (s *Session) cpStartRoundLocked(now time.Time) {
 			continue
 		}
 		p.cps.rttMin = 0
+		p.cps.acked0 = p.meter.Acked()
 		// Packets sent from now on are counted for this round, and what
 		// becomes of them too (cc.Meter.RoundStats).
 		p.meter.StartRound(cp.roundNo)
@@ -412,6 +415,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	var e1, e2 float64
 	var allowed, used, usedRaw float64 // round k: what the paths could send, and did
 	var rate, rate2 float64            // the rate at which rounds k-1 (so far) and k-2 were delivered
+	var out float64                    // the rate at which acknowledgements came in during round k
 	loaded, queued := 0, 0
 	var lossy1, lossy2 uint64    // ... and what the paths sent that lost more than their baseline
 	commonQ := time.Duration(-1) // the queue all loaded paths saw
@@ -420,7 +424,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if p.meter == nil || p.state == stateDead {
 			continue
 		}
-		t1, t2 := p.meter.RoundStats(k-1), p.meter.RoundStats(k-2)
+		t1, t2, t3 := p.meter.RoundStats(k-1), p.meter.RoundStats(k-2), p.meter.RoundStats(k-3)
 		ps0 := p.meter.RoundStats(k).Sent
 		ps1, pa1, pl1 := t1.Sent, t1.Acked, t1.Lost
 		ps2, pa2, pl2 := t2.Sent, t2.Acked, t2.Lost
@@ -435,12 +439,18 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 				used += min(float64(ps0), share)
 			}
 		}
-		c.rate, c.sent, c.lossy = t2.Rate(r2.dt), 0, false
+		c.sent, c.lossy = 0, false
 		if r1.dt > 0 {
 			c.sent = float64(ps1) / r1.dt.Seconds()
 		}
-		rate += t1.Rate(r1.dt)
-		rate2 += c.rate
+		rate += t1.Rate(t2, r1.dt)
+		rate2 += t2.Rate(t3, r2.dt)
+		// What the path put out during the round, whatever round it was
+		// sent in.
+		if acked := p.meter.Acked(); acked >= c.acked0 {
+			c.rate = float64(acked-c.acked0) / dt.Seconds()
+			out += c.rate
+		}
 		if ps1 >= cpLoadedBytes {
 			s1, a1, l1, e1 = s1+ps1, a1+pa1, l1+pl1, e1+float64(ps1)*c.lossBase
 			if cpExcess(ps1, pl1, c.lossBase, 8) {
@@ -467,7 +477,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	}
 	commonQ = max(commonQ, 0)
 	busy := allowed > 0 && used >= cpBusyFrac*allowed
-	*h(k) = cpRound{cp.phase, cp.gain, dt, busy, allowed > 0 && usedRaw >= cpBusyFrac*allowed}
+	*h(k) = cpRound{cp.phase, cp.gain, dt, busy, allowed > 0 && usedRaw >= cpBusyFrac*allowed, queued > 0}
 
 	// Round k-1: what it delivered (nearly all of it is acknowledged by
 	// now, unless a queue is growing) and lost so far. Round k-2: its
@@ -486,14 +496,19 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	common2 := ok2 && float64(lossy2) >= cpCommon*float64(s2) && cpExcess(s2, l2, e2/float64(max(s2, 1)), 1)
 	// What the pipe took, as a send rate: with random loss more is sent
 	// than is delivered, and B is what is sent.
-	sample := rate
+	sample, now1 := rate, out
 	if ok1 {
 		sample = rate / (1 - min(e1/float64(s1), 0.5))
+		now1 = out / (1 - min(e1/float64(s1), 0.5))
 	}
 	sample2 := rate2
 	if ok2 {
 		sample2 = rate2 / (1 - min(e2/float64(s2), 0.5))
 	}
+	// What the pipe puts out now says what it takes if the session has
+	// been sending at B for two rounds: the acknowledgements of a round
+	// are for what was sent in it and in the one before.
+	steady := busy && r1.busy && ok1 && cp.phase == cpCruise && r1.phase == cpCruise
 
 	// The paths, each on its own account: a path that alone has a queue or
 	// loses (a relay slower than its share) carries what it delivers then.
@@ -574,7 +589,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		}
 		if over {
 			// B is what the pipe delivers now, not the most it ever did.
-			cp.setLocked(min(cp.bw, max(sample, cp.best/cpStartGrowth)))
+			cp.setLocked(min(cp.bw, max(now1, cp.best/cpStartGrowth)))
 		}
 		if over || limit > 0 && cp.bw >= float64(limit) {
 			next = cpDrain
@@ -588,14 +603,15 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			}
 		}
 	} else {
-		// The last round of the start-up lost too: what it delivered is
-		// what the pipe takes (the round before had a policer's burst
-		// allowance on top). Roughly a round later, better after two.
+		// The last round of the start-up lost too, and not to a queue
+		// that was full: a policer. What that round delivered is what the
+		// policer lets pass (the round before had its burst allowance on
+		// top). Roughly a round later, better after two.
 		switch {
-		case was == cpDrain && r1.phase == cpStartup && common1 && r1.full:
+		case was == cpDrain && r1.phase == cpStartup && common1 && r1.full && !r1.queue:
 			cp.setLocked(min(cp.bw, sample))
 			cp.ceil = cp.bw
-		case r2.phase == cpStartup && r1.phase == cpDrain && common2 && r2.full:
+		case r2.phase == cpStartup && r1.phase == cpDrain && common2 && r2.full && !r2.queue:
 			cp.setLocked(min(cp.bw, cpMargin*sample2))
 			cp.ceil = cp.bw
 		}
@@ -630,6 +646,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 					cp.probeGain = min(cp.probeGain*1.2, cpMaxProbeGain)
 				}
 			default:
+				// Little or nothing more: B is what it delivered, if that
+				// is more, and the next probe waits.
+				if sample2 > cp.bw {
+					cp.pushLocked(sample2)
+				}
 				cp.streak, cp.probeGain = 0, cpProbeGain
 				cp.backoff = min(cp.backoff+1, cpMaxBackoff)
 				cp.nextProbe = k + max(int64(1)<<cp.backoff, cp.hold)
@@ -639,11 +660,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		// sample is not exact, and the highest of ten would creep up), and
 		// less if it queued. (With loss, it may hold a policer's burst
 		// allowance.)
-		if r1.busy && ok1 && r1.phase == cpCruise && !common1 {
-			if rate*r1.dt.Seconds() >= cpKept*(float64(s1)-e1) {
+		if steady && !common1 {
+			if now1 >= cpKept*cp.bw {
 				cp.pushLocked(cp.bw)
 			} else {
-				cp.pushLocked(min(sample, cp.bw))
+				cp.pushLocked(now1)
 			}
 		}
 		// Loss beyond the baseline at B, on every path, two rounds in a
@@ -654,7 +675,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		case !ok2 || !r2.full || r2.phase != cpCruise || k-2 <= cp.cutRound:
 		case common2:
 			if cp.lossN++; cp.lossN >= cpLossRounds {
-				cp.setLocked(min(cpMargin*sample2, cp.bw))
+				v := sample2
+				if steady {
+					v = now1
+				}
+				cp.setLocked(min(cpMargin*v, cp.bw))
 				held()
 				cp.lossN, cp.cutRound, cp.wantDrain = 0, k, true
 			}
@@ -677,7 +702,8 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		// follows at once; a queue alone may not be ours. And a maximum of
 		// noisy samples is a few percent high: over ten queued rounds B is
 		// what was delivered if that is less.
-		if cp.congested && r1.busy && ok1 && r1.phase == cpCruise && cp.phase == cpCruise {
+		if cp.congested && steady {
+			sample := now1
 			cp.satN = min(cp.satN+1, cpSatRounds)
 			cp.sat[int(k)%cpSatRounds] = sample
 			var mean float64
