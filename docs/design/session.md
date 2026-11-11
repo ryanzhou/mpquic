@@ -26,7 +26,14 @@ offset, and delivered in order. ACKs are sent as datagrams on the **two**
 lowest-latency paths, so a single lossy or dead path can't delay
 acknowledgements; they are refreshed every 30 ms while data is arriving,
 since a datagram can be lost. Each ACK carries the cumulative point, the
-window and up to 200 SACK ranges.
+window and up to 200 SACK ranges (as many as fit in a datagram: about 110
+with 16 KB chunks; from 48 ranges on, the sender takes the list as complete
+only up to its last range).
+
+A window update is such an ACK too, sent once. A sender that is blocked by
+the window with nothing in flight therefore asks for it every 500 ms
+(WINDOW): otherwise one lost datagram would leave both ends waiting for
+each other until the idle timeout.
 
 ACKs travel against the data, through the receiver's uplink, which is often
 the slowest link of all (and may be busy with an upload):
@@ -96,8 +103,10 @@ decides what this path should send, in priority order:
    penalisation" tries to solve. Here it happens proactively and without
    shrinking anybody's congestion window.
 
-   **Eager redundancy.** Small chunks (≤ 8 KB: requests, TLS handshakes,
-   keystrokes) are additionally duplicated onto an idle second path whenever
+   **Eager redundancy.** Small chunks (requests, TLS handshakes,
+   keystrokes: all that the stream had to send was ≤ 8 KB; a slow path
+   carves small chunks from bulk data too, which does not count) are
+   additionally duplicated onto an idle second path whenever
    that copy would arrive before a loss recovery on the first path could.
    This uses a token bucket of 512 KB/s, so it never applies to bulk data. It
    cut the p99 latency of small round trips over a 2%-loss best path from 71

@@ -64,7 +64,11 @@ type relClock struct {
 	sent0    uint64
 	rate     float64 // bytes/s, while backlogged
 	haveRate bool
+	rateAt   time.Time // the last sample
 }
+
+// relRateAge is how long a drain rate stays valid without a new sample.
+const relRateAge = time.Second
 
 const relSample = 50 * time.Millisecond
 
@@ -78,6 +82,12 @@ func (c *relClock) congested(st *mp.Stream, now time.Time) bool {
 	case unsent < relMinBacklog/4:
 		// not backlogged: the drain rate is the sender's, not the paths'
 		c.t0 = time.Time{}
+		// An old rate says nothing about the paths now: one measured
+		// during an outage would otherwise drop every later burst, which
+		// drains too fast to be sampled again.
+		if c.haveRate && now.Sub(c.rateAt) > relRateAge {
+			c.haveRate = false
+		}
 	case c.t0.IsZero():
 		c.t0, c.sent0 = now, sent
 	case now.Sub(c.t0) >= relSample:
@@ -87,6 +97,7 @@ func (c *relClock) congested(st *mp.Stream, now time.Time) bool {
 		} else {
 			c.rate, c.haveRate = r, true
 		}
+		c.rateAt = now
 		c.t0, c.sent0 = now, sent
 	}
 	if unsent <= relMinBacklog || !c.haveRate {

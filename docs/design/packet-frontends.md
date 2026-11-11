@@ -30,8 +30,23 @@ replies are built as raw IP packets, fragmented to the interface MTU.
   default RACK: after a retransmission timeout RACK re-entered recovery on
   the first ACK and sent one or two segments per timeout, which stalled a
   connection for seconds after a burst loss.
+* A closed connection lingers for one second, not gVisor's 60 (TIME_WAIT).
+  gVisor passes a new SYN for the same addresses and ports only to a
+  listening socket; with a forwarder it was dropped, and clients reuse
+  source ports within a minute (Linux after a few thousand connections to
+  one destination): about one connection in thirty then stalled or timed
+  out under a few hundred connections per minute.
+* A handshake whose SYN-ACK is never answered is given up after four
+  retransmissions (31 s), and 4096 may be in progress. The stream is opened
+  with the SYN, so that the remote dials while the client completes the
+  handshake.
 * A UDP flow is released after 2 minutes without traffic, or after 15 s if
-  it only ever sent to port 53; an echo flow after 30 s.
+  it only ever sent to port 53; an echo flow after 30 s. A stack keeps at
+  most 4096 UDP flows and 4096 echo flows; beyond that the ones idle for
+  longest are dropped (a port scan or ping sweep through the tunnel).
+* gVisor sizes its pool of TCP processors by GOMAXPROCS when the stack is
+  created; the stack is created with the number of threads the process may
+  come to use, not the one it starts on (see "Threads" in the overview).
 * A datagram the paths cannot carry is answered with ICMP "fragmentation
   needed" / "packet too big" carrying the tunnel's limit; with UDP relaying
   off, UDP is answered with ICMP port unreachable.
@@ -58,7 +73,7 @@ flow in a batch are coalesced on the way back (GSO/GRO): one system call
 moves many packets.
 
 mpquic configures only what goes away with the interface (addresses, link
-state, routes through it). An existing persistent device of the same name is
+state, routes through it), and adds routes without replacing any. An existing persistent device of the same name is
 attached to instead and left in place. If the device disappears, the read
 loop fails and the process exits.
 

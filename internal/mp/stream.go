@@ -43,6 +43,7 @@ type chunk struct {
 	acked    bool
 	queued   bool // in the reinjection queue
 	queuedAt time.Time
+	small    bool // all its stream had to send was small (see carveLocked)
 }
 
 func (c *chunk) end() uint64 {
@@ -90,6 +91,7 @@ func (c *chunk) sentOn(p *Path) bool {
 type Stream struct {
 	id   uint64
 	sess *Session
+	done chan struct{} // closed when the stream is reset
 
 	// ---- send side (guarded by sess.mu) ----
 	sendBuf []*chunk // sent, unacknowledged chunks in offset order
@@ -144,6 +146,7 @@ type Stream struct {
 
 func newStream(s *Session, id uint64) *Stream {
 	st := &Stream{id: id, sess: s, peerWindow: initialPeerWindow, lastActive: time.Now(), created: time.Now(), sackLimit: ^uint64(0)}
+	st.done = make(chan struct{})
 	st.ooo = make(map[uint64]*chunk)
 	st.sendCond = sync.NewCond(&s.mu)
 	st.recvCond = sync.NewCond(&s.mu)
@@ -155,6 +158,11 @@ func newStream(s *Session, id uint64) *Stream {
 
 // ID returns the stream identifier.
 func (st *Stream) ID() uint64 { return st.id }
+
+// Done is closed when the stream is reset: by the peer, by Reset, by the
+// idle timeout or with the session. A stream that ends cleanly (both
+// directions closed) is not reset.
+func (st *Stream) Done() <-chan struct{} { return st.done }
 
 // Write queues p for transmission. It blocks while the send buffer is full.
 func (st *Stream) Write(p []byte) (int, error) {
@@ -229,8 +237,11 @@ func (st *Stream) insertSentLocked(c *chunk) {
 
 // carveLocked carves up to n bytes from the front (plus FIN if it follows).
 func (st *Stream) carveLocked(n int) *chunk {
+	// Small is what the stream had to send, not what the path made of it:
+	// a slow path carves small chunks from a bulk transfer too (maxChunk).
+	small := st.sq.avail() <= eagerMaxChunk
 	off, data, fin := st.sq.carveFront(n)
-	c := &chunk{st: st, off: off, data: data, fin: fin}
+	c := &chunk{st: st, off: off, data: data, fin: fin, small: small}
 	sz := int64(len(data))
 	if fin {
 		sz++
@@ -333,6 +344,13 @@ func (st *Stream) Close() error {
 		st.closeWriteLocked()
 	}
 	st.appClosed = true
+	if st.readyBytes > 0 {
+		// discarded, so consumed: otherwise the window stays short by
+		// this much, and a peer that still has data or its FIN to send
+		// may never be allowed to
+		st.consumed += uint64(st.readyBytes)
+		s.markAckLocked(st)
+	}
 	st.ready = nil
 	st.readyBytes = 0
 	s.maybeFinalizeLocked(st)
@@ -345,6 +363,7 @@ func (st *Stream) resetLocked(code uint64, notify bool) {
 	}
 	s := st.sess
 	st.err = &ResetError{Code: code, Remote: !notify}
+	close(st.done)
 	s.backlog -= st.unsent
 	st.unsent = 0
 	for _, c := range st.sendBuf {
@@ -364,6 +383,14 @@ func (st *Stream) resetLocked(code uint64, notify bool) {
 	st.sendCond.Broadcast()
 	st.recvCond.Broadcast()
 	if notify {
+		// The frame is written once, to the control streams of two paths.
+		// If they die with it, or there is no path right now, the peer
+		// would keep its side open until the idle timeout: remember it
+		// for the paths that come up next (addPath).
+		if len(s.resets) >= maxResets {
+			s.resets = append(s.resets[:0], s.resets[len(s.resets)-maxResets/2:]...)
+		}
+		s.resets = append(s.resets, sentReset{st.id, code, time.Now()})
 		s.sendCtrlBest(encodeU64s(frReset, st.id, code), 2)
 	}
 	s.maybeFinalizeLocked(st)
@@ -408,7 +435,7 @@ func (st *Stream) onAckLocked(e *ackEntry) {
 			st.sackHigh = max(st.sackHigh, e.ranges[n-1].end)
 		}
 	}
-	if len(e.ranges) >= maxAckRanges {
+	if len(e.ranges) >= ackRangesMayBeCut {
 		st.sackLimit = e.ranges[len(e.ranges)-1].end
 	} else {
 		st.sackLimit = ^uint64(0)
@@ -476,8 +503,10 @@ func (st *Stream) onChunkLocked(off uint64, data []byte, fin bool) {
 	st.addRangeLocked(c.off, c.end())
 	// Reordering across paths pins part of the window behind holes. If the
 	// undeliverable data fills half the window, the window (not the
-	// consumer) is the bottleneck: grow it.
-	if w := st.sess.opt.Window; st.recvWindow < uint64(w) && uint64(st.oooBytes+st.readyBytes) > st.recvWindow/2 {
+	// consumer) is the bottleneck: grow it. Data that is deliverable but
+	// unread does not count: that is a slow consumer, whose window (and
+	// the memory it pins) must stay small.
+	if w := st.sess.opt.Window; st.recvWindow < uint64(w) && uint64(st.oooBytes) > st.recvWindow/2 {
 		st.recvWindow = min(2*st.recvWindow, uint64(w))
 		st.sess.markAckLocked(st)
 	}

@@ -27,6 +27,19 @@ streams with reliable UDP (below). On the remote each association owns one
 UDP socket, so replies from any peer are relayed back (full-cone); an
 association without traffic for two minutes is closed.
 
+Relaying a datagram never waits. It is queued for the best path that takes
+its size and has room (64 datagrams per path, besides the connection's own
+32), and dropped otherwise: the sender is the reader of the TUN device or
+of a socket, with everybody's TCP behind it, and the remote's receive loop
+also carries the session's pings and acknowledgements. For the same reason
+the remote resolves targets given by name in a goroutine of the
+association, with the datagrams that wait for the answer, and keeps the
+answer for a minute (a failure for 5 s).
+
+The remote keeps at most 8192 associations (sockets), and 1024 sockets for
+echo flows; beyond that, and when the system refuses another socket, the
+ones idle for longest are closed.
+
 Two more datagram forms share that format:
 
 * `assoc_id` alone releases an association (the local sends it when a SOCKS

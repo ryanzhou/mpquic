@@ -54,7 +54,12 @@ type Path struct {
 	ctrlR  *bufio.Reader
 	ctrlQ  chan []byte
 	dgramQ chan []byte // control datagrams (unreliable: PING/PONG)
-	wake   chan struct{}
+	// Proxied UDP waiting to go out on this path (see Session.SendDatagram),
+	// and the largest datagram the connection takes (see dgramLimit).
+	udpQ       chan []byte
+	maxDgram   atomic.Int64 // 0: not known
+	maxDgramAt atomic.Int64 // unix nanoseconds
+	wake       chan struct{}
 	// Acknowledgements waiting to go out on this path: the latest state per
 	// stream and per path (see queueAcks).
 	ackMu       sync.Mutex
@@ -137,6 +142,7 @@ func newPath(s *Session, name string, index uint64, conn *quic.Conn, meter *cc.M
 		sess: s, name: name, index: index, conn: conn, meter: meter, ctrl: ctrl, ctrlR: ctrlR,
 		ctrlQ:       make(chan []byte, 1024),
 		dgramQ:      make(chan []byte, 256),
+		udpQ:        make(chan []byte, udpQueue),
 		ackSig:      make(chan struct{}, 1),
 		dgramChunk:  dgramChunkDefault,
 		streamUses:  make(map[uint64]int),
@@ -161,6 +167,7 @@ func (p *Path) run() error {
 	go p.sendLoop()
 	go p.recvDatagrams(ctx)
 	go p.sendDatagrams(ctx)
+	go p.sendUDP(ctx)
 	<-ctx.Done()
 	err := context.Cause(ctx)
 	p.sess.removePath(p, err)
@@ -220,6 +227,56 @@ func (p *Path) acceptUni(ctx context.Context) {
 			return
 		}
 		go p.readUni(rs)
+	}
+}
+
+// udpQueue is the number of proxied UDP datagrams that wait for a path
+// (besides the 32 that the connection queues): beyond it they are dropped,
+// as at a full interface queue.
+const udpQueue = 64
+
+// maxDgramAge is how long a path's datagram size limit is taken for
+// current: path MTU discovery raises it.
+const maxDgramAge = 200 * time.Millisecond
+
+// oversize is larger than any datagram a connection takes.
+var oversize = make([]byte, 1<<16)
+
+// dgramLimit returns the largest datagram the connection takes now, or 0 if
+// it takes none (it is closing). The connection says so, without sending
+// or waiting, when asked to send something too large.
+func (p *Path) dgramLimit(now int64) int64 {
+	if m := p.maxDgram.Load(); m > 0 && now-p.maxDgramAt.Load() < int64(maxDgramAge) {
+		return m
+	}
+	var tl *quic.DatagramTooLargeError
+	if err := p.conn.SendDatagram(oversize); !errors.As(err, &tl) {
+		return 0
+	}
+	p.maxDgram.Store(int64(tl.MaxDatagramPayloadSize))
+	p.maxDgramAt.Store(now)
+	return int64(tl.MaxDatagramPayloadSize)
+}
+
+// sendUDP sends the proxied UDP datagrams queued for the path. The
+// connection's own queue blocks when it is full (a slow or dead path), which
+// must not stop whoever relays the datagram: that is the reader of the TUN
+// device or of the WireGuard socket, with everybody's TCP behind it.
+func (p *Path) sendUDP(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case b := <-p.udpQ:
+			err := p.conn.SendDatagram(b)
+			var tl *quic.DatagramTooLargeError
+			if errors.As(err, &tl) {
+				// the limit dropped since it was asked for (dgramLimit)
+				p.maxDgram.Store(int64(tl.MaxDatagramPayloadSize))
+				p.maxDgramAt.Store(time.Now().UnixNano())
+				p.sess.noteOversize(len(b)-1, int(tl.MaxDatagramPayloadSize)-1, time.Now())
+			}
+		}
 	}
 }
 

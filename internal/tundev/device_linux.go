@@ -43,6 +43,35 @@ func createHint(err error) string {
 	return ""
 }
 
+// routeIsOurs reports whether the main table's route to rt's destination
+// goes through link.
+func routeIsOurs(link netlink.Link, rt *netlink.Route) bool {
+	fam := netlink.FAMILY_V6
+	if rt.Dst.IP.To4() != nil {
+		fam = netlink.FAMILY_V4
+	}
+	routes, err := netlink.RouteListFiltered(fam, &netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return false
+	}
+	want, _ := rt.Dst.Mask.Size()
+	for _, r := range routes {
+		if r.LinkIndex != link.Attrs().Index {
+			continue
+		}
+		if r.Dst == nil { // the default route
+			if want == 0 {
+				return true
+			}
+			continue
+		}
+		if ones, _ := r.Dst.Mask.Size(); ones == want && r.Dst.IP.Equal(rt.Dst.IP) {
+			return true
+		}
+	}
+	return false
+}
+
 func ipNet(p netip.Prefix) *net.IPNet {
 	return &net.IPNet{IP: p.Addr().AsSlice(), Mask: net.CIDRMask(p.Bits(), p.Addr().BitLen())}
 }
@@ -67,7 +96,17 @@ func configure(name string, addrs, routes []netip.Prefix) error {
 		if r.Addr().Is4() {
 			rt.Scope = netlink.SCOPE_LINK
 		}
-		if err := netlink.RouteReplace(rt); err != nil {
+		// Add, not replace: a route of the system to the same
+		// destination (its default route, say) would be gone for good,
+		// also after this process has exited.
+		if err := netlink.RouteAdd(rt); err != nil {
+			if errors.Is(err, unix.EEXIST) {
+				if routeIsOurs(link, rt) {
+					continue // a persistent interface: from an earlier run
+				}
+				return fmt.Errorf("route %s: the system already has a route to this destination, which --tun-route does not replace "+
+					"(use more specific routes, or a routing table of your own: see docs/tun.md)", r)
+			}
 			return fmt.Errorf("route %s: %w", r, err)
 		}
 	}

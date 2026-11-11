@@ -28,6 +28,8 @@ import (
 
 const (
 	minBps = 65536 // 64 KB/s
+	// minCappedBps is the least a path capped by the session paces at.
+	minCappedBps = 8 << 10
 
 	invalidPacketNumber            = -1
 	initialCongestionWindowPackets = 32
@@ -711,13 +713,34 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 }
 
 func (b *bbrSender) PacingRate() Bandwidth {
-	if b.pacingRate == 0 {
-		return Bandwidth(b.highGain * float64(
+	r := b.pacingRate
+	if r == 0 {
+		r = Bandwidth(b.highGain * float64(
 			BandwidthFromDelta(b.initialCongestionWindow, b.getMinRtt()),
 		))
 	}
+	if lim := b.capLimit(); lim > 0 {
+		r = min(r, lim)
+	}
+	return r
+}
 
-	return b.pacingRate
+// capLimit is the most a path with a session cap paces at, or 0 without
+// one. mpquic: the cap bounds what the path sends, not only its estimate.
+// STARTUP paces at 2.9 times the estimate, and a path whose estimate is
+// below its cap probes with its own gain: both went over a configured limit
+// (--up/--down), which is to be obeyed from the first packet. The session's
+// own probe gain still applies.
+func (b *bbrSender) capLimit() Bandwidth {
+	c := b.rateCap()
+	if c == 0 {
+		return 0
+	}
+	g := 1.0
+	if b.RateGain != nil {
+		g = max(g, b.RateGain())
+	}
+	return max(Bandwidth(g*float64(c)), minCappedBps*BytesPerSecond)
 }
 
 // Sets the CWND gain used in STARTUP.  Must be greater than 1.
@@ -811,11 +834,17 @@ func (b *bbrSender) Restart() {
 
 func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
 	bps := congestion.ByteCount(float64(b.PacingRate()) / float64(BytesPerSecond))
-	if bps < minBps {
+	floor := congestion.ByteCount(minBps)
+	if lim := b.capLimit(); lim > 0 {
+		// a session cap may be below the usual minimum (a slow line shared
+		// by several paths)
+		floor = min(floor, congestion.ByteCount(lim/BytesPerSecond))
+	}
+	if bps < floor {
 		// We need to make sure that the bandwidth value for pacer is never zero,
 		// otherwise it will go into an edge case where HasPacingBudget = false
 		// but TimeUntilSend is before, causing the quic-go send loop to go crazy and get stuck.
-		return minBps
+		return floor
 	}
 	return bps
 }
@@ -1036,6 +1065,13 @@ func (b *bbrSender) maybeRegrowAfterStale(now monotime.Time) {
 	}
 	if float64(b.bandwidthEstimate()) >= 0.8*float64(b.staleOldBw) {
 		b.staleOldBw = 0 // recovered
+		return
+	}
+	if !now.Before(b.staleReprobeUntil) {
+		// The rate did not come back in time: it dropped for good, and a
+		// later rise is found by the ordinary probes, not by a STARTUP
+		// that nobody expects any more.
+		b.staleOldBw = 0
 		return
 	}
 	if b.probeStartBw > 0 &&
