@@ -60,6 +60,7 @@ const (
 	cpProbeGain    = 1.25
 	cpMaxProbeGain = 2.0
 	cpMinProbeGain = 1.06
+	cpSmallProbes  = 3   // probes at the least gain before a full one again
 	cpProbeShow    = 0.5 // share of a probe's gain that must show in the delivery rate
 	cpDrainGain    = 0.75
 	cpMaxBackoff   = 3 // probes at least every 2^3 rounds
@@ -166,6 +167,7 @@ type coupling struct {
 	probeGain float64
 	probeBw   float64
 	probeLeft int // rounds of the probe still to come
+	small     int // probes at the least gain in a row that found nothing
 	backoff   int
 	streak    int
 	nextProbe int64
@@ -787,11 +789,17 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 				cp.backoff, cp.nextProbe = 0, k
 				cp.raised, cp.clean = k, 0
 				cp.probeGain = cpProbeGain
-				if cp.hold > 0 {
+				switch {
+				case cp.hold > 0:
 					cp.nextProbe = k + cpProbation + 2
-				} else if cp.streak >= 2 {
+				case r2.queue || r1.queue:
+					// It was delivered, but it queued: the pipe is nearly
+					// full, and a larger probe would mostly add to the
+					// queue (which is latency for every stream, and for
+					// the other direction's acknowledgements).
+				case cp.streak >= 2:
 					cp.probeGain = cpMaxProbeGain
-				} else {
+				default:
 					cp.probeGain = 1.5
 				}
 			default:
@@ -801,9 +809,17 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 				// paths' shares of it reach a common queue at different
 				// times), so B stays, and the next probe asks for half as
 				// much more: a little more shows in a small probe.
-				// (And sooner: a small probe queues little.)
+				// (And sooner: a small probe queues little.) Every few
+				// probes a full one again: where delivery is uneven
+				// (other traffic in the same queue), a small probe proves
+				// nothing either way, and B would stay where a dip put it.
 				cp.streak = 0
 				cp.probeGain = max(1+(r2.gain-1)/2, cpMinProbeGain)
+				if r2.gain <= cpMinProbeGain {
+					if cp.small++; cp.small >= cpSmallProbes {
+						cp.probeGain, cp.small = cpProbeGain, 0
+					}
+				}
 				cp.backoff = min(cp.backoff+1, cpMaxBackoff)
 				wait := float64(int64(1)<<cp.backoff) * (cp.probeGain - 1) / (cpProbeGain - 1)
 				cp.nextProbe = k + max(int64(wait), 1, cp.hold)
@@ -922,6 +938,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			next, cp.drainN = cpDrain, cp.drainN+1
 		}
 		if next != cpDrain {
+			if cp.dropped && cp.hold == 0 {
+				// The capacity dropped. It may come back: a full probe,
+				// soon.
+				cp.probeGain, cp.backoff, cp.small = cpProbeGain, 0, 0
+				cp.nextProbe = min(cp.nextProbe, k+3)
+			}
 			cp.drainQ, cp.dropped = 0, false
 		} else {
 			cp.drainQ = commonQ
