@@ -25,7 +25,11 @@ mpquic local -s remote.example.com:8388 -s relay-a.example.net:9000 -k 'long-ran
 
 mpquic creates the interface, assigns `--tun-addr`, brings it up and adds
 `--tun-route` to the main routing table; when it exits, the interface and
-with it the addresses and routes are gone. Anything more is ordinary
+with it the addresses and routes are gone. A route the system already has
+to the same destination (its default route, for instance) is not replaced:
+mpquic refuses to start. Use more specific routes (`0.0.0.0/1` and
+`128.0.0.0/1` instead of `default`), or a routing table of your own as
+below. Anything more is ordinary
 routing, done by you or by the router software that starts mpquic.
 
 ## Everything through the tunnel (Linux)

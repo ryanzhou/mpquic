@@ -111,4 +111,6 @@ WireGuard listener and the TUN interface (which needs a remote that knows
 it). Reliable UDP needs a
 remote that knows it; an older one refuses the streams (the local warns).
 Oversized UDP datagrams are no longer sent reliably on the control stream:
-they are dropped, unless reliable UDP is on.
+they are dropped, unless reliable UDP is on. The WINDOW control frame (a
+stream blocked by flow control asks for the window again) is ignored by
+older peers, which then behave as before.

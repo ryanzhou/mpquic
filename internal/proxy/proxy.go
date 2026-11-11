@@ -29,6 +29,8 @@ type Local struct {
 	Tunnel string
 	// UDP enables SOCKS5 UDP ASSOCIATE.
 	UDP *UDPLocal
+
+	acceptErrs rateLog
 }
 
 // Serve accepts connections on ln until it is closed.
@@ -41,16 +43,26 @@ func (l *Local) Serve(ln net.Listener) error {
 		}
 		tunnelAddr = a
 	}
+	var backoff time.Duration
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				time.Sleep(10 * time.Millisecond)
-				continue
+			if errors.Is(err, net.ErrClosed) {
+				return err
 			}
-			return err
+			// Anything else passes: out of file descriptors or buffers, a
+			// connection reset before it was accepted. Giving up would take
+			// the whole local down, with its other listeners.
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff *= 2; backoff > time.Second {
+				backoff = time.Second
+			}
+			l.acceptErrs.note(l.Log, "accept failed, retrying: "+err.Error())
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
 		go l.handle(c, tunnelAddr)
 	}
 }
@@ -182,6 +194,19 @@ var bufPool = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }
 // implement CloseWrite() error (half-close) and Abort() (close with a reset).
 func Pipe(c net.Conn, st *mp.Stream) {
 	done := make(chan struct{})
+	finished := make(chan struct{})
+	defer close(finished)
+	// A reset of the stream ends the relay whatever the two directions are
+	// doing: either may be waiting on the connection (a peer that neither
+	// sends nor closes, or one that has stopped reading), where it would
+	// not notice, and keep the connection open indefinitely.
+	go func() {
+		select {
+		case <-st.Done():
+			abort(c)
+		case <-finished:
+		}
+	}()
 	go func() {
 		defer close(done)
 		bp := bufPool.Get().(*[]byte)
@@ -199,18 +224,23 @@ func Pipe(c net.Conn, st *mp.Stream) {
 	if err != nil {
 		// Peer reset or local write error: abort both sides.
 		st.Reset(mp.ResetGeneric)
-		if tc, ok := c.(*net.TCPConn); ok {
-			tc.SetLinger(0)
-		} else if a, ok := c.(interface{ Abort() }); ok {
-			a.Abort()
-		}
-		c.Close()
+		abort(c)
 	} else if cw, ok := c.(interface{ CloseWrite() error }); ok {
 		cw.CloseWrite()
 	}
 	<-done
 	c.Close()
 	st.Close()
+}
+
+// abort closes c with a reset.
+func abort(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetLinger(0)
+	} else if a, ok := c.(interface{ Abort() }); ok {
+		a.Abort()
+	}
+	c.Close()
 }
 
 type readerOnly struct{ io.Reader }

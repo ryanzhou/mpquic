@@ -14,8 +14,6 @@ import (
 	"time"
 
 	"mpquic/internal/cc"
-
-	"github.com/apernet/quic-go"
 )
 
 var errSessionClosed = errors.New("session closed")
@@ -71,8 +69,12 @@ type Session struct {
 	// interval, as we compute our own: see ackEveryLocked)
 	ackWait time.Duration
 
-	lastSlowTick  time.Time
-	lastReAck     time.Time
+	lastSlowTick time.Time
+	lastReAck    time.Time
+	lastWinProbe time.Time
+	// resets sent recently, newest last: sent again on every new path, as
+	// the path that carried one may have died with it (see resetLocked)
+	resets        []sentReset
 	lastStatsTick time.Time
 }
 
@@ -175,9 +177,12 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	p.id = s.nextPID
 	p.state = stateActive
 	s.paths = append(s.paths, p)
-	if r := s.opt.MaxRecvRate; r > 0 {
-		// on every path's control stream (reliable); older peers ignore it
-		p.sendCtrl(encodeU64s(frLimit, r))
+	// On every path's control stream (reliable); older peers ignore it.
+	// Also without a limit: the peer may remember one from before this end
+	// was restarted without it.
+	p.sendCtrl(encodeU64s(frLimit, s.opt.MaxRecvRate))
+	if b := s.recentResetsLocked(time.Now()); len(b) > 0 {
+		p.sendCtrl(b)
 	}
 	s.wakeAllLocked()
 	s.log.Info("path up", "path", p.name, "count", s.activeCountLocked())
@@ -431,6 +436,22 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 			s.closedIDs[v[0]] = time.Now()
 		}
 		s.mu.Unlock()
+	case frWindow:
+		v, err := decodeU64s(body, 1)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if st := s.streams[v[0]]; st != nil {
+			s.markAckLocked(st)
+		} else if _, ok := s.closedIDs[v[0]]; ok || s.acceptFn == nil {
+			s.ackAllIDs = append(s.ackAllIDs, v[0]) // as for data of a stream that is gone
+			select {
+			case s.ackSig <- struct{}{}:
+			default:
+			}
+		}
+		s.mu.Unlock()
 	case frLimit:
 		v, err := decodeU64s(body, 1)
 		if err != nil {
@@ -535,6 +556,35 @@ const tickInterval = 10 * time.Millisecond
 
 const reAckInterval = 30 * time.Millisecond
 
+// winProbeInterval is how often a stream blocked by the peer's window asks
+// for it (see tick).
+const winProbeInterval = 500 * time.Millisecond
+
+const (
+	resetMemory = time.Minute // resets are sent again on paths that come up within
+	maxResets   = 1024
+)
+
+type sentReset struct {
+	id, code uint64
+	at       time.Time
+}
+
+// recentResetsLocked returns the frames of the resets sent within
+// resetMemory, and forgets the older ones.
+func (s *Session) recentResetsLocked(now time.Time) []byte {
+	i := 0
+	for i < len(s.resets) && now.Sub(s.resets[i].at) > resetMemory {
+		i++
+	}
+	s.resets = s.resets[i:]
+	var b []byte
+	for _, r := range s.resets {
+		b = append(b, encodeU64s(frReset, r.id, r.code)...)
+	}
+	return b
+}
+
 func (s *Session) tickLoop() {
 	t := time.NewTimer(tickInterval)
 	defer t.Stop()
@@ -596,6 +646,19 @@ func (s *Session) tick(now time.Time) bool {
 		for _, p := range s.paths {
 			if now.Sub(p.rxAt) < 500*time.Millisecond {
 				p.rxDirty = true
+			}
+		}
+	}
+	if now.Sub(s.lastWinProbe) >= winProbeInterval {
+		// A stream that is blocked by the peer's window with nothing in
+		// flight hears from the peer only when the window opens, in an ACK
+		// that is sent once, as a datagram. If that one is lost (or all
+		// paths were down), both ends would wait for each other until the
+		// idle timeout: ask.
+		s.lastWinProbe = now
+		for _, st := range s.streams {
+			if st.err == nil && len(st.sendBuf) == 0 && st.pendingData() > 0 && st.peerWindow <= st.sq.frontOff() {
+				s.sendCtrlBest(encodeU64s(frWindow, st.id), 2)
 			}
 		}
 	}
@@ -672,23 +735,34 @@ func (s *Session) SendDatagram(b []byte, hdrLen int) error {
 	if len(paths) == 0 {
 		return errors.New("no path available")
 	}
+	// SendDatagram does not block: the datagram is queued for the best path
+	// that takes its size and has room, and dropped if none has (as a full
+	// interface queue would).
 	msg := append([]byte{dgUDP}, b...)
 	limit := -1 // largest payload some path carries
-	var lastErr error
+	busy := false
+	now := time.Now().UnixNano()
 	for _, p := range paths {
-		err := p.conn.SendDatagram(msg)
-		if err == nil {
-			return nil
+		m := p.dgramLimit(now)
+		if m == 0 {
+			continue // the path is closing
 		}
-		var tl *quic.DatagramTooLargeError
-		if !errors.As(err, &tl) {
-			lastErr = err // e.g. the path is closing
+		if int64(len(msg)) > m {
+			limit = max(limit, int(m)-1-hdrLen)
 			continue
 		}
-		limit = max(limit, int(tl.MaxDatagramPayloadSize)-1-hdrLen)
+		select {
+		case p.udpQ <- msg:
+			return nil
+		default:
+			busy = true // this path would take it, but has no room
+		}
+	}
+	if busy {
+		return nil // dropped: congestion
 	}
 	if limit < 0 {
-		return lastErr
+		return errors.New("no path available")
 	}
 	size := len(b) - hdrLen
 	s.noteOversize(size, max(limit, 0), time.Now())

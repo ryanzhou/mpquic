@@ -2,9 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -200,9 +205,11 @@ func (u *UDPLocal) associate(c net.Conn) {
 type UDPRemote struct {
 	Log *slog.Logger
 
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	assocs map[assocKey]*remoteAssoc
 	icmp   *icmpRemote
+	// sockets that could not be opened, associations closed to make room
+	failed, evicted rateLog
 }
 
 type assocKey struct {
@@ -210,10 +217,54 @@ type assocKey struct {
 	id uint64
 }
 
+// remoteAssoc is the remote side of an association: one UDP socket.
 type remoteAssoc struct {
-	pc    *net.UDPConn
-	last  atomic.Int64
-	cache sync.Map // string -> *net.UDPAddr
+	pc   *net.UDPConn
+	last atomic.Int64
+	done chan struct{} // closed with the socket
+	once sync.Once
+
+	// Targets given by name are resolved by a goroutine of the association
+	// (see sendToName).
+	nmu     sync.Mutex
+	names   map[string]nameEntry
+	lookups chan nameDgram
+}
+
+type nameEntry struct {
+	ap    netip.AddrPort // invalid: the lookup failed
+	until time.Time
+}
+
+type nameDgram struct {
+	target  string
+	payload []byte
+}
+
+const (
+	// dgramReadBuf is the read buffer of a socket whose datagrams travel
+	// as QUIC DATAGRAMs: larger than anything a QUIC packet (at most 1452
+	// bytes) can carry, so a datagram that fills it is dropped as too large
+	// anyway. A 64 KB buffer per association was 128 KB of stack each.
+	dgramReadBuf = 2048
+	// maxRemoteAssocs bounds the associations (sockets) of a remote. Beyond
+	// it, and when the system refuses another socket, the associations idle
+	// for longest are closed: a port scan or a flood of flows through the
+	// tunnel must not take the file descriptors that TCP connections need.
+	maxRemoteAssocs = 8192
+
+	nameTTL      = time.Minute
+	nameFailTTL  = 5 * time.Second
+	nameTimeout  = 5 * time.Second
+	maxNames     = 256
+	lookupsQueue = 16
+)
+
+func (a *remoteAssoc) close() {
+	a.once.Do(func() {
+		a.pc.Close()
+		close(a.done)
+	})
 }
 
 func NewUDPRemote(log *slog.Logger) *UDPRemote {
@@ -222,7 +273,9 @@ func NewUDPRemote(log *slog.Logger) *UDPRemote {
 	return u
 }
 
-// HandleDatagram is the mp.Options.DatagramHandler for the server.
+// HandleDatagram is the mp.Options.DatagramHandler for the server. It runs
+// on the path's receive loop, which also carries the session's pings and
+// acknowledgements: it must not block.
 func (u *UDPRemote) HandleDatagram(s *mp.Session, b []byte) {
 	r := bytes.NewReader(b)
 	id, err := quicvarint.Read(r)
@@ -230,71 +283,202 @@ func (u *UDPRemote) HandleDatagram(s *mp.Session, b []byte) {
 		return
 	}
 	k := assocKey{s, id}
+	rest := b[len(b)-r.Len():]
 	if id == icmpAssoc {
-		u.icmp.handle(s, b[len(b)-r.Len():])
+		u.icmp.handle(s, rest)
 		return
 	}
-	if r.Len() == 0 { // the local released the association
+	if len(rest) == 0 { // the local released the association
 		u.mu.Lock()
 		if a := u.assocs[k]; a != nil {
-			a.pc.Close()
+			a.close()
 			delete(u.assocs, k)
 		}
 		u.mu.Unlock()
 		return
 	}
-	target, _, err := ReadAddr(r)
+	al := addrLen(rest)
+	if al < 0 {
+		return
+	}
+	u.mu.RLock()
+	a := u.assocs[k]
+	u.mu.RUnlock()
+	if a == nil {
+		if a = u.newAssoc(s, k); a == nil {
+			return
+		}
+	}
+	a.last.Store(time.Now().UnixNano())
+	if ap, _, ok := ParseAddrPort(rest); ok {
+		a.pc.WriteToUDPAddrPort(rest[al:], ap)
+		return
+	}
+	target, _, err := ReadAddr(bytes.NewReader(rest[:al]))
 	if err != nil {
 		return
 	}
-	payload := b[len(b)-r.Len():]
+	a.sendToName(u.Log, target, rest[al:])
+}
+
+// newAssoc opens the socket of a new association.
+func (u *UDPRemote) newAssoc(s *mp.Session, k assocKey) *remoteAssoc {
 	u.mu.Lock()
-	a := u.assocs[k]
-	if a == nil {
-		pc, err := net.ListenUDP("udp", nil)
-		if err != nil {
-			u.mu.Unlock()
-			return
-		}
-		a = &remoteAssoc{pc: pc}
-		u.assocs[k] = a
-		go u.readLoop(s, id, a)
+	defer u.mu.Unlock()
+	if a := u.assocs[k]; a != nil {
+		return a
 	}
-	u.mu.Unlock()
+	if len(u.assocs) >= maxRemoteAssocs {
+		u.evictLocked()
+	}
+	pc, err := net.ListenUDP("udp", nil)
+	if err != nil && len(u.assocs) > 0 {
+		// e.g. out of file descriptors: make room and try once more
+		u.evictLocked()
+		pc, err = net.ListenUDP("udp", nil)
+	}
+	if err != nil {
+		u.failed.note(u.Log, "cannot open a socket for a UDP association: "+err.Error())
+		return nil
+	}
+	a := &remoteAssoc{pc: pc, done: make(chan struct{})}
 	a.last.Store(time.Now().UnixNano())
-	var ua *net.UDPAddr
-	if v, ok := a.cache.Load(target); ok {
-		ua = v.(*net.UDPAddr)
-	} else {
-		ua, err = net.ResolveUDPAddr("udp", target)
-		if err != nil {
-			u.Log.Debug("udp resolve", "target", target, "err", err)
-			return
-		}
-		a.cache.Store(target, ua)
+	u.assocs[k] = a
+	go u.readLoop(s, k.id, a)
+	return a
+}
+
+// evictLocked closes the eighth of the associations that has been idle for
+// longest.
+func (u *UDPRemote) evictLocked() {
+	if len(u.assocs) == 0 {
+		return
 	}
-	a.pc.WriteToUDP(payload, ua)
+	last := make([]int64, 0, len(u.assocs))
+	for _, a := range u.assocs {
+		last = append(last, a.last.Load())
+	}
+	slices.Sort(last)
+	limit := last[len(last)/8]
+	n := 0
+	for k, a := range u.assocs {
+		if a.last.Load() <= limit {
+			a.close()
+			delete(u.assocs, k)
+			n++
+		}
+	}
+	u.evicted.note(u.Log, fmt.Sprintf("too many UDP associations: closed the %d idle for longest", n))
+}
+
+// sendToName sends payload to a target given by name. The lookup must not
+// hold up the caller (see HandleDatagram): a goroutine of the association
+// does it, with the datagrams that wait for it, and the answer is kept for
+// a while, as is a failure.
+func (a *remoteAssoc) sendToName(log *slog.Logger, target string, payload []byte) {
+	a.nmu.Lock()
+	if e, ok := a.names[target]; ok && time.Now().Before(e.until) {
+		a.nmu.Unlock()
+		if e.ap.IsValid() {
+			a.pc.WriteToUDPAddrPort(payload, e.ap)
+		}
+		return
+	}
+	if a.lookups == nil {
+		a.lookups = make(chan nameDgram, lookupsQueue)
+		go a.resolver(log)
+	}
+	ch := a.lookups
+	a.nmu.Unlock()
+	select {
+	case ch <- nameDgram{target, bytes.Clone(payload)}:
+	default: // the lookups are slower than the datagrams arrive: drop
+	}
+}
+
+func (a *remoteAssoc) resolver(log *slog.Logger) {
+	for {
+		var d nameDgram
+		select {
+		case <-a.done:
+			return
+		case d = <-a.lookups:
+		}
+		a.nmu.Lock()
+		e, ok := a.names[d.target]
+		a.nmu.Unlock()
+		if !ok || !time.Now().Before(e.until) {
+			ap, err := lookupUDP(d.target)
+			e = nameEntry{ap: ap, until: time.Now().Add(nameTTL)}
+			if err != nil {
+				log.Debug("udp resolve", "target", d.target, "err", err)
+				e.until = time.Now().Add(nameFailTTL)
+			}
+			a.nmu.Lock()
+			if a.names == nil || len(a.names) >= maxNames {
+				a.names = make(map[string]nameEntry)
+			}
+			a.names[d.target] = e
+			a.nmu.Unlock()
+		}
+		if e.ap.IsValid() {
+			a.pc.WriteToUDPAddrPort(d.payload, e.ap)
+		}
+	}
+}
+
+// testLookup replaces the resolver in tests.
+var testLookup atomic.Pointer[func(ctx context.Context, network, host string) ([]netip.Addr, error)]
+
+// lookupUDP resolves "name:port" like net.ResolveUDPAddr (the first IPv4
+// address, else the first), within nameTimeout.
+func lookupUDP(target string) (netip.AddrPort, error) {
+	host, ps, err := net.SplitHostPort(target)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	port, err := strconv.ParseUint(ps, 10, 16)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), nameTimeout)
+	defer cancel()
+	lookup := net.DefaultResolver.LookupNetIP
+	if f := testLookup.Load(); f != nil {
+		lookup = *f
+	}
+	ips, err := lookup(ctx, "ip", host)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	if len(ips) == 0 {
+		return netip.AddrPort{}, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	ip := ips[0]
+	for _, c := range ips {
+		if c.Unmap().Is4() {
+			ip = c
+			break
+		}
+	}
+	return netip.AddrPortFrom(ip.Unmap(), uint16(port)), nil
 }
 
 func (u *UDPRemote) readLoop(s *mp.Session, id uint64, a *remoteAssoc) {
 	hdr := quicvarint.Append(nil, id)
-	buf := make([]byte, 65536)
+	var buf [dgramReadBuf]byte
 	for {
-		n, from, err := a.pc.ReadFromUDP(buf)
+		n, from, err := a.pc.ReadFromUDPAddrPort(buf[:])
 		if err != nil {
 			return
 		}
 		a.last.Store(time.Now().UnixNano())
-		ip := from.IP
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-		}
-		addr, _ := EncodeAddr((&net.UDPAddr{IP: ip, Port: from.Port}).String())
-		msg := make([]byte, 0, len(hdr)+len(addr)+n)
+		msg := make([]byte, 0, len(hdr)+19+n)
 		msg = append(msg, hdr...)
-		msg = append(msg, addr...)
+		msg = AppendAddrPort(msg, from)
+		al := len(msg)
 		msg = append(msg, buf[:n]...)
-		if err := s.SendDatagram(msg, len(hdr)+len(addr)); err != nil && s.Context().Err() != nil {
+		if err := s.SendDatagram(msg, al); err != nil && s.Context().Err() != nil {
 			return
 		}
 	}
@@ -307,7 +491,7 @@ func (u *UDPRemote) reaper() {
 		u.mu.Lock()
 		for k, a := range u.assocs {
 			if now-a.last.Load() > int64(udpIdle) || k.s.Context().Err() != nil {
-				a.pc.Close()
+				a.close()
 				delete(u.assocs, k)
 			}
 		}

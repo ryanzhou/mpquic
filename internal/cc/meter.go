@@ -55,6 +55,7 @@ type Meter struct {
 	minRTT   atomic.Int64
 	pacing   atomic.Uint64
 	mode     atomic.Value
+	lastMode string // of publish (the connection's goroutine)
 
 	appLimited atomic.Bool
 	probeGate  atomic.Pointer[ProbeGate]
@@ -99,7 +100,9 @@ func (m *Meter) takeMark(now int64) {
 	if t := m.markAt.Load(); t != 0 && now >= t {
 		m.markAcked.Store(m.acked.Load())
 		m.markTime.Store(m.ackedAt.Load())
-		m.markAt.Store(0)
+		// not Store(0): a Mark set meanwhile (the session's next round)
+		// must stay, or that round would read this one's result again
+		m.markAt.CompareAndSwap(t, 0)
 	}
 }
 
@@ -239,7 +242,12 @@ func (m *Meter) modeName() string {
 }
 
 func (m *Meter) publish() {
-	m.mode.Store(m.s.ModeName())
+	// stored only when it changes: boxing the string allocates, and this
+	// runs for every ACK
+	if name := m.s.ModeName(); name != m.lastMode {
+		m.lastMode = name
+		m.mode.Store(name)
+	}
 	m.bw.Store(m.s.BandwidthEstimate())
 	m.rawBw.Store(m.s.RawBandwidthEstimate())
 	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))

@@ -59,6 +59,7 @@ const (
 	// 5 was frDgram (an oversized UDP datagram sent reliably); unused now
 	frPathAck = 6 // pathIndex, largest dseq, 32-byte bitmap of the 256 dseqs below
 	frLimit   = 7 // rate: the most the sender of the frame wants to receive over all paths (bytes/s, 0 = no limit)
+	frWindow  = 8 // id: the sender is blocked by the stream's window and asks for it again (older peers ignore it)
 )
 
 // pathAckBits is how many datagram sequence numbers below the largest one a
@@ -85,6 +86,14 @@ type ackRange struct{ start, end uint64 } // [start,end)
 // maxAckRanges bounds the SACK ranges per stream in one ACK. Ranges are
 // delta-encoded (gap, length), typically 4 bytes each.
 const maxAckRanges = 200
+
+// ackRangesMayBeCut: an ACK with at least this many ranges may have lost
+// its last ones to the size of a datagram (a range takes up to 8 bytes with
+// 16 KB chunks, so about 110 fit, and the encoder used to halve the list
+// until it did). The sender cannot tell, so from here on it takes the list
+// as complete only up to its last range. Taking a cut list for complete
+// made it resend what the receiver already had.
+const ackRangesMayBeCut = 48
 
 type ackEntry struct {
 	id     uint64
@@ -123,7 +132,9 @@ func encodeAckDatagrams(entries []ackEntry) [][]byte {
 	for _, e := range entries {
 		b := encodeAckEntry(e)
 		for len(b) > budget && len(e.ranges) > 0 {
-			e.ranges = e.ranges[:len(e.ranges)/2]
+			// drop the last ranges until it fits (never below
+			// ackRangesMayBeCut: the sender relies on that)
+			e.ranges = e.ranges[:max(len(e.ranges)*7/8, min(len(e.ranges)-1, ackRangesMayBeCut))]
 			b = encodeAckEntry(e)
 		}
 		if size+len(b) > budget {
@@ -190,7 +201,8 @@ func decodeAck(body []byte) ([]ackEntry, error) {
 	if err != nil || n > 1<<16 {
 		return nil, errors.New("bad ack")
 	}
-	out := make([]ackEntry, 0, n)
+	// an entry is at least 4 bytes: don't allocate for more than can follow
+	out := make([]ackEntry, 0, min(n, uint64(len(body)/4)))
 	for i := uint64(0); i < n; i++ {
 		var e ackEntry
 		if e.id, err = r.varint(); err != nil {

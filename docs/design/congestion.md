@@ -179,7 +179,9 @@ loss is that path's business.
   `up` over all paths together, and it announces `down` to the peer (a
   control frame; older peers ignore it), which then sends no more than
   that. The limit is a ceiling for *B*, obeyed from the first packet (also
-  in STARTUP, and with a single path) and never probed. Below it everything
+  in STARTUP, and with a single path) and never probed: every path's share
+  of it bounds what the path paces at, not only its estimate, and at the
+  start, when no path has an estimate, the shares are equal. Below it everything
   above still applies, so a line that is slower than configured is handled
   as without the option. Set them a little below the real rates (95%) and
   the bottleneck's queue stays empty.

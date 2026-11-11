@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/apernet/quic-go/quicvarint"
@@ -35,6 +37,9 @@ import (
 const (
 	icmpAssoc = 0
 	icmpIdle  = time.Minute
+	// maxEchoSockets bounds the unprivileged ICMP sockets (one per echo
+	// flow): a ping sweep must not take the remote's file descriptors.
+	maxEchoSockets = 1024
 )
 
 // EchoFlows is the number of echo flow ids of one receiver of echo replies.
@@ -124,6 +129,7 @@ type icmpRemote struct {
 	raw      [2]*rawPinger // per family (0: IPv4, 1: IPv6), opened on demand
 	noRaw    [2]bool       // raw socket unavailable
 	noDgram  [2]bool       // unprivileged ICMP sockets unavailable
+	sockets  int           // flows with a socket of their own
 	reported [2]bool       // warned that pings cannot be sent
 }
 
@@ -228,12 +234,27 @@ func (u *icmpRemote) newFlowLocked(k echoKey) *echoFlow {
 		network, laddr = "udp6", "::"
 	}
 	if !u.noDgram[fam] {
+		if u.sockets >= maxEchoSockets {
+			u.evictLocked()
+		}
 		c, err := u.listen(network, laddr)
+		if err != nil && outOfResources(err) && u.sockets > 0 {
+			u.evictLocked()
+			c, err = u.listen(network, laddr)
+		}
 		if err == nil {
 			f := &echoFlow{key: k, conn: c}
+			f.last.Store(time.Now().UnixNano())
 			u.flows[k] = f
-			go u.readLoop(c, k.v6, func(uint16) *echoFlow { return f })
+			u.sockets++
+			go u.readLoop(c, k.v6, dgramReadBuf, func(uint16) *echoFlow { return f })
 			return f
+		}
+		if outOfResources(err) {
+			// not a verdict on ICMP sockets: this ping is lost, the next
+			// tries again
+			u.log.Debug("cannot open an ICMP socket", "network", network, "err", err)
+			return nil
 		}
 		u.log.Debug("unprivileged ICMP socket unavailable, trying a raw socket", "network", network, "err", err)
 		u.noDgram[fam] = true
@@ -265,6 +286,10 @@ func (u *icmpRemote) rawLocked(v6 bool) *rawPinger {
 	}
 	c, err := u.listen(network, laddr)
 	if err != nil {
+		if outOfResources(err) {
+			u.log.Debug("cannot open a raw ICMP socket", "network", network, "err", err)
+			return nil
+		}
 		u.noRaw[fam] = true
 		if !u.reported[fam] {
 			u.reported[fam] = true
@@ -274,7 +299,7 @@ func (u *icmpRemote) rawLocked(v6 bool) *rawPinger {
 	}
 	rp := &rawPinger{conn: c, byID: make(map[uint16]*echoFlow), nextID: uint16(time.Now().UnixNano())}
 	u.raw[fam] = rp
-	go u.readLoop(c, v6, func(id uint16) *echoFlow {
+	go u.readLoop(c, v6, 65536, func(id uint16) *echoFlow {
 		u.mu.Lock()
 		defer u.mu.Unlock()
 		return rp.byID[id]
@@ -282,13 +307,14 @@ func (u *icmpRemote) rawLocked(v6 bool) *rawPinger {
 	return rp
 }
 
-// readLoop relays the echo replies received on c to their flows.
-func (u *icmpRemote) readLoop(c net.PacketConn, v6 bool, lookup func(id uint16) *echoFlow) {
+// readLoop relays the echo replies received on c to their flows. A reply
+// that fills a flow's small buffer could not travel as a datagram anyway.
+func (u *icmpRemote) readLoop(c net.PacketConn, v6 bool, bufSize int, lookup func(id uint16) *echoFlow) {
 	proto, reply := 1, icmp.Type(ipv4.ICMPTypeEchoReply)
 	if v6 {
 		proto, reply = 58, ipv6.ICMPTypeEchoReply
 	}
-	buf := make([]byte, 65536)
+	buf := make([]byte, bufSize)
 	for {
 		n, peer, err := c.ReadFrom(buf)
 		if err != nil {
@@ -327,12 +353,46 @@ func (u *icmpRemote) reap(now int64) {
 	defer u.mu.Unlock()
 	for k, f := range u.flows {
 		if now-f.last.Load() > int64(icmpIdle) || k.s.Context().Err() != nil {
-			if f.conn != nil {
-				f.conn.Close()
-			} else if rp := u.raw[family(k.v6)]; rp != nil {
-				delete(rp.byID, f.rawID)
-			}
-			delete(u.flows, k)
+			u.closeLocked(f)
 		}
 	}
+}
+
+func (u *icmpRemote) closeLocked(f *echoFlow) {
+	if f.conn != nil {
+		f.conn.Close()
+		u.sockets--
+	} else if rp := u.raw[family(f.key.v6)]; rp != nil {
+		delete(rp.byID, f.rawID)
+	}
+	delete(u.flows, f.key)
+}
+
+// evictLocked closes the eighth of the flows with a socket of their own
+// that has been idle for longest.
+func (u *icmpRemote) evictLocked() {
+	var last []int64
+	for _, f := range u.flows {
+		if f.conn != nil {
+			last = append(last, f.last.Load())
+		}
+	}
+	if len(last) == 0 {
+		return
+	}
+	slices.Sort(last)
+	limit := last[len(last)/8]
+	for _, f := range u.flows {
+		if f.conn != nil && f.last.Load() <= limit {
+			u.closeLocked(f)
+		}
+	}
+}
+
+// outOfResources reports whether a socket could not be opened for lack of
+// file descriptors or memory, which passes, rather than for lack of
+// permission or support.
+func outOfResources(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.ENOMEM)
 }

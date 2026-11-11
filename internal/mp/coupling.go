@@ -247,6 +247,11 @@ func (s *Session) coupled() bool { return !cpDisabled && !s.opt.NoCoupling }
 func (s *Session) couplingTickLocked(now time.Time) {
 	limit := s.rateLimitLocked()
 	if !s.coupled() && limit == 0 {
+		for _, p := range s.paths { // a limit the peer has withdrawn
+			if p.cps.cap != 0 && p.meter != nil {
+				s.setCapLocked(p, 0)
+			}
+		}
 		return
 	}
 	cp := &s.cp
@@ -578,10 +583,24 @@ func (s *Session) cpShareLocked(limit uint64) {
 	if ceiling {
 		total = float64(limit)
 	}
+	// A configured limit is not probed: a probe goes as far as the limit,
+	// and the round after it takes back only what the probe added (nothing,
+	// if the limit is what is shared out).
 	gain := cp.gain
-	if limit > 0 && total*gain > float64(limit) {
-		gain = float64(limit) / total // a configured limit is not probed
+	if limit > 0 && total > 0 {
+		room := float64(limit) / total
+		switch cp.phase {
+		case cpProbe:
+			gain = min(gain, room)
+		case cpObserve:
+			gain = max(2-min(cp.probeGain, room), 0.5)
+		default:
+			gain = min(gain, room)
+		}
 	}
+	// The least a share is: BBR's minimum pacing rate, unless the paths
+	// then add up to more than there is to share (a slow line).
+	minShare := min(cpMinShare, total/float64(max(n, 1)))
 	open := s.tmpPaths[:0]
 	var starting []*Path
 	reserved := 0.0
@@ -608,7 +627,7 @@ func (s *Session) cpShareLocked(limit uint64) {
 	for _, p := range starting {
 		c := uint64(0)
 		if limit > 0 { // ... but it stays below a configured limit
-			c = uint64(max((float64(limit)-left)/float64(len(starting)), cpMinShare(p)))
+			c = uint64(max((float64(limit)-left)/float64(len(starting)), minShare))
 		}
 		s.setCapLocked(p, c)
 	}
@@ -624,7 +643,15 @@ func (s *Session) cpShareLocked(limit uint64) {
 		k := 0
 		for _, p := range open {
 			if raw := float64(p.cps.rawBw); raw <= fair {
-				s.setCapLocked(p, 0)
+				c := uint64(0)
+				if ceiling {
+					// A limit holds for what the paths send, whatever
+					// their estimates: this one may grow up to an equal
+					// share (and at the start, when no path has an
+					// estimate, that is what every path gets).
+					c = uint64(max(fair, minShare))
+				}
+				s.setCapLocked(p, c)
 				left -= raw
 				changed = true
 			} else {
@@ -634,17 +661,18 @@ func (s *Session) cpShareLocked(limit uint64) {
 		open = open[:k]
 	}
 	for _, p := range open {
-		s.setCapLocked(p, uint64(max(left/float64(len(open)), cpMinShare(p))))
+		s.setCapLocked(p, uint64(max(left/float64(len(open)), minShare)))
 	}
 	clear(s.tmpPaths[:cap(s.tmpPaths)])
 	s.tmpPaths = open[:0]
 }
 
-// cpMinShare is the least a path is capped at (bytes/s): BBR's own minimum
-// pacing rate. (Four packets per RTT, as it was, is 4 Mbit/s at 10 ms: more
-// than a path's share of a slow uplink, which the paths then overran
-// together however well it was measured.)
-func cpMinShare(*Path) float64 { return 64 << 10 }
+// cpMinShare is the least a path is capped at (bytes/s), where there is
+// that much to share: BBR's own minimum pacing rate. (Four packets per RTT,
+// as it was, is 4 Mbit/s at 10 ms: more than a path's share of a slow
+// uplink, which the paths then overran together however well it was
+// measured.)
+const cpMinShare = 64 << 10
 
 func (s *Session) setCapLocked(p *Path, c uint64) {
 	if p.cps.cap != c {

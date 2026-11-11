@@ -37,9 +37,10 @@ path, which used to produce false "path suspect" events and late SACKs:
 |---|---|---|
 | PING/PONG | seq | path liveness and ping-loss estimate; every 100 ms while streams are active (1 s when idle) |
 | ACK | per stream: cumulative offset, window, ≤200 SACK ranges (delta-encoded) | data-level acknowledgement + flow control; sent on the two best paths four times per RTT of the fastest path (every 2–25 ms), refreshed every 30 ms while data is arriving |
-| LIMIT | rate | the most the sender of the frame wants to receive over all paths together (its configured `down`); on the control stream |
+| LIMIT | rate | the most the sender of the frame wants to receive over all paths together (its configured `down`, 0 for none); on the control stream of every new path |
+| WINDOW | stream id | the sender is blocked by the stream's window with nothing in flight, and asks for the window again (every 500 ms; the answer is an ACK); on the control stream |
 | PATHACK | path index, largest datagram seq, 256-bit bitmap | per-path receipt of data datagrams (loss detection on lossy paths) |
-| RESET | stream id, code | abort (dial failure, idle timeout, …) |
+| RESET | stream id, code | abort (dial failure, idle timeout, …); on the control stream, and again on every path that comes up within a minute |
 
 Every DATAGRAM payload starts with a type byte: 0 = proxied UDP, 1 = control
 frames, 2 = stream data (`dseq id off len|fin data`, see

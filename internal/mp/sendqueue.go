@@ -33,7 +33,11 @@ func (q *sendQueue) push(p []byte, chunk int) {
 				continue
 			}
 		}
-		b := make([]byte, 0, chunk)
+		// A full-size buffer for every small write (a keystroke, a
+		// datagram in reliable UDP mode) was 16 KB allocated per 100 bytes
+		// sent. Room for a few more writes of the size is enough to
+		// coalesce them.
+		b := make([]byte, 0, min(chunk, max(512, 4*len(p))))
 		q.bufs = append(q.bufs, b)
 		q.bufOff = append(q.bufOff, q.end)
 	}

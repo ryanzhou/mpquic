@@ -30,7 +30,7 @@ func ReadAddr(r io.Reader) (string, []byte, error) {
 
 // readAddrRest reads the rest of a SOCKS5-format address of type atyp.
 func readAddrRest(r io.Reader, atyp byte) (string, []byte, error) {
-	var b [1 + 255 + 2]byte
+	var b [1 + 1 + 255 + 2]byte // ATYP, LEN, a name of up to 255 bytes, PORT
 	b[0] = atyp
 	var host string
 	n := 1

@@ -10,12 +10,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"mpquic/internal/cc"
 	"mpquic/internal/config"
+	"mpquic/internal/ipstack"
 	"mpquic/internal/linkem"
 	"mpquic/internal/mp"
 	"mpquic/internal/procs"
@@ -194,6 +196,7 @@ func Run(ctx context.Context, role string, cfg *config.Config, log *slog.Logger)
 		return err
 	}
 	// Run on one thread while it has headroom (see package procs).
+	ipstack.MaxProcs.Store(int32(runtime.GOMAXPROCS(0))) // before it is lowered
 	defer procs.Start(log)()
 	switch r {
 	case "local", "tunnel":

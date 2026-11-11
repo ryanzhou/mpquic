@@ -15,6 +15,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,20 @@ const nicID = 1
 
 // outQueue is the number of packets queued for the clients.
 const outQueue = 1024
+
+// MaxProcs, if set, is the number of threads the process may come to use
+// (GOMAXPROCS before it was lowered): see New.
+var MaxProcs atomic.Int32
+
+// maxHandshakes is the number of TCP handshakes in progress (SYNs beyond
+// it are dropped until some complete or are given up).
+const maxHandshakes = 4096
+
+// maxUDPFlows bounds the UDP flows (client sockets) of a stack.
+const maxUDPFlows = 4096
+
+// timeWait is how long a closed TCP connection lingers (see New).
+const timeWait = time.Second
 
 const (
 	udpIdle  = 2 * time.Minute
@@ -76,6 +92,7 @@ type Stack struct {
 	echoRelease func()
 
 	mu       sync.Mutex
+	closed   bool
 	udpFlows map[netip.AddrPort]*udpFlow
 	echoes   map[echoKey]*echoFlow
 	byFlow   map[uint16]*echoFlow
@@ -108,6 +125,14 @@ func New(opt Options) (*Stack, error) {
 	if opt.Name == "" {
 		opt.Name = "ipstack"
 	}
+	// gVisor sizes its pool of TCP processors by GOMAXPROCS at this
+	// moment, for good. The local starts on one thread (package procs) and
+	// adds more under load: without this, all TCP of the front-end would
+	// stay on one goroutine however many threads there are later.
+	if prev, n := runtime.GOMAXPROCS(0), int(MaxProcs.Load()); n > prev {
+		runtime.GOMAXPROCS(n)
+		defer runtime.GOMAXPROCS(prev)
+	}
 	gs := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -124,6 +149,21 @@ func New(opt Options) (*Stack, error) {
 		// timeout (~200 ms). A burst loss of 100+ KB, e.g. a UDP socket
 		// buffer overflowing, stalled a connection for many seconds.
 		ptr(tcpip.TCPRecovery(0)),
+		// A closed connection stays in TIME_WAIT for 60 s by default, and
+		// gVisor only lets a new SYN for the same addresses and ports through
+		// to a listening socket: with a forwarder it is dropped, until the
+		// client gives up. A client reuses a source port much sooner than
+		// that (Linux picks them in random steps: after a few thousand
+		// connections to one destination), so now and then a connection took
+		// many seconds to open, or timed out. One second still absorbs a
+		// retransmitted FIN, and a new SYN on the same ports gets through
+		// with its first retransmission at the latest.
+		ptr(tcpip.TCPTimeWaitTimeoutOption(timeWait)),
+		// A SYN whose SYN-ACK is never answered (the client is gone, or
+		// never existed) holds one of the forwarder's places, a stream and
+		// a connection of the remote until the handshake is given up: 127 s
+		// by default, 31 s with four retransmissions (as Linux).
+		ptr(tcpip.TCPSynRetriesOption(4)),
 		&tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: 8 << 20},
 		&tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: 8 << 20},
 	}
@@ -163,7 +203,7 @@ func New(opt Options) (*Stack, error) {
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
-	fwd := tcp.NewForwarder(gs, 0, 1024, s.handleTCP)
+	fwd := tcp.NewForwarder(gs, 0, maxHandshakes, s.handleTCP)
 	gs.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 	gs.SetTransportProtocolHandler(udp.ProtocolNumber, s.handleUDP)
 	if opt.UDP != nil {
@@ -209,6 +249,7 @@ func (s *Stack) Close() {
 			s.echoRelease()
 		}
 		s.mu.Lock()
+		s.closed = true // no new flows: nobody would release them
 		flows := s.udpFlows
 		s.udpFlows = map[netip.AddrPort]*udpFlow{}
 		s.mu.Unlock()
@@ -225,9 +266,10 @@ func (s *Stack) pump() {
 		if pkt == nil {
 			return
 		}
-		v := pkt.ToView()
-		b := v.ToSlice()
-		v.Release()
+		b := make([]byte, 0, pkt.Size()) // one copy
+		for _, part := range pkt.AsSlices() {
+			b = append(b, part...)
+		}
 		pkt.DecRef()
 		select {
 		case s.out <- b:
@@ -336,6 +378,9 @@ func (s *Stack) handleUDP(id stack.TransportEndpointID, pkt *stack.PacketBuffer)
 		return true
 	}
 	f := s.udpFlow(src)
+	if f == nil {
+		return true
+	}
 	f.last.Store(time.Now().UnixNano())
 	if dst.Port() != 53 {
 		f.nonDNS.Store(true)
@@ -379,13 +424,39 @@ func packetBytes(pkt *stack.PacketBuffer) []byte {
 
 func (s *Stack) udpFlow(src netip.AddrPort) *udpFlow {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if f := s.udpFlows[src]; f != nil {
+		s.mu.Unlock()
 		return f
 	}
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	// Every flow is a socket on the remote. A client that opens them without
+	// end (a port scan, a flood) gets the ones idle for longest closed.
+	var evicted []uint64
+	if len(s.udpFlows) >= maxUDPFlows {
+		last := make([]int64, 0, len(s.udpFlows))
+		for _, f := range s.udpFlows {
+			last = append(last, f.last.Load())
+		}
+		slices.Sort(last)
+		limit := last[len(last)/8]
+		for k, f := range s.udpFlows {
+			if f.last.Load() <= limit {
+				evicted = append(evicted, f.id)
+				delete(s.udpFlows, k)
+			}
+		}
+	}
 	f := &udpFlow{client: src}
+	f.last.Store(time.Now().UnixNano())
 	f.id = s.opt.UDP.Register(func(msg []byte) { s.udpReply(f, msg) })
 	s.udpFlows[src] = f
+	s.mu.Unlock()
+	for _, id := range evicted {
+		s.opt.UDP.Unregister(id, true)
+	}
 	s.log.Debug(s.opt.Name+" udp flow", "from", src, "id", f.id)
 	return f
 }
@@ -419,12 +490,30 @@ func (s *Stack) intercept(p []byte) bool {
 	k := echoKey{e.src, e.dst, e.id}
 	s.mu.Lock()
 	f := s.echoes[k]
+	if f == nil && len(s.byFlow) >= proxy.EchoFlows {
+		// All flow ids are taken (a ping sweep): free the eighth idle for
+		// longest, rather than search them all in vain for every further
+		// echo request and answer none.
+		last := make([]int64, 0, len(s.byFlow))
+		for _, e := range s.byFlow {
+			last = append(last, e.last.Load())
+		}
+		slices.Sort(last)
+		limit := last[len(last)/8]
+		for id, e := range s.byFlow {
+			if e.last.Load() <= limit {
+				delete(s.byFlow, id)
+				delete(s.echoes, e.echoKey)
+			}
+		}
+	}
 	if f == nil {
 		for range proxy.EchoFlows {
 			s.nextFlow = (s.nextFlow + 1) % proxy.EchoFlows
 			id := s.echoBase + s.nextFlow
 			if s.byFlow[id] == nil {
 				f = &echoFlow{echoKey: k, flow: id}
+				f.last.Store(time.Now().UnixNano())
 				s.echoes[k] = f
 				s.byFlow[id] = f
 				break

@@ -111,7 +111,10 @@ func (r *raceDialer) dialContext(ctx context.Context, target string) (net.Conn, 
 			timer.Stop()
 		}
 	}
-	start()
+	if !start() {
+		// nothing was started: the context ended during the lookup
+		return nil, st, ctx.Err()
+	}
 	started()
 	var firstErr error
 	for {

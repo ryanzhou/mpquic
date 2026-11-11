@@ -99,11 +99,11 @@ func (s *Session) nextChunk(p *Path) (*chunk, int64, int, []uint64, error) {
 			p.busySince = now
 			p.busyLen = len(c.data)
 			p.busyChunk = c
-			if len(c.data) >= 8<<10 && p.burstAt.IsZero() {
+			if !c.small && p.burstAt.IsZero() {
 				p.burstAt = now
 			}
 			c.st.lastActive = now
-			if !s.opt.NoDup && len(c.sends) == 1 && len(c.data) <= eagerMaxChunk {
+			if !s.opt.NoDup && len(c.sends) == 1 && c.small {
 				s.wakeAllLocked() // let an idle path consider a redundant copy
 			}
 			perStream := p.chunksPerStream()
@@ -336,7 +336,7 @@ func (s *Session) pickLocked(p *Path, now time.Time) (*chunk, time.Duration, str
 // would deliver, so the lossy path can only help. Budgeted like eager
 // duplication.
 func (s *Session) insureLocked(p *Path, c *chunk, now time.Time) {
-	if s.opt.NoDup || c.queued || len(c.data) > eagerMaxChunk || !p.lossy() {
+	if s.opt.NoDup || c.queued || !c.small || !p.lossy() {
 		return
 	}
 	if c.st.unsent > 0 && s.streamBacklogLocked(c.st) > 64<<10 {
@@ -714,7 +714,7 @@ func (s *Session) dupCandidateLocked(p *Path, now time.Time) *chunk {
 			if ok && !mine.Before(arr) {
 				// Not faster. Eagerly duplicate small chunks if this copy
 				// beats a loss recovery on the original path.
-				if len(c.data) > eagerMaxChunk || len(c.sends) != 1 || s.eagerTokens < float64(len(c.data)+64) {
+				if !c.small || len(c.sends) != 1 || s.eagerTokens < float64(len(c.data)+64) {
 					continue
 				}
 				q := c.sends[0].p
