@@ -55,7 +55,6 @@ const (
 	cpStartGain   = 2.0
 	cpStartGrowth = 1.25 // delivery grows by this much per round, or start-up is over ...
 	cpStartStall  = 2    // ... after this many rounds without
-	cpStartLoss   = 0.2  // ... or with this share of a round lost beyond the baseline
 	cpStartKept   = 0.9  // ... or at once, if less than this much of what was sent came out
 
 	cpProbeGain    = 1.25
@@ -85,6 +84,7 @@ const (
 
 	cpLoadedBytes = 10 * 1200 // a path carried data in a round: at least this much
 	cpBusyFrac    = 0.85      // the session was busy: it sent this much of what it could
+	cpThinFrac    = 0.5       // ... and it has little to send: less than this much
 	cpKept        = 0.95      // a round came out: this much of it is acknowledged a round later
 	cpBaseWindow  = 30 * time.Second
 
@@ -132,6 +132,7 @@ type cpRound struct {
 	full  bool    // ... and it did send what it could: what the round delivered and lost says what the pipe takes
 	queue bool    // a path saw a queue
 	out   float64 // the rate at which acknowledgements came in during it (bytes/s)
+	thin  bool    // the session sent less than half of what it could: it has little to send
 }
 
 // coupling is the session's part (sess.mu held).
@@ -234,8 +235,8 @@ func (c *cpPath) learn(sent, lost uint64, drain bool) {
 	loss := float64(lost) / float64(sent)
 	n := float64(sent) / cpPkt
 	switch {
-	case drain && (!c.lossOK || loss < c.lossBase):
-		c.lossBase, c.lossOK = loss, true
+	case drain && (!c.lossOK || n*(c.lossBase-loss) >= 2*math.Sqrt(n*c.lossBase+1)):
+		c.lossBase, c.lossOK = loss, true // the first, or clearly less than was known
 	case drain:
 		c.lossBase += (loss - c.lossBase) / 4
 	case n*(c.lossBase-loss) >= 2*math.Sqrt(n*c.lossBase+1):
@@ -371,9 +372,9 @@ func (s *Session) cpStartRoundLocked(now time.Time) {
 // In the start-up the rate is twice what is being acknowledged, so it
 // follows that at once and doubles every round trip (TCP's slow start does
 // the same with its window). And the start-up is over, without waiting for
-// the round to end, as soon as it has gone too far: a tenth of what the
-// last two rounds are known to have delivered or lost is lost, or every
-// path sees a queue. From then on it sends no more than is delivered.
+// the round to end, as soon as it has gone too far: the last two rounds
+// lose more than the paths' baselines on every path, or every path sees a
+// queue. From then on it sends no more than is delivered.
 //
 // And when the capacity drops under a session that sends at B (every path
 // sees a queue, and clearly less than B comes out), B follows at once: a
@@ -448,8 +449,8 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 		if cp.gain <= 1 {
 			break
 		}
-		if (busy || r1.busy) && known > 0 && float64(lossy) >= cpCommon*float64(known) &&
-			float64(lost)-expected >= cpStartLoss/2*float64(known) && cpExcess(known, lost, expected/float64(known), 1) {
+		if !r1.thin && known > 0 && float64(lossy) >= cpCommon*float64(known) &&
+			cpExcess(known, lost, expected/float64(known), 1) {
 			cp.gain, cp.startOver, cp.startLoss = 1, true, true
 		} else if busy && cp.qTicks >= cpQueueTicks {
 			cp.gain, cp.startOver = 1, true
@@ -585,7 +586,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		}
 	}
 	busy := allowed > 0 && used >= cpBusyFrac*allowed
-	*h(k) = cpRound{cp.phase, cp.gain, dt, busy, allowed > 0 && usedRaw >= cpBusyFrac*allowed, queued > 0, out}
+	*h(k) = cpRound{cp.phase, cp.gain, dt, busy, allowed > 0 && usedRaw >= cpBusyFrac*allowed, queued > 0, out, used < cpThinFrac*allowed}
 
 	// Round k-1: what it delivered (nearly all of it is acknowledged by
 	// now, unless a queue is growing) and lost so far. Round k-2: its
@@ -707,21 +708,26 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		cp.startOver, cp.startLoss = false, false
 		switch {
 		case over:
-		case !r1.busy || !ok1:
+		case r1.thin || !ok1:
 			// A session with little to send (the acknowledgements of a
 			// download) learns nothing about the pipe, whatever it loses.
-		case common1 && known1 && float64(l1)-e1 >= cpStartLoss*float64(s1):
-			// A fifth of what was sent is lost, beyond what the paths lose
-			// anyway (which the first rounds have shown): more than the
-			// pipe takes.
+		case common1 && known1:
+			// Loss on every path beyond what the paths lose anyway (which
+			// the first rounds have shown): more than the pipe takes.
 			over = true
+		case !r1.busy:
 		case cp.bw >= cpStartGrowth*cp.best:
 			cp.best, cp.stall = cp.bw, 0
-		default:
-			// It did not grow: over after two such rounds, or at once if
-			// clearly less came out than went in (queued or lost).
+		case kept < cpStartKept:
+			// clearly less came out than went in (queued or lost)
+			over = true
+		case queued > 0 || r1.queue:
+			// It did not grow, and there is a queue: over after two such
+			// rounds. (Without a queue it is not the pipe that holds the
+			// rate back: the paths' windows open with what they deliver,
+			// a round trip behind.)
 			cp.stall++
-			over = cp.stall >= cpStartStall || kept < cpStartKept
+			over = cp.stall >= cpStartStall
 		}
 		if over {
 			// B is what the pipe delivers now, not the most it ever did.
@@ -980,7 +986,10 @@ func (s *Session) cpShareLocked(limit uint64) {
 	n := len(open)
 	total := cp.bw
 	if cp.phase == cpStartup {
-		total = max(total, floor/cpStartGain)
+		// (twice the initial window per round trip: the paths' windows
+		// bound what is in flight, and a first flight that is paced over
+		// a whole round trip arrives a round trip late)
+		total = max(total, floor)
 	}
 	total *= cp.gain
 	if limit > 0 {

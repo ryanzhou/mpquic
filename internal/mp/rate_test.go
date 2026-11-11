@@ -326,7 +326,7 @@ func TestRatePolicedDownlink(t *testing.T) {
 	if l := x.lossShare(); l > 0.01 {
 		t.Errorf("loss %.2f%%", 100*l)
 	}
-	if x.peak > 1.12*mbit(500) {
+	if x.peak > 1.15*mbit(500) { // a probe: two rounds of four at 1.25
 		t.Errorf("peak %.0f Mbit/s over a second", x.peak*8/1e6)
 	}
 }

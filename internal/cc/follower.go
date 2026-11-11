@@ -95,7 +95,13 @@ func (f *follower) onAcked(t monotime.Time, n congestion.ByteCount) {
 	f.winBytes += n
 	f.winIdle = f.winIdle || f.m.appLimited.Load()
 	d := t.Sub(f.winAt)
-	if d < max(f.baseRTT(), followMinMeasure) {
+	w := max(f.baseRTT(), followMinMeasure)
+	if d < w {
+		// More than is known shows before the window is over (a start-up:
+		// the rate doubles every round trip, and so must the window).
+		if r := float64(f.winBytes) / d.Seconds(); d >= w/2 && r > f.rates[0] {
+			f.rates[0] = r
+		}
 		return
 	}
 	// A window in which the path had nothing to send for a while only
