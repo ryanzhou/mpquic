@@ -552,3 +552,34 @@ func TestRatePolicedRelays(t *testing.T) {
 		t.Errorf("loss %.2f%%", 100*l)
 	}
 }
+
+// The other direction of a download: little to send (acknowledgements), and
+// every path's round trips are long because of the download's queue. That
+// queue is not this direction's. It must not end the start-up or cut the
+// rate, or the acknowledgements and pings are throttled to what happened to
+// be sent so far.
+func TestRateThinDirection(t *testing.T) {
+	x := newRateSim(mbit(100), 0.05, ms(16), ms(40), ms(70), ms(120))
+	x.demand = mbit(1)
+	x.run(2 * time.Second)
+	for i := 0; i < 40; i++ { // the foreign queue comes and goes
+		x.extra = ms(10 + 10*(i%5))
+		x.run(250 * time.Millisecond)
+	}
+	if x.s.cp.phase != cpStartup {
+		t.Errorf("start-up ended at B = %.2f Mbit/s with 1 Mbit/s to send", x.bw()*8/1e6)
+	}
+	var total float64
+	for _, p := range x.s.paths {
+		total += float64(p.meter.Rate())
+	}
+	if total < mbit(2) {
+		t.Errorf("the paths may send %.2f Mbit/s together", total*8/1e6)
+	}
+	// and when there is data, it gets the line
+	x.demand, x.extra = 0, 0
+	x.run(2 * time.Second)
+	x.reset()
+	x.run(5 * time.Second)
+	within(t, "goodput", x.goodput(5*time.Second), mbit(100), 0.9, 1.0)
+}

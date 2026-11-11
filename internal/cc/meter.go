@@ -119,6 +119,9 @@ func (m *Meter) Acked() uint64 { return m.acked.Load() }
 // have since the last call: the path was not delivering what it was given.
 func (m *Meter) TakeBlocked() bool { return m.blocked.Swap(false) }
 
+// Blocked is TakeBlocked without taking.
+func (m *Meter) Blocked() bool { return m.blocked.Load() }
+
 // RoundStats returns what is known of the packets sent in round id. Rounds
 // older than a dozen are forgotten.
 func (m *Meter) RoundStats(id int64) (st RoundStat) {

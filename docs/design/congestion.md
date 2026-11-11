@@ -39,8 +39,8 @@ probing of its own. It does two things:
 
 * it **paces** at the rate the session assigns (`Meter.SetRate`), and
 * it bounds what is **in flight** to what that rate sends in two round
-  trips (at least one round trip plus 50 ms), so a path that stops
-  delivering stops sending.
+  trips (at least one round trip plus 50 ms; the session's base RTT for
+  the path, below), so a path that stops delivering stops sending.
 
 Hysteria's Brutal does the same with a configured rate. The path also
 counts, for the session: every packet is booked on the session round it was
@@ -87,24 +87,31 @@ business (below); random loss, however heavy, is in the baseline.
   arriving (measured continuously, over the last round), so it doubles
   about every round trip, like TCP's slow start. It ends when *B* stops
   growing by a quarter per round (two rounds in a row, or at once if a
-  tenth of a round did not come out), or when loss shows: the session looks
-  at the last two rounds' losses at every tick, not only at the end of a
-  round, and as soon as a tenth of what is accounted for is lost it sends
-  no more than was being delivered. What reaches the receiver is never more
-  than the line carries; what leaves the sender overshoots by up to a
-  factor of two for about one round trip, as with any slow start. *B* is
-  then what the pipe puts out, and one round at half of it drains what the
-  overshoot queued.
+  tenth of a round did not come out). It also ends within a round, at the
+  next tick, as soon as it has gone too far: a tenth of what the last two
+  rounds are known to have delivered or lost is lost, or every path's
+  round-trip time is clearly above its base (a queue; by a quarter of the
+  base RTT, at least 3 ms). From then on the session sends no more than is
+  being delivered. What reaches the receiver is never more than the line
+  carries; what leaves the sender overshoots by up to a factor of two for
+  about one round trip, as with any slow start. *B* is then what the pipe
+  puts out, and one round at half of it drains what the overshoot queued.
 * **Cruise.** The session sends at *B*. A round at *B* that comes out
-  (95% acknowledged a round later) confirms *B*; if less comes out for ten
-  rounds, *B* is the most that did.
+  (95% of *B* is put out) confirms *B*; if less comes out for ten rounds,
+  *B* is the most that did.
 * **Probes.** Every few rounds one round is sent at 1.25·*B*, and the next
   one at 0.75·*B* while the acknowledgements come in, so what the probe
-  queued is gone again by the time its result is known. If the probe round
-  was delivered faster than *B*, *B* is that rate. If at least half of the
-  extra was delivered, the next probe follows at once (from the second
-  success in a row at 1.5·*B*, then 2·*B*); otherwise probes back off to
-  every 2, 4, then 8 rounds.
+  queued is gone again by the time its result is known.
+  * If at least half of what the probe added was delivered, *B* is what
+    the probe round delivered, and the next probe follows at once, at
+    1.5·*B* and from the second success in a row at 2·*B*.
+  * Otherwise *B* stays. A probe's delivery cannot be measured exactly
+    (the paths' parts of the pulse reach a common queue at different
+    times, which makes it look a few percent better than it was), so less
+    than half is not evidence. The next probe asks for half as much more
+    (1.125, down to 1.06), where a little spare capacity does show as half
+    of the probe, and it comes sooner, because a small probe queues
+    little: every 8 rounds at 1.25, every 2 at 1.06.
 * **Loss: a ceiling.** Two lossy rounds in a row at *B* mean that *B* is
   more than the pipe takes: a policer, or a buffer that is full. *B* becomes
   98% of what the pipe puts out by then. The first lossy round is not used
@@ -116,18 +123,26 @@ business (below); random loss, however heavy, is in the baseline.
   * probes are **held**: the next one comes after 16 rounds, and each time
     loss stops *B* at about the same rate again (within 15%), the hold
     doubles, up to 128 rounds. Probing a policer costs a round of loss
-    every time, so it should be rare where the ceiling has been confirmed;
-  * a held probe lasts **two rounds**. If the second is lossy, what it
-    delivered is the ceiling, and *B* is set to 98% of it (this also
-    corrects a *B* that was too low). If the probe finds more without
+    every time, so it should be rare where the ceiling has been confirmed.
+    The hold ends when *B* is no longer near that ceiling (the capacity
+    dropped);
+  * a held probe lasts **two rounds**. If the second is lossy and no path
+    saw a queue (a policer), 96% of what it delivered is the ceiling, and
+    *B* is raised to that if it was lower. If the probe finds more without
     loss and four rounds at the higher *B* stay clean, the hold is over.
+  A probe that loses while the paths see a queue has overflowed a buffer.
+  That is no ceiling to remember: it counts as a probe that found nothing,
+  and the next one is smaller.
 * **Queues.** When every path that carried data saw a queue for a whole
   round, the bottleneck they all pass is congested.
-  * If the pipe then puts out clearly less than *B* (the average of up to
-    three such rounds is below 0.9·*B*), the capacity dropped, and *B*
-    follows at once. A queue alone changes nothing: it may not be ours.
-  * Over ten queued rounds, *B* is what was put out on average if that is
-    less than 0.98·*B*.
+  * If the pipe then puts out clearly less than *B* (below 0.9·*B*), the
+    capacity dropped, and *B* follows at once. This is also checked at
+    every tick within a round, with the acknowledgements of the last
+    round's length: a whole round at the old rate can be more than the
+    bottleneck's buffer holds. A queue alone changes nothing: it may not
+    be ours.
+  * Over three queued rounds, *B* is what was put out on average if that
+    is less than 0.98·*B*.
   * A queue that stays for two rounds is drained by a round at 0.75·*B*, at
     most every 8 rounds. If that does not shrink it, the queue is not the
     session's (the other direction's, or other people's traffic), and it
@@ -150,8 +165,11 @@ own limit, and the others share the rest.
 A path has a **limit of its own** when it alone has trouble: for two rounds
 its queue is clearly longer than what all paths see, or it loses beyond its
 baseline while the others do not (a relay slower than its share). The limit
-is what the path delivered then. Every 8 rounds (doubling when it fails, up
-to 64) the limit is raised by a quarter to see whether the path takes more.
+is what the path put out then. This is only learned while the session sends
+steadily and the path gets its share; after a start-up or while the rate
+changes, a path's output says little about what it can carry. Every 8
+rounds (doubling when it fails, up to 64) the limit is raised by a quarter
+for three rounds, and stays raised if the path then puts out more.
 
 Equal shares keep every path loaded: a failing path leaves only its share
 to be taken over, and loss recovery has capacity everywhere. Which stream's
@@ -215,9 +233,11 @@ built-in controller, which also bypasses the session rate).
   radio link) is taken for a ceiling once when it rises: *B* is cut by
   about the loss rate, and the round after that puts the loss into the
   baselines. Probes recover *B*, after the hold.
-* **A probe adds a quarter of a round of queue** at a bottleneck that is
-  full, for one round in eight to ten. With `up` / `down` set there are no
-  probes.
+* **A probe adds queue** at a bottleneck that is full: a quarter of a
+  round at first, a sixteenth once the probes have shrunk. With `up` /
+  `down` set there are no probes.
+* **Spare capacity of less than about 3%** is not found: the smallest
+  probe asks for 6% more and needs half of that delivered.
 * **Queues are judged by round-trip times**, which also grow with a queue
   in the ACK direction (an upload filling the receiver's uplink while it
   downloads). The session rate therefore never comes down for a queue

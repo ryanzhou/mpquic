@@ -843,9 +843,9 @@ func (s *Session) statsStringLocked() string {
 		if st.StaleResets > 0 {
 			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
 		}
-		if st.SharedCap > 0 && st.SharedCap < p.cps.rawBw {
-			// capped at its share of the session rate; its own estimate
-			fmt.Fprintf(&b, " own=%.1fMbit/s", float64(p.cps.rawBw)*8/1e6)
+		if l := p.cps.rawBw; l > 0 && st.SharedCap >= l/100*99 {
+			// held to what it carries on its own, below an equal share
+			fmt.Fprintf(&b, " own=%.1fMbit/s", float64(l)*8/1e6)
 		}
 		b.WriteString("]")
 	}
