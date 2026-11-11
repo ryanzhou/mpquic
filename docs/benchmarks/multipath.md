@@ -109,8 +109,9 @@ bufferbloat fixes in the congestion controller it was ~120 ms (see
 [congestion-control.md](congestion-control.md)).
 
 Four lossy paths only (`scripts/lossy-bench.sh`: 20 ms/20%, 30 ms/10%,
-40 ms/5%, 60 ms/1% loss, 50 Mbit/s each): about 145–150 Mbit/s download and
-upload (an earlier release reached about 100), with echo p50 42 ms. Before the
+40 ms/5%, 60 ms/1% loss, 50 Mbit/s each): about 170–180 Mbit/s download and
+upload (145–150 with a BBR per path; an earlier release reached about 100),
+with echo p50 42 ms. Before the
 control plane moved to datagrams, this setup produced frequent false
 "path suspect" events; now there are 2–5 per run.
 
@@ -162,7 +163,7 @@ their shares; see [congestion control](../design/congestion.md)). Single
 | 100 Mbit/s downlink, relays with jitter | per-path | 90.1 | +6.5% | 0.03% | 3.4% | 102 / 103 | 32 / 39 ms | 64 |
 | | **session** | 90.8 | +6.9% | 0.00% | 3.8% | 98 / 104 | 32 / 41 ms | 66 |
 | 100 Mbit/s downlink, 4 relays of 300/200/200/100 Mbit/s | per-path | 93.5 | +3.4% | 0.11% | 0.4% | 102 / 104 | 26 / 36 ms | 78 |
-| | **session** | 93.4 | +3.7% | 0.24% | 0.4% | 99 / 105 | 29 / 37 ms | 68 |
+| | **session** | 95.1 | +3.2% | 0.09% | 0.2% | 98 / 103 | 23 / 29 ms | 88 |
 | 100 Mbit/s downlink, 4 parallel downloads | per-path | 95.2 | +3.4% | 0.14% | 0.1% | 101 / 102 | 35 / 58 ms | 42 |
 | | **session** | 100.1 | +4.3% | 0.23% | 0.0% | 98 / 104 | 38 / 54 ms | 47 |
 | downlink 100 ↔ 40 Mbit/s every 4 s | per-path | 62.6 | +4.7% | 0.85% | 0.2% | 69 / 103 | 29 / 45 ms | 13 |
@@ -180,17 +181,17 @@ their shares; see [congestion control](../design/congestion.md)). Single
 | remote's uplink 150 ↔ 60 Mbit/s every 4 s | per-path | 93.9 | +3.4% | 0.72% | 0.5% | 101 / 148 | 28 / 41 ms | 18 |
 | | **session** | 98.5 | +3.2% | 1.46% | 0.0% | 111 / 157 | 28 / 89 ms | 19 |
 | remote's uplink 100 Mbit/s, 2 relays, the fastest with 1% loss | per-path | 92.4 | +3.9% | 0.00% | 0.1% | 99 / 100 | 27 / 34 ms | 53 |
-| | **session** | 93.9 | +3.4% | 0.00% | 0.1% | 99 / 105 | 28 / 34 ms | 66 |
+| | **session** | 94.5 | +3.3% | 0.00% | 0.2% | 98 / 104 | 27 / 30 ms | 66 |
 | control: uplink 400 Mbit/s, not the limit (3×100 Mbit/s) | per-path | 275.9 | +2.7% | 0.00% | 0.0% | 296 / 301 | 25 / 32 ms | 226 |
 | | **session** | 283.1 | +2.7% | 0.00% | 0.0% | 290 / 307 | 25 / 28 ms | 252 |
 | control: independent paths 3×50 Mbit/s | per-path | 138.7 | +3.0% | 0.00% | 0.0% | 148 / 151 | 26 / 34 ms | 121 |
-| | **session** | 143.1 | +2.8% | 0.00% | 0.0% | 147 / 156 | 26 / 29 ms | 127 |
+| | **session** | 141.5 | +2.8% | 0.00% | 0.1% | 147 / 156 | 27 / 46 ms | 126 |
 | control: two identical paths, 50 Mbit/s each | per-path | 94.4 | +2.7% | 0.00% | 0.0% | 99 / 100 | 46 / 49 ms | 88 |
-| | **session** | 94.8 | +2.7% | 0.00% | 0.0% | 97 / 103 | 45 / 48 ms | 92 |
+| | **session** | 95.5 | +2.7% | 0.00% | 0.0% | 98 / 104 | 47 / 50 ms | 92 |
 | control: independent 50 / 30 (2% loss) / 20 Mbit/s | per-path | 92.5 | +4.7% | 0.00% | 0.8% | 98 / 101 | 26 / 33 ms | 74 |
-| | **session** | 91.1 | +4.0% | 0.00% | 0.3% | 96 / 102 | 25 / 32 ms | 68 |
+| | **session** | 91.3 | +4.2% | 0.00% | 0.5% | 96 / 103 | 25 / 33 ms | 75 |
 | 100 Mbit/s downlink, one relay limited to 20 Mbit/s | per-path | 93.3 | +3.2% | 0.17% | 0.1% | 101 / 102 | 36 / 48 ms | 73 |
-| | **session** | 94.2 | +2.9% | 0.21% | 0.0% | 96 / 96 | 28 / 34 ms | 75 |
+| | **session** | 93.9 | +2.8% | 0.00% | 0.0% | 99 / 104 | 32 / 40 ms | 74 |
 
 What the numbers say:
 
@@ -208,7 +209,7 @@ What the numbers say:
   rows (echo p90).
 * **A relay slower than its share** (last row) is held to what it carries
   by its own window from the first round trip, and gets its own limit
-  within a second: echo 28 / 34 ms instead of 36 / 48.
+  within a second: echo 32 / 40 ms instead of 36 / 48.
 * **A flapping bottleneck** is where the session is not better. On the
   flapping downlink it delivers the same or a little less (57 Mbit/s both
   in repeated 16 s runs; 59 against 63 here) with more queueing around
@@ -232,7 +233,10 @@ The scenario the session controller was written for: five relays of
 front of the receiver (`mpbench --path delay=75ms,rate=200mbit` … `--path
 delay=125ms,rate=200mbit --shared-rx 'none|police=500mbit'`, 30 s).
 
-USER_SCENARIO_TABLE
+| | goodput | dropped at the policer | relays carried | sender's peak over 100 ms / 1 s | sender after 2 s, p50 / p90 |
+|---|---|---|---|---|---|
+| per-path (two runs) | 299–374 Mbit/s | 5.4–12.8% | +20–36% | 0.9–2.1 Gbit/s / 580–990 Mbit/s | 340–500 / 590–760 Mbit/s |
+| **session** (two runs) | 448–450 Mbit/s | 1.2–1.4% | +5% | 1.0 Gbit/s / 570–600 Mbit/s | 480 / 487 Mbit/s |
 
 Per-path controllers each find "200" and start up on their own: together
 they send up to three times what the policer passes, and in the steady
@@ -240,6 +244,32 @@ state still a fifth more, because none of them sees what the others lose.
 One controller starts up once, stops at the first loss that every path has,
 and then stays just below the policer; what it sends above it are the
 start-up's last round and a probe now and then.
+
+### Where every path's own rate changes
+
+The session controller is built for paths that share something. Where the
+paths are independent and their *own* rates keep changing, a controller per
+path follows each of them more closely than one rate with per-path limits
+does (`scripts/bench-matrix.sh`, `scripts/lossy-bench.sh`, 8–15 s runs,
+download / upload in Mbit/s):
+
+| scenario | per-path | session |
+|---|---|---|
+| four lossy paths (20/10/5/1% loss, 50 Mbit/s each) | 146 / 153 | **172 / 180** |
+| two equal paths (40 Mbit/s) | 74 / 75 | 74 / 75 |
+| 10 + 100 Mbit/s | 97 / 111 | 100 / 105 |
+| 5 ms and 150 ms round trips, 100 Mbit/s each | 165 / 181 | 168 / 174 |
+| one path with 2% loss, one with jitter | 92 / 94 | 95 / 93 |
+| two paths flapping on their own (50↔10, 20↔60 Mbit/s) | 51–59 / 54–61 | 45 / 50–53 |
+| three paths: 1% loss and outages, jitter, 2% reordering | 97–111 / 101 | 76–92 / 83–87 |
+
+Steady paths, lossy or not, are the same or better (the four lossy paths
+by a fifth: the baselines keep random loss out of the rate). Paths whose own
+capacity flaps, or that drop out and come back, are 10–20% behind: a path's
+limit follows its relay down at once, but up again only by tries every few
+rounds. Small transfers are unchanged except on very lossy paths, where a
+256 KB transfer took 0.3–0.6 s against 0.25–0.3 s (16 MB: 1.2–1.4 s against
+1.6–1.8 s).
 
 ## Reading the results
 

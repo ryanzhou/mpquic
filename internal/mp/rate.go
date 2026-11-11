@@ -69,7 +69,7 @@ const (
 	cpBurst       = 4    // random loss comes in bursts of about this many packets
 	cpStartLoss   = 0.05 // loss beyond the baselines that ends a start-up
 	cpMargin      = 0.98 // B after such loss: this much of what was delivered
-	cpProbeMargin = 0.96 // ... or of what a probe's lossy second round delivered
+	cpProbeMargin = 0.96 // ... or of what a start-up's lossy last round delivered
 	cpLossRounds  = 2    // rounds in a row with it at B before B comes down ...
 	cpProbation   = 4    // rounds without loss after which a higher B is taken to hold
 	cpBaseKeep    = 0.75 // a baseline: what an older calm round counts for after each newer one
@@ -94,8 +94,9 @@ const (
 	cpKept        = 0.95      // a round came out: this much of it is acknowledged a round later
 	cpBaseWindow  = 30 * time.Second
 
-	cpMinShare    = 64 << 10  // the least a path's share is (bytes/s), where there is that much to share
-	cpStartWindow = 32 * 1200 // start-up begins with this much per path and round trip
+	cpMinShare    = 64 << 10              // the least a path's share is (bytes/s), where there is that much to share
+	cpStartWindow = 32 * 1200             // start-up begins with this much per path and round trip
+	cpStartRTT    = 50 * time.Millisecond // ... taken to be this long until it is measured
 
 	cpPathRounds  = 2 // rounds with a queue of its own after which a path has a limit
 	cpPathProbe   = 8 // rounds between a limited path's tries for more (doubling when they fail)
@@ -590,22 +591,20 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	}
 	commonQ = max(commonQ, 0)
 	// The baselines: a round shows what a path loses anyway if it sent
-	// clearly less than the pipe was putting out before it. (A round below
-	// B is not enough: after the capacity dropped, three quarters of B may
-	// still be twice what the pipe takes, and what is lost then is not
-	// lost anyway.)
-	below := func(r *cpRound, sent uint64, before float64) bool {
-		return r.gain < 1 && r.dt > 0 && float64(sent)/r.dt.Seconds() <= cpHoldQ*before
+	// clearly less than comes out now, two rounds later, of the pipe and
+	// of the path itself (the round after a probe; a start-up's rounds
+	// while the rate still grows). A round below B is not enough, nor one
+	// below what the pipe put out before: after the capacity dropped,
+	// three quarters of B may still be twice what the pipe takes, and what
+	// is lost then is not lost anyway. Nor is what a path loses while its
+	// own relay takes less than its share.
+	below := func(r *cpRound, sent uint64, than float64) bool {
+		return r.dt > 0 && float64(sent)/r.dt.Seconds() <= cpHoldQ*than
 	}
-	calm := below(r2, s2, max(h(k-3).out, h(k-4).out))
-	if r2.dt > 0 && float64(s2)/r2.dt.Seconds() <= 0.8*max(r1.out, out) {
-		// ... or than it put out afterwards: the rate was still growing
-		// (a start-up's rounds, before the pipe is full).
-		calm = true
-	}
+	calm := below(r2, s2, out)
 	for _, p := range s.paths {
 		if c := &p.cps; p.meter != nil && p.state != stateDead && c.sent2 >= cpLoadedBytes {
-			c.learn(c.sent2, c.lost2, calm)
+			c.learn(c.sent2, c.lost2, calm && below(r2, c.sent2, c.rate))
 		}
 	}
 	busy := allowed > 0 && used >= cpBusyFrac*allowed
@@ -831,15 +830,16 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			case !ok2 || !r2.busy:
 				cp.nextProbe = k + 2 // there was not the data for it
 			case lost && !r2.queue && !r1.queue:
-				// The ceiling. The second round of a probe of two shows
-				// where it is: the first has used up what a policer lets
-				// pass in a burst. (Roughly: the round's packets share the
-				// policer with the next round's, which are fewer, so a
-				// little more of them passes. Hence the wider margin.)
-				if v := cpProbeMargin * sample2; h(k-3).phase == cpProbe && v > cp.bw {
-					cp.setLocked(min(v, cp.probeBw*r2.gain))
-				}
+				// The ceiling: B stays, probes become rarer, and the next
+				// one asks for half as much more. (What the lossy probe
+				// delivered does not say where the ceiling is: its packets
+				// met the next round's at the policer, which were fewer,
+				// so more of them passed than the policer's rate. If B is
+				// below the ceiling, a smaller probe finds out without
+				// loss.)
+				g := max(1+(r2.gain-1)/2, cpMinProbeGain)
 				held()
+				cp.probeGain = g
 			case !lost && sample2 >= cp.probeBw*(1+cpProbeShow*(r2.gain-1)):
 				// There was more: again, and for more. Right away, unless
 				// loss stopped B before: then the rounds at the new B must
@@ -905,9 +905,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		// Loss beyond the baseline at B, on every path, two rounds in a
 		// row: B is too high (a policer, a buffer that is full), and what
 		// the second round delivered is what the pipe takes. A round
-		// below B follows, to see what loss is there anyway.
+		// below B follows, to see what loss is there anyway. (A round
+		// below B that loses says the same, unless it followed a probe:
+		// then its packets met the probe's on the way.)
+		atB := r2.phase == cpCruise || r2.phase == cpDrain && h(k-3).gain <= 1
 		switch {
-		case !ok2 || !r2.busy || r2.phase != cpCruise || k-2 <= cp.cutRound:
+		case !ok2 || !r2.busy || !atB || k-2 <= cp.cutRound:
 		case common2:
 			if cp.lossN++; cp.lossN >= cpLossRounds {
 				v := sample2
@@ -963,6 +966,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	if limit > 0 && cp.bw > float64(limit) {
 		cp.setLocked(float64(limit))
 	}
+	if cp.hold == 0 && cp.bw > (1+cpSameCeil)*cp.ceil {
+		// B is far above where loss stopped it once, and no loss holds
+		// it back: that ceiling is gone, and one found there later is new.
+		cp.ceil = 0
+	}
 	if cp.hold > 0 && cp.bw < (1-cpSameCeil)*cp.ceil {
 		// B is far below where loss stopped it (the capacity dropped):
 		// what was learned there does not hold probes back here.
@@ -984,7 +992,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		switch {
 		case cp.drainQ == 0 || !cp.congested:
 			// not a drain for a queue, or the queue is gone
-		case cp.drainQ-commonQ < max(target, dt/16) && below(h(k), s0, r1.out):
+		case cp.drainQ-commonQ < max(target, dt/16) && h(k).gain < 1 && below(h(k), s0, r1.out):
 			// The queue is still there and the drain did not shrink it,
 			// though it sent less than the pipe puts out: the queue is
 			// not ours (the other direction's, or somebody else's
@@ -1096,7 +1104,11 @@ func (s *Session) cpShareLocked(limit uint64) {
 			continue
 		}
 		open = append(open, p)
-		floor += cpStartWindow / max(p.srttOrDefault(), 10*time.Millisecond).Seconds()
+		rtt := p.srtt
+		if rtt <= 0 {
+			rtt = cpStartRTT // not measured yet (the window bounds what is in flight)
+		}
+		floor += cpStartWindow / max(rtt, 10*time.Millisecond).Seconds()
 	}
 	n := len(open)
 	total := cp.bw

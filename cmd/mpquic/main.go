@@ -118,14 +118,15 @@ Common options (shadowsocks-compatible):
                     (-s = the local's address and relays forwarding to it)
 
 mpquic options:
-  --congestion CC   bbr (default), bbr-aggressive, bbr-conservative, cubic
+  --congestion CC   with --no-coupling: bbr (default), bbr-aggressive,
+                    bbr-conservative; or cubic (bypasses the session rate)
   --window SIZE     max per-stream window, auto-tuned from 4MB (default 64MB)
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths
   --up RATE         this endpoint's uplink rate, if known (e.g. 20mbit): never send more
   --down RATE       this endpoint's downlink rate (e.g. 100mbit): the peer never sends more
-  --no-coupling     do not rate-control the paths together (each path on its own)
+  --no-coupling     no session rate: every path runs a BBR of its own
   --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
                     size, no MTU discovery (default: start at 1200-byte
                     packets and discover each path's MTU)
@@ -229,7 +230,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
 	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
-	fs.BoolVar(&f.noCoupling, "no-coupling", false, "do not rate-control the paths together")
+	fs.BoolVar(&f.noCoupling, "no-coupling", false, "no session rate: every path runs a BBR of its own")
 	fs.StringVar(&f.up, "up", "", "uplink rate of this endpoint (e.g. 20mbit)")
 	fs.StringVar(&f.down, "down", "", "downlink rate of this endpoint (e.g. 100mbit)")
 	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")

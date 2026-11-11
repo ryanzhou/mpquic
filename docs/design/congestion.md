@@ -94,11 +94,14 @@ round *k* it knows:
 
 **Loss is judged against a baseline.** Every path has a baseline loss: the
 share it loses whatever the rate (a radio link, a bad cable). A round shows
-it if the pipe was clearly not full: the round sent less than 0.9 of what
-the pipe was putting out before it (the round after a probe), or less than
-0.8 of what it put out afterwards (a start-up's rounds while the rate still
-grows). A round merely below *B* is not enough: after the capacity has
-dropped, three quarters of *B* may still be twice what the pipe takes. The
+it if neither the pipe nor the path was full: the session sent less than 0.9
+of what the pipe puts out two rounds later, and the path sent less than 0.9
+of what it puts out itself by then (the round after a probe; a start-up's
+rounds while the rate still grows). A round merely below *B* is not enough:
+after the capacity has dropped, three quarters of *B* may still be twice
+what the pipe takes. Nor is a round in which only the session as a whole
+sent little: what a path loses while its own relay takes less than its
+share is not lost anyway. The
 baseline is the loss of these calm rounds taken together, later ones
 counting more, and it is known once they add up to 200 packets: one small
 round says little (two lost of a hundred is as likely as none), and a
@@ -169,7 +172,9 @@ quarters of the round. Loss on one path only is that path's own business
   more than the pipe takes: a policer, or a buffer that is full. *B* becomes
   98% of what the pipe puts out by then. The first lossy round is not used
   for that: a policer lets a burst pass before it drops, so only the second
-  shows its rate. After that:
+  shows its rate. (A lossy round *below* *B*, while a queue is being
+  drained, counts the same, unless it followed a probe: its packets met the
+  probe's on the way.) After that:
   * a round below *B* follows, so the baselines are current (if the loss
     was random after all, it is in the baselines from then on and does not
     count again);
@@ -178,11 +183,18 @@ quarters of the round. Loss on one path only is that path's own business
     doubles, up to 128 rounds. Probing a policer costs a round of loss
     every time, so it should be rare where the ceiling has been confirmed.
     The hold ends when *B* is no longer near that ceiling (the capacity
-    dropped);
-  * a held probe lasts **two rounds**. If the second is lossy and no path
-    saw a queue (a policer), 96% of what it delivered is the ceiling, and
-    *B* is raised to that if it was lower. If the probe finds more without
-    loss and four rounds at the higher *B* stay clean, the hold is over.
+    dropped), and a ceiling is forgotten once *B* has risen clearly above
+    it without loss (the capacity rose: loss at the old rate later is a new
+    ceiling, with a short hold);
+  * a held probe lasts **two rounds**: one does not tell a policer's burst
+    allowance from capacity. If it is lossy and no path saw a queue (a
+    policer), *B* stays where it is, the hold starts again, and the next
+    probe asks for half as much more (1.125, then 1.06). What the lossy
+    probe delivered is not used: its packets met the following round's at
+    the policer, which were fewer, so more of them passed than the
+    policer's rate. Where *B* is below the ceiling, the smaller probes find
+    the rest without loss. If a probe finds more without loss and four
+    rounds at the higher *B* stay clean, the hold is over.
   A probe that loses while the paths see a queue has overflowed a buffer.
   That is no ceiling to remember: it counts as a probe that found nothing,
   and the next one is smaller.
@@ -248,7 +260,10 @@ controller's: small transfers still go to the fastest path.
 
 A path that is not usable (suspect, benched) keeps a minimal share for its
 pings. Before the session has a rate, every path has a window of 32 packets
-and is paced at twice that per round trip.
+and is paced at twice that per round trip (taken to be 50 ms until the
+path's first RTT sample: the window bounds what is in flight anyway, and a
+slower pace would delay the first datagrams of a session over a short
+path).
 
 The session's stats log line shows `rate=<B>` (and `limit=` if configured);
 a path with a limit of its own shows it as `own=`. `MPQUIC_RATE_DEBUG=1`
