@@ -93,15 +93,28 @@ import (
 // rate, the session does not need to find it by filling it.
 
 const (
-	cpMinRound     = 50 * time.Millisecond
-	cpMaxRound     = time.Second
-	cpRounds       = 10                   // rounds the session's delivery rate is remembered for
-	cpSatRounds    = 3                    // congested rounds whose delivery rate is averaged
-	cpHold         = 0.9                  // ... and replaces B if below this share of it
-	cpTrim         = 0.98                 // "clearly less": delivered below this share of what was sent, or of B
-	cpQueueTarget  = 3 * time.Millisecond // a path sees a queue: this much (or a tenth of the shortest base RTT) above its base RTT
-	cpLoadedBytes  = 10 * 1200            // a path carried data in a round: this much acknowledged
-	cpIdleFrac     = 0.2                  // the session was busy: its paths waited for data less than this
+	cpMinRound         = 50 * time.Millisecond
+	cpMaxRound         = time.Second
+	cpRounds           = 10                   // rounds the session's delivery rate is remembered for
+	cpSatRounds        = 3                    // congested rounds whose delivery rate is averaged
+	cpHold             = 0.9                  // ... and replaces B if below this share of it
+	cpTrim             = 0.98                 // "clearly less": delivered below this share of what was sent, or of B
+	cpQueueTarget      = 3 * time.Millisecond // a path sees a queue: this much (or a tenth of the shortest base RTT) above its base RTT
+	cpLoadedBytes      = 10 * 1200            // a path carried data in a round: this much acknowledged
+	cpPolicedRounds    = 6                    // rounds with loss on every path, within four times as many
+	cpPolicedMargin    = 0.98                 // B is this much of what the bottleneck let through
+	cpPolicedHold      = 48                   // rounds B is held without probing, doubled when found again at once ...
+	cpPolicedMaxHold   = 192                  // ... up to this
+	cpPolicedFloor     = 0.75                 // loss that is still there with B down to this much of where it was: not a policer
+	cpPolicedBan       = 256                  // rounds without looking again after that
+	cpPolicedClear     = 3                    // tests in a row without loss: not limited any more
+	cpPolicedMore      = 1.03                 // a test probe delivered this much of B: there is more
+	cpPolicedMoreLossy = 1.06                 // ... with loss in the probes, this much (a round\'s rate is a few percent off)
+	cpPolicedUp        = 1.03                 // the step up then
+	cpPolicedDown      = 0.97                 // the most B comes down for one round with loss
+	cpPolicedCheck     = 4                    // rounds at the lower rate after which the loss must be gone
+
+	cpIdleFrac     = 0.2 // the session was busy: its paths waited for data less than this
 	cpProbeGain    = 1.25
 	cpMaxProbeGain = 2.0
 	cpProbeShow    = 0.5 // share of a probe's gain that must show in the delivery rate
@@ -161,7 +174,26 @@ type coupling struct {
 	prevBusy  bool
 	prevRate  float64
 	congested bool // last round: every loaded path saw a queue or loss
-	full      bool // ... and the delivery rate has stopped growing, also of every path in STARTUP
+	// A bottleneck that drops by rate (see cpRoundLocked): the sampling
+	// interval (rounds with loss on every path, their delivery rates and
+	// loss fractions added up, the previous interval's average), and the
+	// state itself.
+	ltN                      int
+	ltSum, ltLoss            float64
+	ltStart                  int64
+	ltBw                     float64 // B at the first of them
+	policed                  bool
+	polBw, polBw0, polLoss   float64 // B while it holds, B before, the loss that led here
+	polStart, polUntil       int64
+	polHold, polExit, polBan int64
+	polRef                   float64 // B when the state was entered, or after the last step up
+	polChkN                  int     // rounds checked for loss at the lower rate ...
+	polChkLoss               float64 // ... and their loss fractions added up
+	polTest                  int     // 0, or the test probe in progress (1, 2)
+	polProbe                 bool    // start one
+	polTestLoss              bool    // a test probe lost packets
+	polClear                 int     // tests in a row that delivered without loss
+	full                     bool    // ... and the delivery rate has stopped growing, also of every path in STARTUP
 	// B is shared out until this round: the pipe was full not long ago
 	sharedUntil int64
 	queued      int // consecutive rounds in which every loaded path saw a queue
@@ -471,6 +503,153 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration) {
 	if len(cp.filter) > 0 {
 		cp.bw = cp.filter[0].v
 	}
+	// A bottleneck that drops instead of queueing (a policer, a buffer of a
+	// few milliseconds) gives no delay to go by, and the maximum of what it
+	// let through is above its rate by its burst allowance: the paths then
+	// lose a few percent all the time. Each loss holds up its stream for a
+	// loss recovery, a round trip or more, which at a high rate and a long
+	// round trip is most of the stream's window. So where the loss depends
+	// on the rate (it is there round after round at B, on every path, and
+	// gone when less is sent), B is what the bottleneck let through on
+	// average, a little less, and is not probed for a while (as Linux BBR's
+	// long-term rate for policers). Random loss looks the same until less
+	// is sent: it stays, and B is given back.
+	lossy := measured > 0 && kept == measured && sentPrev > 0 && rate < sentPrev
+	lossFrac := 0.0
+	if lossy {
+		lossFrac = 1 - rate/sentPrev
+	}
+	switch {
+	case cp.policed:
+		// At a policer B is below its rate now and nothing is lost. If B
+		// is still above (what the bottleneck let through included its
+		// burst allowance, or a step went too far), the loss says so, and
+		// what is delivered while more is sent is its rate. Loss that
+		// stays however far B comes down does not come from the rate.
+		if cp.roundNo-cp.polStart >= 2 && wasBusy && lossy && lossFrac >= 0.01 && sentPrev >= 0.9*cp.polBw {
+			// (a round's delivery rate is a few percent off: by steps)
+			cp.polBw = min(cp.polBw, max(cpPolicedMargin*rate, cpPolicedDown*cp.polBw))
+		}
+		// ... and the loss itself, of all paths together, in the first
+		// rounds at the lower rate: at a policer it is gone.
+		if cp.roundNo-cp.polStart >= 2 && cp.polChkN < cpPolicedCheck && sentPrev > 0 && cp.polTest == 0 {
+			cp.polChkN++
+			cp.polChkLoss += 1 - rate/sentPrev
+		}
+		still := cp.polChkN == cpPolicedCheck && cp.polChkLoss/cpPolicedCheck >= max(0.01, cp.polLoss/3)
+		if cp.polChkN == cpPolicedCheck && !still {
+			cp.polChkN++ // checked
+		}
+		switch {
+		case still || cp.polBw < cpPolicedFloor*cp.polRef:
+			if cpDebug {
+				fmt.Fprintf(os.Stderr, "RATE round=%d policed: no (loss stays: %.1f%% over %d rounds, B from %.1fM to %.1fM), B back to %.1fM\n", cp.roundNo, 100*cp.polChkLoss/float64(max(cp.polChkN, 1)), cp.polChkN, cp.polRef*8/1e6, cp.polBw*8/1e6, cp.polBw0*8/1e6)
+			}
+			cp.policed, cp.polTest, cp.polBan, cp.polHold = false, 0, cp.roundNo+cpPolicedBan, 0
+			cp.filter = append(cp.filter[:0], cpSample{cp.shortNo, cp.polBw0})
+			cp.bw = cp.polBw0
+		case cp.polTest > 0 && cp.phase == cpObserve:
+			// rate is what was delivered of a test probe's round
+			// (loss of all paths together: one of them may have got through)
+			cp.polTestLoss = cp.polTestLoss || sentPrev > 0 && rate < cpTrim*sentPrev
+			switch {
+			case rate < cp.polBw*cpPolicedMore || cp.polTest == 2 && cp.polTestLoss && rate < cp.polBw*cpPolicedMoreLossy:
+				// nothing more: held again, for longer
+				cp.polTest = 0
+				cp.polHold = min(2*cp.polHold, cpPolicedMaxHold)
+				cp.polUntil = cp.roundNo + cp.polHold
+			case cp.polTest == 1:
+				// One probe may have been a policer's burst allowance,
+				// which has had no time to refill: once more.
+				cp.polTest, cp.polProbe = 2, true
+			case !cp.polTestLoss && cp.polClear+1 >= cpPolicedClear:
+				// Delivered without loss, time after time: the limit is
+				// gone, or far above. The usual probes find where.
+				if cpDebug {
+					fmt.Fprintf(os.Stderr, "RATE round=%d policed: probes delivered without loss %d times, %.1fM -> %.1fM, probing as usual\n", cp.roundNo, cp.polClear+1, cp.polBw*8/1e6, rate*8/1e6)
+				}
+				cp.policed, cp.polTest, cp.polExit, cp.polHold, cp.polClear = false, 0, cp.roundNo, 0, 0
+				cp.polBw = rate
+				cp.nextProbe, cp.probeGain = cp.roundNo, 0
+			default:
+				// More was delivered: the limit is above. A step towards
+				// it, and the next test soon; if the step is too far, the
+				// loss says so and B comes back (above). With loss in the
+				// probes the limit is near, and what a probe delivers
+				// includes the burst allowance: a small step. Without, B
+				// was too low (found while the stream was stalling).
+				// The second probe found the burst allowance used up by
+				// the first: with loss, what it delivered is the rate.
+				up := min(cpPolicedMargin*rate, cp.polBw*cpPolicedUp)
+				cp.polHold = cpPolicedHold / 4
+				if cp.polTestLoss {
+					cp.polClear = 0
+				} else {
+					up = cp.polBw * (1 + cpProbeShow*(cpProbeGain-1)/2)
+					cp.polClear++
+					cp.polHold = cpPolicedHold / 12
+				}
+				if cpDebug {
+					fmt.Fprintf(os.Stderr, "RATE round=%d policed: two probes delivered %.1fM (loss: %v), B %.1fM -> %.1fM\n", cp.roundNo, rate*8/1e6, cp.polTestLoss, cp.polBw*8/1e6, up*8/1e6)
+				}
+				cp.polBw, cp.polTest = max(up, cp.polBw), 0
+				cp.polStart, cp.polRef = cp.roundNo, cp.polBw
+				cp.polChkN, cp.polChkLoss = 0, 0
+				cp.polUntil = cp.roundNo + cp.polHold
+			}
+			cp.sharedUntil = max(cp.sharedUntil, cp.polUntil+cpShareRounds)
+			cp.filter = append(cp.filter[:0], cpSample{cp.shortNo, cp.polBw})
+			cp.bw = cp.polBw
+		case cp.polTest == 0 && cp.roundNo >= cp.polUntil:
+			// See whether there is more by now, with two probes (below).
+			// Probing as usual would take B above the rate again by the
+			// burst allowance, with loss until it is found once more.
+			cp.polTest, cp.polProbe, cp.polTestLoss = 1, true, false
+			cp.filter = append(cp.filter[:0], cpSample{cp.shortNo, cp.polBw})
+			cp.bw = cp.polBw
+		default:
+			cp.filter = append(cp.filter[:0], cpSample{cp.shortNo, cp.polBw})
+			cp.bw = cp.polBw
+		}
+		cp.ltN, cp.ltSum, cp.ltLoss = 0, 0, 0
+	case cp.roundNo < cp.polBan || cp.phase == cpDrain || cp.phase == cpSettle:
+	case lossy && lossFrac >= 0.01 && !cp.congested:
+		// Rounds with loss on every path and no queue to show for it (a
+		// bottleneck with a buffer is followed by its queue, and loses
+		// only when a probe or STARTUP overflows it), not necessarily in a
+		// row: a
+		// stream that waits for lost data lets the paths idle for part of
+		// some rounds, and those go through without loss.
+		// ... while B stands: as long as it grows (the paths are still
+		// finding their rates), loss says nothing about a limit.
+		if cp.ltN == 0 || cp.roundNo-cp.ltStart > 4*cpPolicedRounds || cp.bw > 1.05*cp.ltBw {
+			cp.ltN, cp.ltSum, cp.ltLoss, cp.ltStart, cp.ltBw = 0, 0, 0, cp.roundNo, cp.bw
+		}
+		cp.ltN++
+		cp.ltSum += rate
+		cp.ltLoss += lossFrac
+		if cp.ltN >= cpPolicedRounds {
+			avg, loss := cp.ltSum/float64(cp.ltN), cp.ltLoss/float64(cp.ltN)
+			cp.policed, cp.polStart, cp.polBw0, cp.polLoss = true, cp.roundNo, cp.bw, loss
+			cp.polBw = cpPolicedMargin * avg
+			cp.polRef = cp.polBw
+			cp.polChkN, cp.polChkLoss = 0, 0
+			// held for longer each time it is found again right after
+			if cp.polHold > 0 && cp.roundNo-cp.polExit < 2*cpPolicedHold {
+				cp.polHold = min(2*cp.polHold, cpPolicedMaxHold)
+			} else {
+				cp.polHold = cpPolicedHold
+			}
+			cp.polUntil = cp.roundNo + cp.polHold
+			if cpDebug {
+				fmt.Fprintf(os.Stderr, "RATE round=%d policed: %d rounds with %.1f%% loss delivered %.1fM, B %.1fM -> %.1fM for %d rounds\n", cp.roundNo, cp.ltN, 100*loss, avg*8/1e6, cp.polBw0*8/1e6, cp.polBw*8/1e6, cp.polHold)
+			}
+			cp.filter = append(cp.filter[:0], cpSample{cp.shortNo, cp.polBw})
+			cp.bw = cp.polBw
+			cp.sharedUntil = max(cp.sharedUntil, cp.polUntil+cpShareRounds)
+			cp.ltN, cp.ltSum, cp.ltLoss = 0, 0, 0
+		}
+	}
 	// A maximum of noisy samples is a few percent too high, and the paths'
 	// own drain phases then keep taking back what queues. While B is what
 	// limits every path and all of them see a queue, the session should
@@ -533,12 +712,21 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration) {
 	}
 	if cp.phase == cpCruise && busy && limited {
 		switch {
+		case cp.policed:
+			// not probed while it holds, but for the test at its end
+			if cp.polProbe {
+				cp.polProbe, cp.probeGain = false, cpProbeGain
+				cp.phase, cp.gain, cp.probeBw = cpProbe, cpProbeGain, cp.bw
+			}
 		case cp.roundNo >= cp.nextProbe:
 			cp.probeGain = max(cp.probeGain, cpProbeGain)
 			cp.phase, cp.gain, cp.probeBw = cpProbe, cp.probeGain, cp.bw
 		case cp.queued >= 2 && cp.roundNo-cp.lastDrain >= cpDrainEvery:
 			cp.phase, cp.gain, cp.drainQ = cpDrain, cpDrainGain, commonQ
 		}
+	}
+	if cp.policed && cp.phase == cpObserve {
+		cp.gain = 1 // a test probe is not followed by a lull: that would refill a policer's bucket
 	}
 	cp.roundNo++
 	if cpDebug {
@@ -613,7 +801,7 @@ func (s *Session) cpShareLocked(limit uint64) {
 		switch {
 		case total == 0 || !p.usable():
 			s.setCapLocked(p, 0)
-		case p.ccMode == "startup" && !cp.full && !ceiling:
+		case p.ccMode == "startup" && !cp.full && !ceiling && !cp.policed:
 			// A path in STARTUP is still finding its rate: it gets no share
 			// until the pipe is evidently full. What it delivered is part
 			// of the session rate, and is set aside for it.
