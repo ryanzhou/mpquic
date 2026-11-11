@@ -97,13 +97,20 @@ share it loses whatever the rate (a radio link, a bad cable). A round shows
 it if the pipe was clearly not full: the round sent less than 0.9 of what
 the pipe was putting out before it (the round after a probe), or less than
 0.8 of what it put out afterwards (a start-up's rounds while the rate still
-grows). Other rounds can only lower it. A round merely below *B* is not
-enough: after the capacity has dropped, three quarters of *B* may still be
-twice what the pipe takes. A round is *lossy* if the paths
-lost clearly more than their baselines (by 2% of what they sent, and by
-more than chance explains), and if that is so for the paths that carried
-three quarters of the round. Loss on one path only is that path's own
-business (below); random loss, however heavy, is in the baseline.
+grows). A round merely below *B* is not enough: after the capacity has
+dropped, three quarters of *B* may still be twice what the pipe takes. The
+baseline is the loss of these calm rounds taken together, later ones
+counting more, and it is known once they add up to 200 packets: one small
+round says little (two lost of a hundred is as likely as none), and a
+baseline of zero from such a round would make every later loss look like
+the pipe's. Other rounds can only lower it.
+
+A round is *lossy* if the paths lost clearly more than their baselines: by
+2% of what they sent, and by more than chance explains (three standard
+deviations, for losses that come in bursts of four packets, as random loss
+on real links does), and if that is so for the paths that carried three
+quarters of the round. Loss on one path only is that path's own business
+(below); random loss, however heavy, is in the baseline.
 
 ## The session rate
 
@@ -112,24 +119,26 @@ business (below); random loss, however heavy, is in the baseline.
 * **Start-up.** The rate is twice the rate at which acknowledgements are
   arriving (measured continuously, over the last round), so it doubles
   about every round trip, like TCP's slow start. It ends
-  * when a round loses more than the paths' baselines on every path (the
-    first rounds have shown the baselines by then, so random loss does not
-    end it): the pipe takes no more;
-  * or when a tenth of a round did not come out, or *B* has not grown by a
-    quarter for two rounds while the paths see a queue. (Without a queue,
-    slow growth is not the pipe's doing: the paths' windows open with what
-    they deliver, a round trip behind.)
+  * when a round loses 5% more than the paths' baselines explain, on every
+    path (the first rounds have shown the baselines by then, so random
+    loss does not end it): the pipe takes no more;
+  * or when a tenth of a round did not come out (judged on the paths that
+    have no limit of their own, below), or *B* has not grown by a quarter
+    for two rounds while every path sees a queue. (Without a queue on every
+    path, slow growth is not the pipe's doing: the paths' windows open with
+    what they deliver, a round trip behind, and one path's queue is that
+    path's.)
 
   Loss and queues are also checked at every tick within a round: as soon
-  as the last two rounds show loss beyond the baselines on every path, or
-  every path's round-trip time is clearly above its base (by a quarter of
-  the base RTT, at least 3 ms), the session sends no more than is being
-  delivered for the rest of the round. What reaches the receiver is never
-  more than the line carries; what leaves the sender overshoots by up to a
-  factor of two for about one round trip, as with any slow start. *B* is
-  then what the pipe puts out, and one round at half of it drains what the
-  overshoot queued. None of this applies to a session that sends less than
-  half of what it may (see "whether it had data" above).
+  as the last two rounds show that loss on every path, or every path's
+  round-trip time is clearly above its base (by a quarter of the base RTT,
+  at least 3 ms), the session sends no more than is being delivered for
+  the rest of the round. What reaches the receiver is never more than the
+  line carries; what leaves the sender overshoots by up to a factor of two
+  for about one round trip, as with any slow start. *B* is then what the
+  pipe puts out, and one round at half of it drains what the overshoot
+  queued. None of this applies to a session that sends less than half of
+  what it may (see "whether it had data" above).
 * **Cruise.** The session sends at *B*. A round at *B* that comes out
   (95% of *B* is put out) confirms *B*; if less comes out for ten rounds,
   *B* is the most that did.
@@ -210,17 +219,23 @@ business (below); random loss, however heavy, is in the baseline.
 **max-min fairly**: equal shares, except that a path gets no more than its
 own limit, and the others share the rest.
 
-A path has a **limit of its own** when it alone has trouble: for two rounds
-its queue is clearly longer than what all paths see, or it loses beyond its
-baseline while the others do not (a relay slower than its share). The limit
-is 98% of what the path put out then, if that is less than it was given (a
-path that puts out its share is not in trouble, whatever its queue looks
-like), and the path sends half of it for one round, so its queue is gone.
-This is only learned while the session sends steadily and the path gets its
-share; after a start-up or while the rate changes, a path's output says
-little about what it can carry. Every 8
-rounds (doubling when it fails, up to 64) the limit is raised by a quarter
-for three rounds, and stays raised if the path then puts out more.
+A path has a **limit of its own** when it cannot take its share (a relay
+slower than its share): its window holds it back, it has a queue or loses
+beyond its baseline, and it puts out less than 0.9 of its share while the
+other paths put out theirs. (A window alone is a path waiting for its
+acknowledgements; and when all paths fall short, it is the session's rate
+that is wrong, not a path.) Far short (below 0.75) it gets the limit at
+once, otherwise after two rounds; in the start-up, when it puts out no more
+than a round ago while the others grow. The same goes for a path that,
+while the session sends steadily, alone has a clearly longer queue than the
+others or alone loses, and puts out less than its share. The limit is 98%
+of what the path put out, and the path sends half of it for one round, so
+its queue is gone. What the path does not take is shared among the others.
+
+Every 8 rounds (doubling when it fails, up to 64) a limited path is tried
+for more the way the session probes: one round at 1.25 times its limit, the
+next at 0.75, and the limit goes up if at least half of what the round
+added was delivered.
 
 Equal shares keep every path loaded: a failing path leaves only its share
 to be taken over, and loss recovery has capacity everywhere. Which stream's
