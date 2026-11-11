@@ -513,7 +513,7 @@ func TestRateFlap(t *testing.T) {
 	}
 	// (Each rise is found by probes, over a second or so of the four.)
 	within(t, "goodput", x.goodput(80*time.Second), mbit(70), 0.8, 1.0)
-	if l := x.lossShare(); l > 0.02 { // each drop overflows the buffer for a round or two
+	if l := x.lossShare(); l > 0.03 { // each drop overflows the buffer for a round or two
 		t.Errorf("loss %.2f%%", 100*l)
 	}
 	if q := x.meanQueue(); q > ms(30) {

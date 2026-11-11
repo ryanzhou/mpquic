@@ -133,6 +133,7 @@ type cpRound struct {
 	busy  bool    // the session was not waiting for data: it sent what it could, or the paths took no more
 	full  bool    // ... and it did send what it could: what the round delivered and lost says what the pipe takes
 	queue bool    // a path saw a queue
+	allq  bool    // ... every path that carried data did
 	out   float64 // the rate at which acknowledgements came in during it (bytes/s)
 	thin  bool    // the session sent less than half of what it could: it has little to send
 }
@@ -154,6 +155,7 @@ type coupling struct {
 	startLoss bool    // ... (loss)
 	acks      []cpAck // the bytes acknowledged as of the last ticks (a round's worth)
 	qTicks    int     // ticks in a row at which every path saw a queue
+	prevOut   float64 // the rate at which acknowledgements came in during the last round
 
 	raised    int64   // a probe found more at the end of this round (-1: not lately) ...
 	clean     int     // ... and rounds at the new B without loss since
@@ -195,14 +197,17 @@ type cpPath struct {
 	base   [2]time.Duration
 	baseAt time.Time
 
-	acked0 uint64  // bytes acknowledged when the round began
-	rate   float64 // the rate at which acknowledgements came in during the last round (bytes/s)
-	rate2  float64 // the rate at which what it sent in the round before last was delivered
-	sent   float64 // how fast it sent in the round before that (bytes/s)
-	lossy  bool    // the round before that lost more than the path's baseline
-	sent2  uint64  // ... of this much sent
-	lost2  uint64
-	full   bool // it sent its share in the last round, or as much as its window let it
+	acked0  uint64  // bytes acknowledged when the round began
+	rate    float64 // the rate at which acknowledgements came in during the last round (bytes/s)
+	rate1   float64 // the rate at which what it sent in the last round was delivered, so far
+	rate2   float64 // the rate at which what it sent in the round before last was delivered
+	sent    float64 // how fast it sent in the round before that (bytes/s)
+	lossy   bool    // the round before that lost more than the path's baseline
+	sent2   uint64  // ... of this much sent
+	lost2   uint64
+	full    bool    // it sent its share in the last round, or as much as its window let it
+	blocked bool    // ... its window held it back in the last round
+	prev    float64 // the rate at which acknowledgements came in during the round before
 
 	// lossBase is the share the path loses whatever the rate (random
 	// loss), as the rounds that send less than B show it.
@@ -520,7 +525,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		ps1, pa1, pl1 := t1.Sent, t1.Acked, t1.Lost
 		ps2, pa2, pl2 := t2.Sent, t2.Acked, t2.Lost
 		blocked := p.meter.TakeBlocked()
-		c.full = false
+		c.full, c.blocked = false, blocked
 		if p.usable() {
 			share := float64(c.cap) * dt.Seconds()
 			allowed += share
@@ -536,11 +541,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if r1.dt > 0 {
 			c.sent = float64(ps1) / r1.dt.Seconds()
 		}
-		c.rate2 = t2.Rate(t3, r2.dt)
-		rate += t1.Rate(t2, r1.dt)
+		c.rate1, c.rate2 = t1.Rate(t2, r1.dt), t2.Rate(t3, r2.dt)
+		rate += c.rate1
 		rate2 += c.rate2
 		// What the path put out during the round, whatever round it was
 		// sent in.
+		c.prev = c.rate
 		if acked := p.meter.Acked(); acked >= c.acked0 {
 			c.rate = float64(acked-c.acked0) / dt.Seconds()
 			out += c.rate
@@ -591,7 +597,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		}
 	}
 	busy := allowed > 0 && used >= cpBusyFrac*allowed
-	*h(k) = cpRound{cp.phase, cp.gain, dt, busy, allowed > 0 && usedRaw >= cpBusyFrac*allowed, queued > 0, out, used < cpThinFrac*allowed}
+	*h(k) = cpRound{cp.phase, cp.gain, dt, busy, allowed > 0 && usedRaw >= cpBusyFrac*allowed, queued > 0, loaded > 0 && queued == loaded, out, used < cpThinFrac*allowed}
 
 	// Round k-1: what it delivered (nearly all of it is acknowledged by
 	// now, unless a queue is growing) and lost so far. Round k-2: its
@@ -637,6 +643,8 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if p.meter == nil || p.state == stateDead {
 			continue
 		}
+		// (its own trouble: a queue, or loss beyond its baseline)
+		own := c.queue() >= max(target, c.baseRTT()/4) || c.lossy && c.lossOK
 		switch {
 		case c.tryAt > 0:
 			if k == c.tryAt {
@@ -653,21 +661,33 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 				c.limitNext = k + cpPathProbe<<c.limitBack
 			}
 			c.tryAt = 0
-		case cp.phase == cpStartup && r1.busy && c.full && c.sent > 0 && c.rate <= cpHoldQ*c.sent &&
-			c.queue() >= max(target, c.baseRTT()/4) && out-c.rate >= cpKept*(sentPrev-c.sent):
+		case cp.phase == cpStartup && c.blocked && own && c.prev > 0 && c.rate < 1.1*c.prev &&
+			out-c.rate >= cpStartGrowth*(cp.prevOut-c.prev):
 			// In the start-up every path gets twice as much every round. One
-			// that has a queue and puts out clearly less than it was sent a
-			// round ago, while the others put out what they were sent, is
-			// full: no need to fill it further.
+			// whose window holds it back, with a queue, and that puts out no
+			// more than a round ago, while the others put out more and
+			// more, is full: what it does not take of its share is the
+			// others' to use.
 			c.limit = max(cpMargin*c.rate, cpMinShare)
 			c.short, c.limitNext, c.drainAt = 0, k+cpPathProbe<<c.limitBack, k+1
-		case !steady || !c.full:
+		case cp.phase != cpCruise || !busy || !c.full:
 			// nothing to learn from this round
-		case (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
-			c.rate <= cpTrim*float64(c.cap):
-			// (A path that puts out what it is given is not in trouble,
-			// whatever its queue or loss looks like.)
-			if c.short++; c.short >= cpPathRounds {
+		case c.blocked && own && c.rate <= cpHoldQ*float64(c.cap) && out-c.rate >= cpKept*(allowed/dt.Seconds()-float64(c.cap)),
+			steady && (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
+				c.rate <= cpTrim*float64(c.cap):
+			// Its window holds it back, it has a queue or loses, and it
+			// puts out clearly less than its share, while the others put
+			// out theirs (a window alone is just a path that is waiting
+			// for its acknowledgements); or it alone has
+			// a queue or loses, and puts out less than its share. (A path
+			// that puts out what it is given is not in trouble, whatever
+			// its queue or loss looks like. And when all paths fall short,
+			// it is the session's rate that is wrong, not a path.)
+			need := cpPathRounds
+			if c.blocked && own && c.rate <= 0.75*float64(c.cap) && out-c.rate >= cpKept*(allowed/dt.Seconds()-float64(c.cap)) {
+				need = 1 // far less: its share is wasted on it
+			}
+			if c.short++; c.short >= need {
 				// A little less than it puts out, and half of that for a
 				// round: its queue is still as long as its share made it.
 				c.limit = max(cpMargin*c.rate, cpMinShare)
@@ -687,6 +707,20 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		cp.queued++
 	} else if !cp.congested {
 		cp.queued = 0
+	}
+	// A path with a limit of its own (a slow relay, found full just now or
+	// before) does not say whether the pipe is full: what comes out of
+	// what went in is judged on the others.
+	if cp.phase == cpStartup {
+		var in, got float64
+		for _, p := range s.paths {
+			if c := &p.cps; p.meter != nil && p.state != stateDead && c.limit == 0 {
+				in, got = in+c.sent, got+c.rate1
+			}
+		}
+		if in > 0 && in < sentPrev {
+			kept = got / in
+		}
 	}
 	was := cp.phase
 	next := cp.phase
@@ -726,11 +760,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		case kept < cpStartKept:
 			// clearly less came out than went in (queued or lost)
 			over = true
-		case queued > 0 || r1.queue:
-			// It did not grow, and there is a queue: over after two such
-			// rounds. (Without a queue it is not the pipe that holds the
-			// rate back: the paths' windows open with what they deliver,
-			// a round trip behind.)
+		case loaded > 0 && queued == loaded || r1.allq:
+			// It did not grow, and every path has a queue: over after two
+			// such rounds. (Otherwise it is not the pipe that holds the
+			// rate back. The paths' windows open with what they deliver,
+			// a round trip behind; and one path's queue is that path's: a
+			// slow relay is full long before the others are.)
 			cp.stall++
 			over = cp.stall >= cpStartStall
 		}
@@ -792,7 +827,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 				switch {
 				case cp.hold > 0:
 					cp.nextProbe = k + cpProbation + 2
-				case r2.queue || r1.queue:
+				case r2.allq || r1.allq:
 					// It was delivered, but it queued: the pipe is nearly
 					// full, and a larger probe would mostly add to the
 					// queue (which is latency for every stream, and for
@@ -972,6 +1007,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			}
 		}
 	}
+	cp.prevOut = out
 	cp.phase = next
 	switch next {
 	case cpStartup:
