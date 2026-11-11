@@ -80,6 +80,7 @@ const (
 	cpTrim        = 0.98                 // ... and over cpTrimRounds queued rounds, below this much
 	cpTrimRounds  = 3
 	cpDrainEvery  = 8 // rounds between drains of a queue that stays
+	cpMaxDrain    = 8 // ... and the rounds one drain takes at most
 	cpSatRounds   = 3
 
 	cpLoadedBytes = 10 * 1200 // a path carried data in a round: at least this much
@@ -175,7 +176,9 @@ type coupling struct {
 	satN      int
 	trimN     int
 	trimSum   float64
-	drainQ    time.Duration
+	drainQ    time.Duration // a drain for a queue is under way: the queue before its last round
+	drainN    int           // ... and the rounds it has taken
+	dropped   bool          // B came down because the capacity dropped: what queued meanwhile must go
 	lastDrain int64
 
 	peerLimit uint64 // the peer's maximum receive rate (bytes/s), 0 = none
@@ -458,7 +461,7 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 	case cp.gain >= 1 && r1.gain >= 1 && r1.phase != cpStartup && busy && el >= w.Seconds()/2:
 		if cp.qTicks >= cpQueueTicks && r < cpHoldQ*cp.bw {
 			cp.setLocked(r)
-			cp.satN, cp.trimN, cp.trimSum = 0, 0, 0
+			cp.satN, cp.trimN, cp.trimSum, cp.dropped = 0, 0, 0, true
 		}
 	}
 }
@@ -864,7 +867,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			switch {
 			case mean < cpHoldQ*cp.bw:
 				cp.setLocked(mean)
-				cp.trimN, cp.trimSum = 0, 0
+				cp.trimN, cp.trimSum, cp.dropped = 0, 0, true
 			case cp.trimN >= cpTrimRounds:
 				if m := cp.trimSum / float64(cp.trimN); m < cpTrim*cp.bw {
 					cp.setLocked(m)
@@ -896,7 +899,10 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		}
 	case cpDrain:
 		next = cpCruise
-		if cp.queued > 0 && cp.drainQ > 0 && cp.drainQ-commonQ < max(target, dt/16) && below(h(k), s0, r1.out) {
+		switch {
+		case cp.drainQ == 0 || !cp.congested:
+			// not a drain for a queue, or the queue is gone
+		case cp.drainQ-commonQ < max(target, dt/16) && below(h(k), s0, r1.out):
 			// The queue is still there and the drain did not shrink it,
 			// though it sent less than the pipe puts out: the queue is
 			// not ours (the other direction's, or somebody else's
@@ -907,15 +913,29 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 				}
 			}
 			cp.queued, cp.congested = 0, false
+		case cp.drainN < cpMaxDrain:
+			// It is ours, and still there: on with it. A queue that was a
+			// buffer's worth (the capacity dropped under the session) is
+			// not gone after one round at three quarters, and until it
+			// is, it is latency for every stream, and for the other
+			// direction's acknowledgements too.
+			next, cp.drainN = cpDrain, cp.drainN+1
 		}
-		cp.drainQ = 0
+		if next != cpDrain {
+			cp.drainQ, cp.dropped = 0, false
+		} else {
+			cp.drainQ = commonQ
+		}
 	case cpCruise:
+		if !cp.congested {
+			cp.dropped = false // nothing queued
+		}
 		switch {
 		case !busy:
 		case cp.wantDrain:
 			next, cp.wantDrain = cpDrain, false
-		case cp.queued >= 2 && k-cp.lastDrain >= cpDrainEvery:
-			next, cp.drainQ, cp.lastDrain = cpDrain, commonQ, k
+		case cp.congested && (cp.dropped || cp.queued >= 2 && k-cp.lastDrain >= cpDrainEvery):
+			next, cp.drainQ, cp.lastDrain, cp.drainN = cpDrain, max(commonQ, 1), k, 1
 		case !atLimit && k >= cp.nextProbe && cp.lossN == 0:
 			next = cpProbe
 			if cp.probeGain == 0 {

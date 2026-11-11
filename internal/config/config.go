@@ -48,7 +48,7 @@ type Config struct {
 	Key           string `json:"key,omitempty"`
 	SNI           string `json:"sni,omitempty"`
 	NoDup         bool   `json:"no_dup,omitempty"`
-	NoCoupling    bool   `json:"no_coupling,omitempty"` // paths are not rate-controlled together
+	NoCoupling    bool   `json:"no_coupling,omitempty"` // no session rate: a BBR per path
 	// Up / Down: the rate of this endpoint's uplink / downlink ("20mbit";
 	// a number is bit/s), if known. The session then sends no more than Up
 	// over all paths together, and tells the peer to send no more than

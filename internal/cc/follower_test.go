@@ -42,6 +42,14 @@ func TestFollowerWindow(t *testing.T) {
 	if w, want := m.GetCongestionWindow(), congestion.ByteCount(200<<10); w < want*95/100 || w > want*105/100 {
 		t.Errorf("window %d, want about %d (two round trips of what it delivers)", w, want)
 	}
+	// A path that delivers what it is given is not held back by long round
+	// trips (another direction's queue): its rate for a smoothed round
+	// trip, on top of the two.
+	m.SetRate(1 << 20)
+	if w, want := m.GetCongestionWindow(), congestion.ByteCount(300<<10); w < want*95/100 || w > want*105/100 {
+		t.Errorf("window %d, want about %d (it carries its rate)", w, want)
+	}
+	m.SetRate(10 << 20)
 	if !m.CanSend(100<<10) || m.TakeBlocked() {
 		t.Error("blocked below the window")
 	}

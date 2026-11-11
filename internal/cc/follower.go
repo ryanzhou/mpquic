@@ -47,6 +47,9 @@ const (
 	followSlack     = 25 * time.Millisecond
 	followMinWindow = 32 // packets
 	followWindows   = 4
+	// The window bounds a path that delivers less than this much of its
+	// rate (see window).
+	followCarries = 0.9
 	// A measuring window is a round trip long, and at least this.
 	followMinMeasure = 25 * time.Millisecond
 )
@@ -120,7 +123,17 @@ func (f *follower) window() congestion.ByteCount {
 		return floor
 	}
 	d := max(2*rtt, rtt+followSlack)
-	return max(congestion.ByteCount(f.delivered()*d.Seconds()), floor)
+	del := f.delivered()
+	w := del * d.Seconds()
+	// A path that delivers what it is given is not held back, however long
+	// its round trips are: they also grow with queues that are not this
+	// path's, or not this direction's (the acknowledgements of a download
+	// behind an upload's queue), and a window of two base round trips
+	// would then keep the path below its rate.
+	if r := float64(f.rate()); del >= followCarries*r && f.rtt != nil {
+		w = max(w, r*(f.rtt.SmoothedRTT()+d).Seconds())
+	}
+	return max(congestion.ByteCount(w), floor)
 }
 
 func (f *follower) SetRTTStatsProvider(p congestion.RTTStatsProvider) { f.rtt = p }

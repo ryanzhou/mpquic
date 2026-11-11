@@ -104,18 +104,25 @@ business (below); random loss, however heavy, is in the baseline.
 
 * **Start-up.** The rate is twice the rate at which acknowledgements are
   arriving (measured continuously, over the last round), so it doubles
-  about every round trip, like TCP's slow start. It ends when *B* stops
-  growing by a quarter per round (two rounds in a row, or at once if a
-  tenth of a round did not come out). It also ends within a round, at the
-  next tick, as soon as it has gone too far: a tenth of what the last two
-  rounds are known to have delivered or lost is lost beyond the baselines
-  (which the first rounds have shown by then), or every path's
-  round-trip time is clearly above its base (a queue; by a quarter of the
-  base RTT, at least 3 ms). From then on the session sends no more than is
-  being delivered. What reaches the receiver is never more than the line
-  carries; what leaves the sender overshoots by up to a factor of two for
-  about one round trip, as with any slow start. *B* is then what the pipe
-  puts out, and one round at half of it drains what the overshoot queued.
+  about every round trip, like TCP's slow start. It ends
+  * when a round loses more than the paths' baselines on every path (the
+    first rounds have shown the baselines by then, so random loss does not
+    end it): the pipe takes no more;
+  * or when a tenth of a round did not come out, or *B* has not grown by a
+    quarter for two rounds while the paths see a queue. (Without a queue,
+    slow growth is not the pipe's doing: the paths' windows open with what
+    they deliver, a round trip behind.)
+
+  Loss and queues are also checked at every tick within a round: as soon
+  as the last two rounds show loss beyond the baselines on every path, or
+  every path's round-trip time is clearly above its base (by a quarter of
+  the base RTT, at least 3 ms), the session sends no more than is being
+  delivered for the rest of the round. What reaches the receiver is never
+  more than the line carries; what leaves the sender overshoots by up to a
+  factor of two for about one round trip, as with any slow start. *B* is
+  then what the pipe puts out, and one round at half of it drains what the
+  overshoot queued. None of this applies to a session that sends less than
+  half of what it may (see "whether it had data" above).
 * **Cruise.** The session sends at *B*. A round at *B* that comes out
   (95% of *B* is put out) confirms *B*; if less comes out for ten rounds,
   *B* is the most that did.
@@ -200,8 +207,8 @@ data goes on which path is the scheduler's decision, not the rate
 controller's: small transfers still go to the fastest path.
 
 A path that is not usable (suspect, benched) keeps a minimal share for its
-pings. Before the session has a rate, every path starts with 32 packets per
-round trip.
+pings. Before the session has a rate, every path has a window of 32 packets
+and is paced at twice that per round trip.
 
 The session's stats log line shows `rate=<B>` (and `limit=` if configured);
 a path with a limit of its own shows it as `own=`. `MPQUIC_RATE_DEBUG=1`

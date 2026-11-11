@@ -21,7 +21,9 @@ type Options struct {
 	// ChunkSize is the maximum scheduling unit (bytes). Smaller chunks give
 	// finer-grained scheduling at the cost of per-chunk overhead.
 	ChunkSize int
-	// Congestion selects the per-path congestion controller.
+	// Congestion selects the per-path congestion controller that
+	// NoCoupling uses (a BBR profile), or "cubic" (quic-go's own, which
+	// also bypasses the session rate).
 	Congestion string
 	// IdleTimeout resets proxied streams without activity (ss "timeout").
 	IdleTimeout time.Duration
@@ -42,11 +44,11 @@ type Options struct {
 	// NoDup disables opportunistic duplication of in-flight data onto idle
 	// faster paths (it is on by default; it only uses otherwise idle capacity).
 	NoDup bool
-	// NoCoupling disables the session rate: by default the paths' bandwidth
-	// estimates are capped so that they add up to what the session delivers
-	// over all of them together, which keeps paths behind a common
-	// bottleneck (an endpoint's uplink or downlink) from each probing for
-	// all of it (see coupling.go).
+	// NoCoupling disables the session rate. By default the session has one
+	// congestion controller for all its paths, and the paths pace at their
+	// shares of its rate (see rate.go). With NoCoupling every path runs a
+	// BBR of its own and probes for its bottleneck alone, also where all
+	// paths share one (an endpoint's uplink or downlink).
 	NoCoupling bool
 	// MaxSendRate / MaxRecvRate, if > 0, are ceilings for what the session
 	// sends and receives over all paths together, in bytes/s: the known
