@@ -172,8 +172,9 @@ type coupling struct {
 
 	probeGain float64
 	probeBw   float64
-	probeLeft int // rounds of the probe still to come
-	small     int // probes at the least gain in a row that found nothing
+	probeLeft int  // rounds of the probe still to come
+	small     int  // probes at the least gain in a row that found nothing
+	restart   bool // a start-up is due: two probes in a row found clear room
 	backoff   int
 	streak    int
 	nextProbe int64
@@ -652,8 +653,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if p.meter == nil || p.state == stateDead {
 			continue
 		}
-		// (its own trouble: a queue, or loss beyond its baseline)
-		own := c.queue() >= max(target, c.baseRTT()/4) || c.lossy && c.lossOK
+		// (its own trouble: a queue, or loss beyond its baseline, while
+		// there are other paths, and they put out their shares)
+		others := allowed/dt.Seconds() - float64(c.cap)
+		own := (c.queue() >= max(target, c.baseRTT()/4) || c.lossy && c.lossOK) &&
+			others > 0 && out-c.rate >= cpKept*others
 		switch {
 		case c.tryAt > 0:
 			if k == c.tryAt {
@@ -681,8 +685,8 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			c.short, c.limitNext, c.drainAt = 0, k+cpPathProbe<<c.limitBack, k+1
 		case cp.phase != cpCruise || !busy || !c.full:
 			// nothing to learn from this round
-		case c.blocked && own && c.rate <= cpHoldQ*float64(c.cap) && out-c.rate >= cpKept*(allowed/dt.Seconds()-float64(c.cap)),
-			steady && (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
+		case c.blocked && own && c.rate <= cpHoldQ*float64(c.cap),
+			steady && others > 0 && (c.queue() >= commonQ+max(target, c.baseRTT()/4) || c.lossy && c.lossOK && !common2) &&
 				c.rate <= cpTrim*float64(c.cap):
 			// Its window holds it back, it has a queue or loses, and it
 			// puts out clearly less than its share, while the others put
@@ -693,7 +697,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			// its queue or loss looks like. And when all paths fall short,
 			// it is the session's rate that is wrong, not a path.)
 			need := cpPathRounds
-			if c.blocked && own && c.rate <= 0.75*float64(c.cap) && out-c.rate >= cpKept*(allowed/dt.Seconds()-float64(c.cap)) {
+			if c.blocked && own && c.rate <= 0.75*float64(c.cap) {
 				need = 1 // far less: its share is wasted on it
 			}
 			if c.short++; c.short >= need {
@@ -843,7 +847,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 					// queue (which is latency for every stream, and for
 					// the other direction's acknowledgements).
 				case cp.streak >= 2:
-					cp.probeGain = cpMaxProbeGain
+					// Twice in a row, and no queue: B is far below what
+					// the pipe takes (the capacity came back, or a slow
+					// start ended early). A start-up finds it in a few
+					// rounds, where probes take three rounds a step.
+					cp.restart = true
 				default:
 					cp.probeGain = 1.5
 				}
@@ -1003,6 +1011,9 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			next, cp.wantDrain = cpDrain, false
 		case cp.congested && (cp.dropped || cp.queued >= 2 && k-cp.lastDrain >= cpDrainEvery):
 			next, cp.drainQ, cp.lastDrain, cp.drainN = cpDrain, max(commonQ, 1), k, 1
+		case !atLimit && cp.restart:
+			next, cp.restart = cpStartup, false
+			cp.best, cp.stall, cp.streak, cp.probeGain = cp.bw, 0, 0, cpProbeGain
 		case !atLimit && k >= cp.nextProbe && cp.lossN == 0:
 			next = cpProbe
 			if cp.probeGain == 0 {
@@ -1026,6 +1037,9 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		cp.gain = cp.probeGain
 	case cpDrain:
 		cp.gain = cpDrainGain
+		if cp.drainQ > dt/2 {
+			cp.gain = 0.5 // a long queue: half the rate, or it takes too long
+		}
 		if was == cpProbe {
 			cp.gain = max(2-h(k).gain, 0.5)
 			if h(k-1).phase == cpProbe {
