@@ -599,3 +599,33 @@ func TestRateThinDirection(t *testing.T) {
 	x.run(5 * time.Second)
 	within(t, "goodput", x.goodput(5*time.Second), mbit(100), 0.9, 1.0)
 }
+
+// Two relays whose rates flap on their own (50/10 Mbit/s every 3 s, 20/60
+// every 4 s): each path's limit follows its relay down and up again. (With
+// every path held to a limit, the session's rate is the sum of the limits,
+// so a limit only comes back up if the try for more has rate of its own to
+// try with.)
+func TestRateFlappingRelays(t *testing.T) {
+	x := newRateSim(0, 0, ms(20), ms(60)).own(0.1, mbit(50), mbit(20))
+	x.run(6 * time.Second)
+	x.reset()
+	var capacity float64
+	for i := 0; i < 120; i++ { // 60 s in half seconds
+		a, b := mbit(50), mbit(20)
+		if i/6%2 == 1 {
+			a = mbit(10)
+		}
+		if i/8%2 == 1 {
+			b = mbit(60)
+		}
+		x.paths[0].own, x.paths[1].own = a, b
+		capacity += (a + b) / 120
+		x.run(500 * time.Millisecond)
+	}
+	// (A limit comes back up by doubling every few rounds, from wherever
+	// the relay's worst round left it.)
+	within(t, "goodput", x.goodput(60*time.Second), capacity, 0.6, 1.0)
+	if l := x.lossShare(); l > 0.05 {
+		t.Errorf("loss %.2f%%", 100*l)
+	}
+}

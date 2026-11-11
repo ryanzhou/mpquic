@@ -97,8 +97,9 @@ const (
 	cpMinShare    = 64 << 10  // the least a path's share is (bytes/s), where there is that much to share
 	cpStartWindow = 32 * 1200 // start-up begins with this much per path and round trip
 
-	cpPathRounds = 2 // rounds with a queue of its own after which a path has a limit
-	cpPathProbe  = 8 // rounds between a limited path's tries for more (doubling when they fail)
+	cpPathRounds  = 2 // rounds with a queue of its own after which a path has a limit
+	cpPathProbe   = 8 // rounds between a limited path's tries for more (doubling when they fail)
+	cpPathBackoff = 1 // ... up to twice
 )
 
 // MPQUIC_COUPLE=0 gives every path a BBR of its own (like
@@ -223,11 +224,12 @@ type cpPath struct {
 	// limit is what the path carries on its own account (bytes/s, 0: no
 	// limit known): it alone queued or lost at more.
 	limit     float64
-	short     int   // rounds in a row in which it did
-	drainAt   int64 // the round in which its queue is drained (after the limit was found)
-	tryAt     int64 // the round in which it is tried for more (0: no try under way)
-	tryFull   bool  // ... and whether it sent what it could in it
-	limitNext int64 // round of the next try
+	short     int     // rounds in a row in which it did
+	drainAt   int64   // the round in which its queue is drained (after the limit was found)
+	tryAt     int64   // the round in which it is tried for more (0: no try under way)
+	tryGain   float64 // ... and for how much more (times its limit)
+	tryFull   bool    // ... and whether it sent what it could in it
+	limitNext int64   // round of the next try
 	limitBack int
 
 	cap   uint64 // the share it paces at (bytes/s)
@@ -271,9 +273,9 @@ func (c *cpPath) limitAt(round int64) float64 {
 	case c.drainAt > 0 && round == c.drainAt:
 		return c.limit / 2
 	case c.tryAt > 0 && round == c.tryAt:
-		return c.limit * cpProbeGain
+		return c.limit * c.tryGain
 	case c.tryAt > 0 && round == c.tryAt+1:
-		return c.limit * (2 - cpProbeGain)
+		return c.limit * max(2-c.tryGain, 0.5)
 	}
 	return c.limit
 }
@@ -648,6 +650,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	// path is tried for more the way the session probes: one round at 1.25
 	// times its limit, the next at 0.75, and the limit goes up if at least
 	// half of what the round added was delivered.
+	raised := 0.0
 	for _, p := range s.paths {
 		c := &p.cps
 		if p.meter == nil || p.state == stateDead {
@@ -666,12 +669,17 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			if k < c.tryAt+2 {
 				break // under way
 			}
-			if c.tryFull && c.rate2 >= c.limit*(1+cpProbeShow*(cpProbeGain-1)) {
-				c.limit = min(c.rate2, c.limit*cpProbeGain)
-				c.limitBack, c.limitNext = 0, k+1 // it carries more: again soon
+			if c.tryFull && c.rate2 >= c.limit*(1+cpProbeShow*(c.tryGain-1)) {
+				// It carries more: again at once, and for twice as much
+				// (its capacity came back). The session's rate goes up
+				// with it: the path's share is all it was held to.
+				was := c.limit
+				c.limit = min(c.rate2, c.limit*c.tryGain)
+				raised += c.limit - was
+				c.limitBack, c.limitNext, c.tryGain = 0, k+1, cpMaxProbeGain
 			} else {
-				c.limitBack = min(c.limitBack+1, cpMaxBackoff)
-				c.limitNext = k + cpPathProbe<<c.limitBack
+				c.limitBack = min(c.limitBack+1, cpPathBackoff)
+				c.limitNext, c.tryGain = k+cpPathProbe<<c.limitBack, cpProbeGain
 			}
 			c.tryAt = 0
 		case cp.phase == cpStartup && c.blocked && own && c.prev > 0 && c.rate < 1.1*c.prev &&
@@ -710,11 +718,16 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			c.short = 0
 			if c.limit > 0 && k >= c.limitNext && c.sent >= 0.9*c.limit {
 				c.tryAt = k + 1
+				c.tryGain = max(c.tryGain, cpProbeGain)
 			}
 		}
 		c.rawBw = uint64(c.limit)
 	}
 
+	if raised > 0 && cp.phase != cpStartup {
+		cp.bw += raised
+		cp.pushLocked(cp.bw)
+	}
 	cp.congested = loaded > 0 && queued == loaded
 	if cp.congested && cp.phase == cpCruise {
 		cp.queued++
@@ -1094,6 +1107,14 @@ func (s *Session) cpShareLocked(limit uint64) {
 		total = max(total, floor)
 	}
 	total *= cp.gain
+	// A path that is tried for more gets it on top (and gives it back the
+	// round after): the session's rate is the sum of what the paths were
+	// held to, and has nothing to try with.
+	for _, p := range open {
+		if c := &p.cps; c.limit > 0 {
+			total += c.limitAt(cp.roundNo) - c.limit
+		}
+	}
 	if limit > 0 {
 		total = min(total, float64(limit))
 	}
