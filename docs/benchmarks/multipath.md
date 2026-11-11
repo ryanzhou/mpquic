@@ -147,51 +147,51 @@ their shares; see [congestion control](../design/congestion.md)). Single
 | scenario | | Mbit/s | relays carried | dropped | copies | rates p50 / p90 | echo p50 / p90 | p10 Mbit/s |
 |---|---|---|---|---|---|---|---|---|
 | 20 Mbit/s uplink, 300 ms buffer (upload) | per-path | 18.6 | +3.1% | 0.00% | 0.3% | 20 / 20 | 30 / 37 ms | 16 |
-| | **session** | 18.7 | +3.1% | 0.00% | 0.0% | 20 / 21 | 35 / 46 ms | 16 |
+| | **session** | 18.9 | +3.0% | 0.00% | 0.0% | 20 / 21 | 30 / 38 ms | 16 |
 | 20 Mbit/s uplink, 15 ms buffer (upload) | per-path | 18.5 | +6.4% | 2.52% | 2.9% | 20 / 20 | 30 / 38 ms | 6 |
-| | **session** | 18.9 | +5.5% | 1.70% | 1.8% | 20 / 21 | 28 / 35 ms | 15 |
+| | **session** | 18.9 | +5.9% | 1.86% | 1.8% | 19 / 20 | 28 / 37 ms | 12 |
 | 50 Mbit/s uplink, relays with 2–4 ms jitter (upload) | per-path | 46.1 | +4.6% | 0.00% | 1.4% | 50 / 50 | 30 / 40 ms | 33 |
-| | **session** | 45.3 | +6.5% | 0.00% | 3.0% | 49 / 52 | 31 / 38 ms | 36 |
+| | **session** | 45.5 | +5.7% | 0.00% | 2.5% | 49 / 52 | 32 / 39 ms | 36 |
 | 100 Mbit/s downlink, 50 ms buffer | per-path | 93.6 | +3.0% | 0.02% | 0.1% | 100 / 103 | 29 / 35 ms | 78 |
-| | **session** | 94.6 | +2.8% | 0.00% | 0.0% | 98 / 106 | 28 / 34 ms | 79 |
+| | **session** | 94.2 | +3.2% | 0.03% | 0.3% | 98 / 106 | 28 / 39 ms | 81 |
 | 100 Mbit/s downlink, 10 ms buffer | per-path | 92.1 | +9.6% | 2.76% | 3.4% | 102 / 105 | 30 / 37 ms | 29 |
-| | **session** | 92.7 | +7.3% | 0.98% | 1.9% | 97 / 97 | 26 / 32 ms | 45 |
+| | **session** | 93.0 | +7.0% | 1.02% | 1.9% | 98 / 104 | 28 / 34 ms | 32 |
 | 100 Mbit/s downlink, 300 ms buffer | per-path | 93.1 | +3.0% | 0.00% | 0.2% | 100 / 103 | 29 / 39 ms | 79 |
-| | **session** | 94.4 | +2.8% | 0.00% | 0.0% | 97 / 106 | 28 / 37 ms | 81 |
+| | **session** | 94.1 | +3.0% | 0.00% | 0.1% | 99 / 105 | 29 / 36 ms | 79 |
 | 50 Mbit/s **policer** on the downlink | per-path | 45.3 | +21.3% | 9.50% | 8.1% | 51 / 52 | 25 / 35 ms | 15 |
-| | **session** | 47.1 | +10.8% | 4.16% | 3.8% | 50 / 50 | 25 / 28 ms | 16 |
+| | **session** | 47.0 | +9.1% | 2.44% | 3.8% | 49 / 49 | 25 / 28 ms | 20 |
 | 100 Mbit/s downlink, relays with jitter | per-path | 90.1 | +6.5% | 0.03% | 3.4% | 102 / 103 | 32 / 39 ms | 64 |
-| | **session** | 90.8 | +6.9% | 0.00% | 3.8% | 98 / 104 | 32 / 41 ms | 66 |
+| | **session** | 89.6 | +8.2% | 0.16% | 4.7% | 98 / 108 | 33 / 47 ms | 58 |
 | 100 Mbit/s downlink, 4 relays of 300/200/200/100 Mbit/s | per-path | 93.5 | +3.4% | 0.11% | 0.4% | 102 / 104 | 26 / 36 ms | 78 |
-| | **session** | 95.1 | +3.2% | 0.09% | 0.2% | 98 / 103 | 23 / 29 ms | 88 |
+| | **session** | 96.7 | +3.7% | 0.30% | 0.4% | 97 / 103 | 23 / 44 ms | 83 |
 | 100 Mbit/s downlink, 4 parallel downloads | per-path | 95.2 | +3.4% | 0.14% | 0.1% | 101 / 102 | 35 / 58 ms | 42 |
-| | **session** | 100.1 | +4.3% | 0.23% | 0.0% | 98 / 104 | 38 / 54 ms | 47 |
+| | **session** | 98.3 | +3.7% | 0.18% | 0.0% | 100 / 108 | 42 / 60 ms | 51 |
 | downlink 100 ↔ 40 Mbit/s every 4 s | per-path | 62.6 | +4.7% | 0.85% | 0.2% | 69 / 103 | 29 / 45 ms | 13 |
-| | **session** | 58.7 | +6.8% | 2.10% | 0.8% | 45 / 100 | 32 / 91 ms | 6 |
+| | **session** | 60.9 | +10.5% | 2.39% | 0.9% | 49 / 108 | 30 / 97 ms | 7 |
 | **100/20 Mbit/s line: a download while an upload runs** | per-path | 92.2 | +3.4% | 0.06% | 0.5% | 101 / 108 | 36 / 47 ms | 77 |
-| | **session** | 93.6 | +3.0% | 0.12% | 0.1% | 100 / 107 | 40 / 55 ms | 75 |
+| | **session** | 86.5 | +4.6% | 0.70% | 0.7% | 91 / 102 | 35 / 50 ms | 36 |
 | … with `--up 19mbit --down 95mbit` | per-path | 90.8 | +3.3% | 0.00% | 0.4% | 95 / 95 | 33 / 36 ms | 79 |
-| | **session** | 92.1 | +3.1% | 0.00% | 0.1% | 95 / 95 | 32 / 35 ms | 84 |
+| | **session** | 92.6 | +3.0% | 0.00% | 0.0% | 95 / 95 | 32 / 35 ms | 82 |
 | 50 Mbit/s policer, with `--down 47mbit` | per-path | 44.7 | +2.9% | 0.00% | 0.1% | 47 / 47 | 25 / 29 ms | 42 |
-| | **session** | 45.9 | +3.0% | 0.00% | 0.1% | 47 / 47 | 25 / 28 ms | 40 |
+| | **session** | 45.8 | +2.9% | 0.00% | 0.1% | 47 / 47 | 25 / 27 ms | 40 |
 | remote's uplink 150 Mbit/s (20 ms), relays 3×100 Mbit/s | per-path | 138.0 | +3.7% | 0.50% | 1.0% | 148 / 159 | 26 / 37 ms | 109 |
-| | **session** | 139.4 | +3.5% | 0.47% | 0.7% | 148 / 156 | 26 / 31 ms | 119 |
+| | **session** | 142.2 | +3.7% | 0.67% | 0.9% | 148 / 157 | 27 / 30 ms | 109 |
 | remote's uplink 150 Mbit/s (50 ms), relays 3×100 Mbit/s | per-path | 138.9 | +2.8% | 0.03% | 0.2% | 148 / 150 | 26 / 36 ms | 119 |
-| | **session** | 141.6 | +2.7% | 0.00% | 0.1% | 148 / 156 | 28 / 32 ms | 120 |
+| | **session** | 141.1 | +2.7% | 0.00% | 0.0% | 148 / 157 | 28 / 32 ms | 120 |
 | remote's uplink 150 ↔ 60 Mbit/s every 4 s | per-path | 93.9 | +3.4% | 0.72% | 0.5% | 101 / 148 | 28 / 41 ms | 18 |
-| | **session** | 98.5 | +3.2% | 1.46% | 0.0% | 111 / 157 | 28 / 89 ms | 19 |
+| | **session** | 98.6 | +4.6% | 1.29% | 0.3% | 124 / 156 | 29 / 54 ms | 6 |
 | remote's uplink 100 Mbit/s, 2 relays, the fastest with 1% loss | per-path | 92.4 | +3.9% | 0.00% | 0.1% | 99 / 100 | 27 / 34 ms | 53 |
-| | **session** | 94.5 | +3.3% | 0.00% | 0.2% | 98 / 104 | 27 / 30 ms | 66 |
+| | **session** | 93.8 | +3.5% | 0.00% | 0.1% | 97 / 103 | 26 / 33 ms | 73 |
 | control: uplink 400 Mbit/s, not the limit (3×100 Mbit/s) | per-path | 275.9 | +2.7% | 0.00% | 0.0% | 296 / 301 | 25 / 32 ms | 226 |
-| | **session** | 283.1 | +2.7% | 0.00% | 0.0% | 290 / 307 | 25 / 28 ms | 252 |
+| | **session** | 285.6 | +2.8% | 0.00% | 0.0% | 294 / 312 | 26 / 31 ms | 242 |
 | control: independent paths 3×50 Mbit/s | per-path | 138.7 | +3.0% | 0.00% | 0.0% | 148 / 151 | 26 / 34 ms | 121 |
-| | **session** | 141.5 | +2.8% | 0.00% | 0.1% | 147 / 156 | 27 / 46 ms | 126 |
+| | **session** | 143.0 | +2.7% | 0.00% | 0.0% | 147 / 156 | 26 / 29 ms | 121 |
 | control: two identical paths, 50 Mbit/s each | per-path | 94.4 | +2.7% | 0.00% | 0.0% | 99 / 100 | 46 / 49 ms | 88 |
-| | **session** | 95.5 | +2.7% | 0.00% | 0.0% | 98 / 104 | 47 / 50 ms | 92 |
+| | **session** | 95.3 | +2.7% | 0.00% | 0.0% | 98 / 104 | 46 / 49 ms | 92 |
 | control: independent 50 / 30 (2% loss) / 20 Mbit/s | per-path | 92.5 | +4.7% | 0.00% | 0.8% | 98 / 101 | 26 / 33 ms | 74 |
-| | **session** | 91.3 | +4.2% | 0.00% | 0.5% | 96 / 103 | 25 / 33 ms | 75 |
+| | **session** | 92.4 | +4.5% | 0.00% | 0.5% | 97 / 104 | 39 / 49 ms | 78 |
 | 100 Mbit/s downlink, one relay limited to 20 Mbit/s | per-path | 93.3 | +3.2% | 0.17% | 0.1% | 101 / 102 | 36 / 48 ms | 73 |
-| | **session** | 93.9 | +2.8% | 0.00% | 0.0% | 99 / 104 | 32 / 40 ms | 74 |
+| | **session** | 95.0 | +3.1% | 0.08% | 0.2% | 98 / 104 | 30 / 36 ms | 76 |
 
 What the numbers say:
 
@@ -199,26 +199,29 @@ What the numbers say:
   design, which followed them as BBR does (by the highest rate they let
   through): 9.5% of the packets were dropped at the 50 Mbit/s policer and
   the relays carried a fifth more than was delivered. The session counts
-  loss that comes with the rate and backs off below it: 2–4% dropped in
-  12 s runs, 7–11% carried extra, and most of what is still dropped are
+  loss that comes with the rate and backs off below it: 2–3% dropped in
+  12 s runs, 9–10% carried extra, and most of what is still dropped are
   the start-up and the first probes (probes become rare once the ceiling
-  is confirmed; see the 30 s run below). A 10–15 ms buffer: 1.0–1.7%
+  is confirmed; see the 30 s run below). A 10–15 ms buffer: 1.0–1.9%
   dropped instead of 2.5–2.8%.
 * **Throughput** is the same or a little higher where the bottleneck is
   steady, and so is the latency under load, with a shorter tail in most
   rows (echo p90).
 * **A relay slower than its share** (last row) is held to what it carries
   by its own window from the first round trip, and gets its own limit
-  within a second: echo 32 / 40 ms instead of 36 / 48.
-* **A flapping bottleneck** is where the session is not better. On the
-  flapping downlink it delivers the same or a little less (57 Mbit/s both
-  in repeated 16 s runs; 59 against 63 here) with more queueing around
-  each change (echo p50 32–39 ms against 29–30, 2% dropped against 0.8%).
-* **Both directions loaded** (the 100/20 Mbit/s line): the download is the
-  same (87–94 against 88–92 Mbit/s in repeated runs); the upload gets
-  somewhat less of the uplink next to the download's acknowledgements
-  (12–16 against 17–18 Mbit/s for both together). With `--up` / `--down`
-  set there is no difference.
+  within a second: echo 30 / 36 ms instead of 36 / 48.
+* **A flapping bottleneck** is where the session is worse. On the
+  flapping downlink it delivers about the same on average but less evenly
+  (52–65 Mbit/s in six runs against 61–63 in three), and each change costs
+  more: 1.3–3.2% dropped against 0.9–1.0%, the longest pause in delivery
+  240–530 ms against 160–220 ms, echo p90 52–120 ms against 45–57. One
+  rate follows a drop at the next loss or queue that every path shows,
+  about a round trip later than the fastest path's own controller did.
+* **Both directions loaded** (the 100/20 Mbit/s line): the download is a
+  little slower (86–94 against 92–93 Mbit/s in five and four runs) and the
+  echo's tail longer (p90 49–68 ms against 44–48); the upload gets the same
+  share of the uplink (16 against 15–17 Mbit/s). With `--up` / `--down` set
+  there is no difference.
 * **Known rates.** With `--up` / `--down` a little below the line's rates
   there is nothing to probe: nothing dropped at the policer, echo p90
   35 ms with both directions loaded.
@@ -236,7 +239,7 @@ delay=125ms,rate=200mbit --shared-rx 'none|police=500mbit'`, 30 s).
 | | goodput | dropped at the policer | relays carried | sender's peak over 100 ms / 1 s | sender after 2 s, p50 / p90 |
 |---|---|---|---|---|---|
 | per-path (two runs) | 299–374 Mbit/s | 5.4–12.8% | +20–36% | 0.9–2.1 Gbit/s / 580–990 Mbit/s | 340–500 / 590–760 Mbit/s |
-| **session** (two runs) | 448–450 Mbit/s | 1.2–1.4% | +5% | 1.0 Gbit/s / 570–600 Mbit/s | 480 / 487 Mbit/s |
+| **session** (four runs) | 432–442 Mbit/s | 1.2–1.5% | +6–7% | 0.9–1.1 Gbit/s / 560–610 Mbit/s | 474–488 / 499–532 Mbit/s |
 
 Per-path controllers each find "200" and start up on their own: together
 they send up to three times what the policer passes, and in the steady
@@ -255,21 +258,26 @@ download / upload in Mbit/s):
 
 | scenario | per-path | session |
 |---|---|---|
-| four lossy paths (20/10/5/1% loss, 50 Mbit/s each) | 146 / 153 | **172 / 180** |
-| two equal paths (40 Mbit/s) | 74 / 75 | 74 / 75 |
-| 10 + 100 Mbit/s | 97 / 111 | 100 / 105 |
-| 5 ms and 150 ms round trips, 100 Mbit/s each | 165 / 181 | 168 / 174 |
-| one path with 2% loss, one with jitter | 92 / 94 | 95 / 93 |
-| two paths flapping on their own (50↔10, 20↔60 Mbit/s) | 51–59 / 54–61 | 45 / 50–53 |
-| three paths: 1% loss and outages, jitter, 2% reordering | 97–111 / 101 | 76–92 / 83–87 |
+| four lossy paths (20/10/5/1% loss, 50 Mbit/s each) | 146 / 153 | **169–171 / 172–173** |
+| two equal paths (40 Mbit/s) | 74 / 75 | 76 / 76 |
+| 10 + 100 Mbit/s | 97 / 111 | 95–96 / 100–103 |
+| 5 ms and 150 ms round trips, 100 Mbit/s each | 165 / 181 | 159–166 / 166–176 |
+| one path with 2% loss, one with jitter | 92 / 94 | 92–94 / 91–94 |
+| two paths flapping on their own (50↔10, 20↔60 Mbit/s) | 51–59 / 54–61 | 48–53 / 54–56 |
+| three paths: 1% loss and outages, jitter, 2% reordering | 97–111 / 101 | 75–98 / 86–96 |
+| two good paths and one that collapses (40↔2 Mbit/s, 3% loss) | 89 | 78–79 |
+| two good paths and one with outages (1 s of every 2) | 74 | 65–66 |
 
-Steady paths, lossy or not, are the same or better (the four lossy paths
-by a fifth: the baselines keep random loss out of the rate). Paths whose own
-capacity flaps, or that drop out and come back, are 10–20% behind: a path's
-limit follows its relay down at once, but up again only by tries every few
-rounds. Small transfers are unchanged except on very lossy paths, where a
-256 KB transfer took 0.3–0.6 s against 0.25–0.3 s (16 MB: 1.2–1.4 s against
-1.6–1.8 s).
+Steady paths, lossy or not, are about the same or better (the four lossy
+paths by a sixth: the baselines keep random loss out of the rate). Paths
+whose own capacity flaps, or that drop out and come back, are 10–15%
+behind: a path's limit follows its relay down at once, but up again only by
+tries every few rounds. With round trips as different as 5 and 150 ms the
+upload is a few percent behind, and cutting the fast path stalled a
+transfer for 0.5–0.75 s in three runs against 0.15 s (one round of the
+session is the long path's round trip). Small transfers are unchanged
+except on very lossy paths, where a 256 KB transfer took 0.3–0.6 s against
+0.25–0.3 s (16 MB: 1.4–1.6 s against 1.6–1.8 s).
 
 ## Reading the results
 
