@@ -52,6 +52,13 @@ in the start-up, where the session doubles the rate every round, a path can
 only send twice what it delivers per round trip, so the window does for one
 path what the session does for all.
 
+That window is for a path that delivers *less* than it is given. A path
+that delivers its rate (at least 0.9 of it) may have its rate times its
+smoothed round trip in flight on top: round trips also grow with queues
+that are not the path's or not this direction's (a download's
+acknowledgements behind an upload's queue on the same line), and a window
+of two base round trips would then hold a healthy path below its rate.
+
 Hysteria's Brutal paces at a configured rate in the same way. The path also
 counts, for the session: every packet is booked on the session round it was
 sent in, and its acknowledgement or loss is counted for that round however
@@ -130,15 +137,22 @@ business (below); random loss, however heavy, is in the baseline.
   one at 0.75·*B* while the acknowledgements come in, so what the probe
   queued is gone again by the time its result is known.
   * If at least half of what the probe added was delivered, *B* is what
-    the probe round delivered, and the next probe follows at once, at
-    1.5·*B* and from the second success in a row at 2·*B*.
+    the probe round delivered, and the next probe follows at once. If the
+    probe did not queue either (no path saw a queue during it or after),
+    there is clearly room: the next probe is at 1.5·*B*, and from the
+    second such success in a row at 2·*B*. If it queued, the pipe is
+    nearly full, and the next probe stays at 1.25: a larger one would
+    mostly add to the queue.
   * Otherwise *B* stays. A probe's delivery cannot be measured exactly
     (the paths' parts of the pulse reach a common queue at different
     times, which makes it look a few percent better than it was), so less
     than half is not evidence. The next probe asks for half as much more
     (1.125, down to 1.06), where a little spare capacity does show as half
     of the probe, and it comes sooner, because a small probe queues
-    little: every 8 rounds at 1.25, every 2 at 1.06.
+    little: every 8 rounds at 1.25, every 2 at 1.06. Every third probe at
+    1.06 that finds nothing is followed by a full one: where delivery is
+    uneven (other traffic in the same queue), a small probe proves nothing
+    either way.
 * **Loss: a ceiling.** Two lossy rounds in a row at *B* mean that *B* is
   more than the pipe takes: a policer, or a buffer that is full. *B* becomes
   98% of what the pipe puts out by then. The first lossy round is not used
@@ -170,8 +184,15 @@ business (below); random loss, however heavy, is in the baseline.
     be ours.
   * Over three queued rounds, *B* is what was put out on average if that
     is less than 0.98·*B*.
-  * A queue that stays for two rounds is drained by a round at 0.75·*B*, at
-    most every 8 rounds. If that does not shrink it, the queue is not the
+  * A queue that stays for two rounds is drained: rounds at 0.75·*B* until
+    some path sees no queue any more (at most 8 rounds, and at most every
+    8 rounds). After *B* came down for a capacity drop the drain starts at
+    once: what queued while the session was still sending at the old rate
+    can be a whole buffer's worth, and it is latency for every stream and
+    for the other direction's acknowledgements until it is gone. A full
+    probe follows soon after, in case the capacity is back.
+  * If the first drain round does not shrink the queue although it sent
+    clearly less than the pipe was putting out, the queue is not the
     session's (the other direction's, or other people's traffic), and it
     becomes part of the paths' base RTT.
 * **Known rates** (`up` / `down`). If an endpoint's uplink or downlink rate
