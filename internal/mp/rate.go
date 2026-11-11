@@ -67,7 +67,8 @@ const (
 
 	cpLossExcess  = 0.02 // loss beyond the baseline that counts
 	cpBurst       = 4    // random loss comes in bursts of about this many packets
-	cpStartLoss   = 0.05 // loss beyond the baselines that ends a start-up
+	cpStartLoss   = 0.05 // loss beyond the baselines that ends a start-up ...
+	cpStartPkts   = 40   // ... if it is this many packets (one burst of random loss is not)
 	cpMargin      = 0.98 // B after such loss: this much of what was delivered
 	cpProbeMargin = 0.96 // ... or of what a start-up's lossy last round delivered
 	cpLossRounds  = 2    // rounds in a row with it at B before B comes down ...
@@ -473,7 +474,7 @@ func (s *Session) cpTickLocked(now time.Time, w time.Duration) {
 			break
 		}
 		if !r1.thin && known > 0 && float64(lossy) >= cpCommon*float64(known) &&
-			float64(lost)-expected >= cpStartLoss*float64(known) && cpExcess(known, lost, expected/float64(known), 1) {
+			float64(lost)-expected >= max(cpStartLoss*float64(known), cpStartPkts*cpPkt) && cpExcess(known, lost, expected/float64(known), 1) {
 			cp.gain, cp.startOver, cp.startLoss = 1, true, true
 		} else if busy && cp.qTicks >= cpQueueTicks {
 			cp.gain, cp.startOver = 1, true
@@ -775,7 +776,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		case r1.thin || !ok1:
 			// A session with little to send (the acknowledgements of a
 			// download) learns nothing about the pipe, whatever it loses.
-		case common1 && known1 && float64(l1)-e1 >= cpStartLoss*float64(s1):
+		case common1 && known1 && float64(l1)-e1 >= max(cpStartLoss*float64(s1), cpStartPkts*cpPkt):
 			// Loss on every path, clearly beyond what the paths lose anyway
 			// (which the first rounds have shown): more than the pipe
 			// takes.
@@ -906,9 +907,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		// row: B is too high (a policer, a buffer that is full), and what
 		// the second round delivered is what the pipe takes. A round
 		// below B follows, to see what loss is there anyway. (A round
-		// below B that loses says the same, unless it followed a probe:
-		// then its packets met the probe's on the way.)
-		atB := r2.phase == cpCruise || r2.phase == cpDrain && h(k-3).gain <= 1
+		// below B that loses behind a queue on every path says the same:
+		// the drain is not draining. Not right after a probe, whose
+		// packets it met on the way, and not without the queue: a burst
+		// of random loss in a drain's round would bring B down to what
+		// the drain sent.)
+		atB := r2.phase == cpCruise || r2.phase == cpDrain && r2.allq && h(k-3).gain <= 1
 		switch {
 		case !ok2 || !r2.busy || !atB || k-2 <= cp.cutRound:
 		case common2:
@@ -1104,9 +1108,15 @@ func (s *Session) cpShareLocked(limit uint64) {
 			continue
 		}
 		open = append(open, p)
-		rtt := p.srtt
+		// The path's shortest round trip: the smoothed one begins with
+		// the handshake's, which may be many times the path's. (The
+		// window bounds what is in flight either way.)
+		rtt := p.minRTT
 		if rtt <= 0 {
-			rtt = cpStartRTT // not measured yet (the window bounds what is in flight)
+			rtt = p.srtt
+		}
+		if rtt <= 0 {
+			rtt = cpStartRTT // not measured yet
 		}
 		floor += cpStartWindow / max(rtt, 10*time.Millisecond).Seconds()
 	}

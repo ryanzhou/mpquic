@@ -172,9 +172,10 @@ quarters of the round. Loss on one path only is that path's own business
   more than the pipe takes: a policer, or a buffer that is full. *B* becomes
   98% of what the pipe puts out by then. The first lossy round is not used
   for that: a policer lets a burst pass before it drops, so only the second
-  shows its rate. (A lossy round *below* *B*, while a queue is being
-  drained, counts the same, unless it followed a probe: its packets met the
-  probe's on the way.) After that:
+  shows its rate. (A lossy round *below* *B*, while a queue that every
+  path sees is being drained, counts the same: the drain is not draining.
+  Not the round after a probe, whose packets it met on the way.) After
+  that:
   * a round below *B* follows, so the baselines are current (if the loss
     was random after all, it is in the baselines from then on and does not
     count again);

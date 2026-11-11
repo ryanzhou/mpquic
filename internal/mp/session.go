@@ -177,6 +177,12 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	p.id = s.nextPID
 	p.state = stateActive
 	s.paths = append(s.paths, p)
+	if s.coupled() {
+		// Its share of the session rate now, not at the next tick (which
+		// is up to 100 ms away in an idle session: a new session's first
+		// data would crawl until then).
+		s.cpShareLocked(s.rateLimitLocked())
+	}
 	// On every path's control stream (reliable); older peers ignore it.
 	// Also without a limit: the peer may remember one from before this end
 	// was restarted without it.
