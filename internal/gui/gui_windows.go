@@ -40,8 +40,8 @@ var roleLabels = []string{
 }
 
 var (
-	congestionValues = []string{"", "bbr-aggressive", "bbr-conservative", "cubic"}
-	congestionLabels = []string{"bbr (default)", "bbr-aggressive", "bbr-conservative", "cubic (quic-go built-in)"}
+	congestionValues = []string{"", "cubic"}
+	congestionLabels = []string{"bbr (default)", "cubic (quic-go built-in)"}
 	logLevels        = []string{"info", "debug", "warn", "error"}
 )
 
@@ -308,12 +308,8 @@ func indexOf(list []string, v string) int {
 
 func congestionIndex(s string) int {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "bbr-aggressive", "aggressive":
+	case "cubic":
 		return 1
-	case "bbr-conservative", "conservative":
-		return 2
-	case "cubic", "reno", "newreno":
-		return 3
 	}
 	return 0
 }
@@ -730,7 +726,7 @@ func (u *ui) refreshLog() {
 func (u *ui) smokeTest() error {
 	for _, js := range []*config.Config{
 		{Role: "local", Server: config.StringList{"203.0.113.10", "relay:9000"}, ServerPort: 8443, Password: "pw", Mode: "tcp_and_udp",
-			LocalAddress: "0.0.0.0", LocalPort: 1081, Congestion: "bbr-aggressive", Window: 32 << 20, Timeout: 60, LogLevel: "debug", StatsInterval: 30},
+			LocalAddress: "0.0.0.0", LocalPort: 1081, Window: 32 << 20, Timeout: 60, LogLevel: "debug", StatsInterval: 30},
 		{Role: "tunnel", Server: config.StringList{"a:1"}, Password: "pw", TunnelAddress: "10.0.0.1:22", ChunkSize: 8 << 10, NoDup: true},
 		{Role: "remote", Reverse: true, Server: config.StringList{"198.51.100.7:8388"}, Password: "pw", Cert: `C:\c.pem`, Key: `C:\k.pem`, SNI: "x", RaceConnect: true},
 		{Role: "relay", Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:8388", Link: "delay=40ms", Rev: "loss=1%"}}, LogLevel: "warn"},

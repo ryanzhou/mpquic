@@ -76,7 +76,6 @@ type Path struct {
 	bw, cwnd     uint64
 	pacing       uint64
 	ccMode       string
-	staleResets  uint64 // BBR stale-estimate resets (rate drops)
 	// measured send rate (fallback when the controller exposes no estimate)
 	measRate  float64
 	measAt    time.Time
@@ -128,8 +127,10 @@ type Path struct {
 	// chunk bytes scheduled as copies of data already sent (sess.mu held):
 	// reinjections/rescues and opportunistic duplicates
 	reinjBytes, dupBytes uint64
-	// session rate (see coupling.go)
-	cps cpPath
+	rateCap              uint64 // share of a configured rate limit (bytes/s, 0 = none; ratelimit.go)
+	// loss tolerance: what this end and the peer have configured for the
+	// path; the larger one applies
+	ownTol, peerTol float64
 
 	// owned by the send loop
 	sendStreams map[uint64]*quic.SendStream
@@ -580,7 +581,6 @@ func (p *Path) refreshStatsLocked() {
 		p.cwnd = m.Cwnd
 		p.pacing = m.Pacing
 		p.ccMode = m.Mode
-		p.staleResets = m.StaleResets
 	}
 }
 
@@ -1003,7 +1003,15 @@ func (p *Path) statLocked() PathStat {
 		Name: p.name, Index: int(p.index), State: state, SRTT: p.srtt, MinRTT: p.minRTT,
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
-		StaleResets: p.staleResets, ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
-		SharedCap: p.cps.cap,
+		ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
+		RateCap: p.rateCap, LossTolerance: max(p.ownTol, p.peerTol),
+	}
+}
+
+// applyToleranceLocked hands the path's loss tolerance to its congestion
+// controller.
+func (p *Path) applyToleranceLocked() {
+	if p.meter != nil {
+		p.meter.SetLossTolerance(max(p.ownTol, p.peerTol))
 	}
 }

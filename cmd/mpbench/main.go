@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mpquic/internal/config"
 	"mpquic/internal/linkem"
 	"mpquic/internal/mp"
 	"mpquic/internal/proxy"
@@ -39,13 +40,13 @@ var (
 	single    = flag.Bool("single", true, "also run each path alone as baseline")
 	verbose   = flag.Bool("v", false, "verbose mpquic logs")
 	noDup     = flag.Bool("no-dup", false, "disable opportunistic duplication")
-	noCouple  = flag.Bool("no-coupling", false, "disable shared-bottleneck coupling")
+	lossTol   = flag.String("loss-tolerance", "", "loss tolerance (e.g. 10%): one value for all paths (both ends), or one per path separated by commas (the dialer's; 0: default)")
 	window    = flag.Int64("window", 0, "stream window bytes")
 	chunk     = flag.Int("chunk", 0, "chunk size")
 	failAfter = flag.Duration("fail-after", 3*time.Second, "failover: take best path down after")
 	failFor   = flag.Duration("fail-for", 4*time.Second, "failover: outage duration")
 	streams   = flag.Int("streams", 1, "parallel streams in bulk tests")
-	ccName    = flag.String("cc", "", "congestion control (bbr, bbr-aggressive, bbr-conservative)")
+	ccName    = flag.String("cc", "", "congestion control (bbr, cubic)")
 	cpuprof   = flag.String("cpuprofile", "", "write a CPU profile")
 	subset    = flag.String("subset", "", "also run with only these path indexes (e.g. 0,1) as a baseline")
 	reverse   = flag.Bool("reverse", false, "reverse mode: the local listens, the remote dials back through the relays")
@@ -76,10 +77,22 @@ func main() {
 	slog.SetDefault(log)
 
 	target := startTarget()
-	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, NoCoupling: *noCouple, Window: *window, ChunkSize: *chunk, Congestion: *ccName, MTU: *mtu}
+	opt := &mp.Options{Password: "bench", Logger: log, NoDup: *noDup, Window: *window, ChunkSize: *chunk, Congestion: *ccName, MTU: *mtu}
+	var pathTol []float64
+	if tols := strings.Split(*lossTol, ","); *lossTol != "" {
+		for _, t := range tols {
+			v, err := config.ParseFraction(t)
+			check(err)
+			pathTol = append(pathTol, float64(v))
+		}
+		if len(pathTol) == 1 {
+			opt.LossTolerance, pathTol = pathTol[0], nil
+		}
+	}
 	// The QUIC listener is the remote normally and the local in reverse mode;
 	// the relays always forward to the listener.
 	lopt, dopt := *opt, *opt
+	dopt.PathLossTolerance = pathTol
 	// The local's known uplink / downlink rates (it is the dialer normally
 	// and the listener in reverse mode).
 	localOpt := &dopt
@@ -421,7 +434,7 @@ func (b *bench) localStats() []mp.PathStat {
 func (b *bench) remoteStats() string {
 	var p []string
 	for _, s := range b.remote() {
-		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s sent=%dMB lost=%dMB resets=%d", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode, s.SentBytes>>20, s.LostBytes>>20, s.StaleResets))
+		p = append(p, fmt.Sprintf("%s rtt=%v min=%v bw=%.1fM pace=%.1fM cwnd=%dK %s sent=%dMB lost=%dMB", s.Name, s.SRTT.Round(time.Millisecond), s.MinRTT.Round(time.Millisecond), float64(s.Bandwidth)*8/1e6, float64(s.Pacing)*8/1e6, s.Cwnd>>10, s.CCMode, s.SentBytes>>20, s.LostBytes>>20))
 	}
 	return strings.Join(p, "; ")
 }
@@ -710,12 +723,12 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		var per []string
 		for _, st := range senderEnd {
 			x := fmt.Sprintf("%.1f", float64(st.Bandwidth)*8/1e6)
-			if st.SharedCap > 0 {
+			if st.RateCap > 0 {
 				x += "*"
 			}
 			per = append(per, x)
 		}
-		fmt.Printf("estimate sender's sum of path estimates: p10=%.1f p50=%.1f p90=%.1f max=%.1f Mbit/s (at the end: %s; *: capped) goodput %.1f\n",
+		fmt.Printf("estimate sender's sum of path estimates: p10=%.1f p50=%.1f p90=%.1f max=%.1f Mbit/s (at the end: %s; *: bound by a configured rate) goodput %.1f\n",
 			est[len(est)/10], est[len(est)/2], est[len(est)*9/10], est[len(est)-1], strings.Join(per, " + "), ss)
 	}
 	if len(loaded) > 0 && len(idle) > 0 {

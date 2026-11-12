@@ -48,14 +48,18 @@ type Config struct {
 	Key           string `json:"key,omitempty"`
 	SNI           string `json:"sni,omitempty"`
 	NoDup         bool   `json:"no_dup,omitempty"`
-	NoCoupling    bool   `json:"no_coupling,omitempty"` // paths are not rate-controlled together
 	// Up / Down: the rate of this endpoint's uplink / downlink ("20mbit";
 	// a number is bit/s), if known. The session then sends no more than Up
 	// over all paths together, and tells the peer to send no more than
 	// Down. Without them the rates are measured.
 	Up   Rate `json:"up,omitempty"`
 	Down Rate `json:"down,omitempty"`
-	MTU  int  `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
+	// LossTolerance ("10%" or 0.1): the share of packet loss that is not
+	// taken for congestion, for paths that are known to lose packets at
+	// random; "100%" ignores loss. A "servers" entry can set its own.
+	// Default: BBR's 2 %.
+	LossTolerance Fraction `json:"loss_tolerance,omitempty"`
+	MTU           int      `json:"mtu,omitempty"` // path MTU (IP packet size) of every path; 0 discovers it
 	// RaceConnect (remote role): race staggered TCP connection attempts to
 	// each target and keep the first that connects.
 	RaceConnect bool `json:"race_connect,omitempty"`
@@ -141,6 +145,9 @@ type ServerEntry struct {
 	ServerPort int    `json:"server_port,omitempty"`
 	Password   string `json:"password,omitempty"`
 	Method     string `json:"method,omitempty"`
+	// LossTolerance of the path through this server (see
+	// Config.LossTolerance, which it replaces for the path).
+	LossTolerance Fraction `json:"loss_tolerance,omitempty"`
 }
 
 func (e *ServerEntry) UnmarshalJSON(b []byte) error {
@@ -207,6 +214,39 @@ func FormatSize(n int64) string {
 		}
 	}
 	return strconv.FormatInt(n, 10)
+}
+
+// Fraction is a share between 0 and 1. It accepts a number (0.1) or a
+// percentage ("10%").
+type Fraction float64
+
+func (f *Fraction) UnmarshalJSON(b []byte) error {
+	var str string
+	if err := json.Unmarshal(b, &str); err != nil {
+		str = string(b)
+	}
+	v, err := ParseFraction(str)
+	*f = v
+	return err
+}
+
+// MarshalJSON writes the fraction as a percentage.
+func (f Fraction) MarshalJSON() ([]byte, error) {
+	return json.Marshal(strconv.FormatFloat(float64(f)*100, 'f', -1, 64) + "%")
+}
+
+// ParseFraction parses "10%" or "0.1".
+func ParseFraction(str string) (Fraction, error) {
+	s := strings.TrimSpace(str)
+	div := 1.0
+	if t := strings.TrimSuffix(s, "%"); t != s {
+		s, div = strings.TrimSpace(t), 100
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v < 0 || v/div > 1 || v != v {
+		return 0, fmt.Errorf("bad fraction %q (e.g. \"10%%\" or 0.1)", str)
+	}
+	return Fraction(v / div), nil
 }
 
 // Rate is a bit rate in bit/s. It accepts a number or a string like
@@ -380,6 +420,16 @@ func (c *Config) ServerAddrs() []string {
 			p = port
 		}
 		out = append(out, JoinHostPort(e.Server, p))
+	}
+	return out
+}
+
+// PathLossTolerances returns the loss tolerance of each server's path, in
+// the order of ServerAddrs (0: the default, LossTolerance).
+func (c *Config) PathLossTolerances() []float64 {
+	out := make([]float64, len(c.Server), len(c.Server)+len(c.Servers))
+	for _, e := range c.Servers {
+		out = append(out, float64(e.LossTolerance))
 	}
 	return out
 }

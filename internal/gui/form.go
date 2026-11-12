@@ -55,6 +55,14 @@ func GeneratePassword() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// entryPath is how a "servers" entry shows in the form's list of paths.
+func entryPath(e config.ServerEntry) string {
+	if e.ServerPort != 0 {
+		return config.JoinHostPort(e.Server, e.ServerPort)
+	}
+	return e.Server
+}
+
 // FormFromConfig fills a form from a config.
 func FormFromConfig(c *config.Config) Form {
 	role, ok := app.NormalizeRole(c.Role)
@@ -67,11 +75,7 @@ func FormFromConfig(c *config.Config) Form {
 	var paths []string
 	paths = append(paths, c.Server...)
 	for _, e := range c.Servers {
-		if e.ServerPort != 0 {
-			paths = append(paths, config.JoinHostPort(e.Server, e.ServerPort))
-		} else {
-			paths = append(paths, e.Server)
-		}
+		paths = append(paths, entryPath(e))
 	}
 	logLevel := strings.ToLower(c.LogLevel)
 	if logLevel == "" && c.Verbose {
@@ -179,8 +183,20 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		}
 	} else {
 		c.Reverse = f.Reverse
-		c.Server = config.StringList(lines(f.Paths))
-		c.Servers = nil
+		// A path keeps the loss tolerance that the configuration file
+		// gives it (the form has no field for it).
+		tol := map[string]config.Fraction{}
+		for _, e := range c.Servers {
+			tol[entryPath(e)] = e.LossTolerance
+		}
+		c.Server, c.Servers = nil, nil
+		for _, l := range lines(f.Paths) {
+			if t := tol[l]; t > 0 {
+				c.Servers = append(c.Servers, config.ServerEntry{Server: l, LossTolerance: t})
+			} else {
+				c.Server = append(c.Server, l)
+			}
+		}
 		num("Port", f.Port, &c.ServerPort)
 		c.Password = f.Password
 		switch {

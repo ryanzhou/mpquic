@@ -60,6 +60,9 @@ const (
 	frPathAck = 6 // pathIndex, largest dseq, 32-byte bitmap of the 256 dseqs below
 	frLimit   = 7 // rate: the most the sender of the frame wants to receive over all paths (bytes/s, 0 = no limit)
 	frWindow  = 8 // id: the sender is blocked by the stream's window and asks for it again (older peers ignore it)
+	// loss tolerance that the sender of the frame has configured for the
+	// path the frame arrives on, in parts per million (older peers ignore it)
+	frTolerance = 9
 )
 
 // pathAckBits is how many datagram sequence numbers below the largest one a

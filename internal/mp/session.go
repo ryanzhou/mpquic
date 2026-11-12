@@ -64,7 +64,7 @@ type Session struct {
 	eagerTokens float64
 	eagerLast   time.Time
 
-	cp coupling // session rate (coupling.go)
+	peerLimit uint64 // the peer's maximum receive rate (bytes/s, 0 = none; ratelimit.go)
 	// ackWait: how long the peer may hold an acknowledgement back (its ACK
 	// interval, as we compute our own: see ackEveryLocked)
 	ackWait time.Duration
@@ -181,6 +181,15 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	// Also without a limit: the peer may remember one from before this end
 	// was restarted without it.
 	p.sendCtrl(encodeU64s(frLimit, s.opt.MaxRecvRate))
+	p.ownTol = s.opt.LossTolerance
+	if i := int(p.index); s.dialer && i < len(s.opt.PathLossTolerance) && s.opt.PathLossTolerance[i] > 0 {
+		p.ownTol = s.opt.PathLossTolerance[i]
+	}
+	p.ownTol = min(max(p.ownTol, 0), 1)
+	if p.ownTol > 0 {
+		p.applyToleranceLocked()
+		p.sendCtrl(encodeU64s(frTolerance, uint64(p.ownTol*1e6)))
+	}
 	if b := s.recentResetsLocked(time.Now()); len(b) > 0 {
 		p.sendCtrl(b)
 	}
@@ -458,7 +467,16 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 			return err
 		}
 		s.mu.Lock()
-		s.cp.peerLimit = v[0]
+		s.peerLimit = v[0]
+		s.mu.Unlock()
+	case frTolerance:
+		v, err := decodeU64s(body, 1)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		p.peerTol = float64(min(v[0], 1e6)) / 1e6
+		p.applyToleranceLocked()
 		s.mu.Unlock()
 	case frPathAck:
 		r := &byteReader{b: body}
@@ -625,7 +643,7 @@ func (s *Session) tick(now time.Time) bool {
 	}
 	s.updateBenchedLocked()
 	s.ackWait = s.ackEveryLocked()
-	s.couplingTickLocked(now)
+	s.shareLimitLocked()
 	if debugWindows {
 		for _, st := range s.streams {
 			if len(st.oooRanges) > 0 && now.Sub(st.lastDeliverAt) > holDebugThreshold && now.Sub(st.lastHOLLog) > 100*time.Millisecond {
@@ -693,9 +711,6 @@ func (s *Session) tick(now time.Time) bool {
 	if s.opt.StatsInterval > 0 && now.Sub(s.lastStatsTick) >= s.opt.StatsInterval {
 		s.lastStatsTick = now
 		args := []any{"streams", len(s.streams), "backlog", s.backlog}
-		if s.cp.bw > 0 {
-			args = append(args, "rate", fmt.Sprintf("%.1fMbit/s", s.cp.bw*8/1e6))
-		}
 		if l := s.rateLimitLocked(); l > 0 {
 			args = append(args, "limit", fmt.Sprintf("%.1fMbit/s", float64(l)*8/1e6))
 		}
@@ -809,15 +824,16 @@ type PathStat struct {
 	RecvBytes uint64
 	LostBytes uint64
 	Loss      float64 // estimated packet loss rate
-	// StaleResets: BBR bandwidth estimates reset after a rate drop
-	StaleResets uint64
 	// ReinjectBytes / DupBytes: chunk bytes sent again on this path, as
 	// reinjections (rescues of late or lost data, insurance copies) and
 	// opportunistic or eager duplicates. Included in SentBytes.
 	ReinjectBytes, DupBytes uint64
-	// SharedCap: the path's share of the session rate (bytes/s), which caps
-	// its estimate; 0: not capped (its own estimate is below its share).
-	SharedCap uint64
+	// RateCap: the path's share of a configured rate limit (bytes/s), which
+	// bounds its sending rate; 0: none.
+	RateCap uint64
+	// LossTolerance: the share of loss that the path's congestion
+	// controller does not take for congestion (0: BBR's own 2 %).
+	LossTolerance float64
 }
 
 // Stats returns per-path statistics.
@@ -840,12 +856,8 @@ func (s *Session) statsStringLocked() string {
 		st := p.statLocked()
 		fmt.Fprintf(&b, "%s[%s rtt=%v bw=%.1fMbit/s tx=%dMB rx=%dMB lost=%dKB", st.Name, st.State,
 			st.SRTT.Round(time.Millisecond), float64(st.Bandwidth)*8/1e6, st.SentBytes>>20, st.RecvBytes>>20, st.LostBytes>>10)
-		if st.StaleResets > 0 {
-			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
-		}
-		if st.SharedCap > 0 && st.SharedCap < p.cps.rawBw {
-			// capped at its share of the session rate; its own estimate
-			fmt.Fprintf(&b, " own=%.1fMbit/s", float64(p.cps.rawBw)*8/1e6)
+		if st.RateCap > 0 {
+			fmt.Fprintf(&b, " limit=%.1fMbit/s", float64(st.RateCap)*8/1e6)
 		}
 		b.WriteString("]")
 	}
