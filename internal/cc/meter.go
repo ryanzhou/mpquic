@@ -55,6 +55,7 @@ type Meter struct {
 	lastMode string // of publish (the connection's goroutine)
 
 	appLimited atomic.Bool
+	hadNoData  atomic.Bool // ... at some moment since the controller last asked
 	probeGate  atomic.Pointer[ProbeGate]
 	sentPkts   atomic.Uint64
 	lostPkts   atomic.Uint64
@@ -149,11 +150,24 @@ func (m *Meter) Restart() { m.restart.Store(true) }
 func (m *Meter) SetLossTolerance(t float64) { m.lossTol.Store(math.Float64bits(t)) }
 
 // SetAppLimited tells the controller whether the application currently has
-// nothing to send on this connection.
+// nothing to send on this connection. Every moment without data counts,
+// however short: the controller is told at its next packet or
+// acknowledgement that there was one (appLimitedHint), as a TCP sender
+// notes the moment its send buffer runs empty. A path that the scheduler
+// feeds with gaps would otherwise have its lower delivery rate taken for
+// what it carries.
 func (m *Meter) SetAppLimited(v bool) {
+	if v {
+		m.hadNoData.Store(true)
+	}
 	if m.appLimited.Load() != v {
 		m.appLimited.Store(v)
 	}
+}
+
+func (m *Meter) appLimitedHint() bool {
+	had := m.hadNoData.Load() && m.hadNoData.Swap(false)
+	return m.appLimited.Load() || had
 }
 
 var _ congestion.CongestionControlEx = (*Meter)(nil)
@@ -187,7 +201,7 @@ func Install(conn *quic.Conn, profile string) *Meter {
 	// Conn.InitialPacketSize): it is what quic-go sends until path MTU
 	// discovery reports more, and all it sends with a fixed MTU.
 	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize())}
-	m.s.AppLimitedHint = m.appLimited.Load
+	m.s.AppLimitedHint = m.appLimitedHint
 	m.s.ProbeRTTGate = m.gate
 	m.s.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
 	m.s.RateGain = func() float64 { return math.Float64frombits(m.rateGain.Load()) }

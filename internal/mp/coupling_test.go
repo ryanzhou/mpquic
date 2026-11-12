@@ -268,6 +268,32 @@ func TestSessionRateRandomLoss(t *testing.T) {
 	}
 }
 
+// Loss within a path's configured tolerance is that path's own, known loss:
+// it does not make the paths look as if they were behind one bottleneck.
+func TestSessionRateLossWithinTolerance(t *testing.T) {
+	c := mbit(20)
+	run := func(tolerance float64) (short int64, capped int) {
+		x := newCPSim(0, 0, []float64{c, c, c}, 80*time.Millisecond, 200*time.Millisecond, 320*time.Millisecond)
+		x.loss = 0.1
+		for _, p := range x.s.paths {
+			p.ownTol = tolerance
+		}
+		x.run(40 * time.Second)
+		for _, p := range x.s.paths {
+			if p.meter.RateCap() != 0 {
+				capped++
+			}
+		}
+		return x.s.cp.shortNo, capped
+	}
+	if short, _ := run(0); short == 0 {
+		t.Fatal("10% loss on every path without a tolerance: no round counted as short (the test tests nothing)")
+	}
+	if short, capped := run(0.15); short != 0 || capped != 0 {
+		t.Errorf("10%% loss within a tolerance of 15%%: %d rounds counted as short, %d paths capped", short, capped)
+	}
+}
+
 // Independent paths deliver the sum of their own rates: nobody is limited.
 func TestSessionRateIndependentPaths(t *testing.T) {
 	own := []float64{mbit(50), mbit(30), mbit(20)}

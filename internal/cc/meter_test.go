@@ -43,3 +43,28 @@ func TestParseProfile(t *testing.T) {
 		t.Error("vegas accepted")
 	}
 }
+
+// Every moment without data reaches the controller once, however short.
+func TestAppLimitedHint(t *testing.T) {
+	m := &Meter{}
+	if m.appLimitedHint() {
+		t.Fatal("limited before anything was said")
+	}
+	m.SetAppLimited(true)
+	if !m.appLimitedHint() || !m.appLimitedHint() {
+		t.Fatal("no data, but not limited")
+	}
+	m.SetAppLimited(false)
+	if m.appLimitedHint() {
+		t.Fatal("data again, the moment without was reported, but still limited")
+	}
+	// a gap between two questions
+	m.SetAppLimited(true)
+	m.SetAppLimited(false)
+	if !m.appLimitedHint() {
+		t.Fatal("a moment without data went unreported")
+	}
+	if m.appLimitedHint() {
+		t.Fatal("reported twice")
+	}
+}
