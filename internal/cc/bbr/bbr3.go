@@ -931,9 +931,22 @@ func (b *Sender) setPacingRate() {
 }
 
 // bandwidthForPacer is the pacing rate for the pacer, in bytes/s: never
-// zero.
+// zero, and (mpquic) never above the session's bound for the path. That
+// bound is on what the path sends, not only on its estimate: the start-up
+// paces at 2.77 times the estimate, and a path whose own estimate is below
+// its bound probes with its own gain, and both would go over a configured
+// rate, which is to be kept from the first packet. The session's own
+// probing gain applies.
 func (b *Sender) bandwidthForPacer() congestion.ByteCount {
-	return max(congestion.ByteCount(b.pacingRate/BytesPerSecond), minPacingRate)
+	rate := b.pacingRate
+	if c := b.rateCap(); c > 0 {
+		g := 1.0
+		if b.RateGain != nil {
+			g = max(g, b.RateGain())
+		}
+		rate = min(rate, Bandwidth(g*float64(c)))
+	}
+	return max(congestion.ByteCount(rate/BytesPerSecond), minPacingRate)
 }
 
 func (b *Sender) minPipeCwnd() congestion.ByteCount { return minPipeCwndPackets * b.mds }

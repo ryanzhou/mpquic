@@ -626,6 +626,33 @@ func TestSimRateCap(t *testing.T) {
 	}
 }
 
+// A cap bounds what a flow sends in every state, the start-up included: a
+// configured rate is kept from the first packet.
+func TestSimRateCapFromTheStart(t *testing.T) {
+	r := runSim(simConfig{duration: 10 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(60), buffer: 100 * time.Millisecond, flows: 3,
+		setup: func(_ int, s *Sender) {
+			s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
+		}})
+	var most float64
+	for i := range 3 {
+		for _, v := range r.flowSent[i] {
+			most = max(most, v)
+		}
+	}
+	var mq time.Duration
+	for _, q := range r.queue {
+		mq = max(mq, q)
+	}
+	t.Logf("most sent by a flow in 100 ms: %.1f Mbit/s, longest queue %v", most*10*8/1e6, mq)
+	// (the pacer's burst allowance on top of the rate)
+	if most > mbit(20)*0.1+16*1200 {
+		t.Errorf("a flow capped at 20 Mbit/s sent %.1f Mbit/s over 100 ms", most*10*8/1e6)
+	}
+	if mq > 10*time.Millisecond {
+		t.Errorf("queue of %v on a link that the caps never fill", mq)
+	}
+}
+
 // A capped flow sends at its cap and does not probe above it on its own
 // (the session probes on all capped paths at once, with RateGain): on a
 // link with room to spare, three flows capped at 20 Mbit/s deliver
