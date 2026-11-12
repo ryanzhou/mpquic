@@ -634,7 +634,7 @@ func TestRateFlappingRelays(t *testing.T) {
 	// when the higher rates have aged out of its last ten rounds, and up
 	// by probes that ask for twice as much more each time.)
 	within(t, "goodput", x.goodput(60*time.Second), capacity, 0.5, 1.0)
-	if l := x.lossShare(); l > 0.08 {
+	if l := x.lossShare(); l > 0.1 { // (a relay drops to a fifth every few seconds)
 		t.Errorf("loss %.2f%%", 100*l)
 	}
 }

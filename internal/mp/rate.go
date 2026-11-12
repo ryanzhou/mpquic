@@ -263,11 +263,11 @@ type coupling struct {
 	gain   float64 // what the round sends: B times this
 
 	// start-up
-	best   float64 // the B that the coming rounds must exceed by cpStartGrowth
-	stall  int     // ... and the rounds that did not
-	over   bool    // loss or a queue showed within the round: it is over
-	acks   []cpAck // the bytes acknowledged as of the last ticks (a round's worth)
-	qTicks int     // ticks in a row at which every path saw a queue
+	best   float64   // the B that the coming rounds must exceed by cpStartGrowth
+	stall  int       // ... and the rounds that did not
+	over   bool      // loss or a queue showed within the round: it is over
+	acks   []cpAck   // the bytes acknowledged as of the last ticks (a round's worth)
+	qSince time.Time // every path has seen a queue since then (zero: not)
 
 	drainN int // rounds the drain under way has taken
 
@@ -431,8 +431,10 @@ func (s *Session) cpStartRoundLocked(now time.Time) {
 // over as soon as it has gone too far, without waiting for the round to end
 // (a round at twice the pipe's rate queues or loses a round's worth):
 //
-//   - every path's round trip is clearly above its base (HyStart: the
-//     common bottleneck is filling its buffer), or
+//   - every path's round trip has been clearly above its base for a
+//     round's length (HyStart: the common bottleneck is filling its
+//     buffer; and it was busy all that time, so what came out in it is
+//     what it carries), or
 //   - the last two rounds lost more than the paths' baselines, on all paths,
 //     and it is not one burst (BBRv2 ends its start-up on loss in the same
 //     way).
@@ -473,10 +475,10 @@ func (s *Session) cpStartupTickLocked(now time.Time, w time.Duration) {
 			}
 		}
 	}
-	if loaded > 0 && queued == loaded {
-		cp.qTicks++
-	} else {
-		cp.qTicks = 0
+	if loaded == 0 || queued < loaded {
+		cp.qSince = time.Time{}
+	} else if cp.qSince.IsZero() {
+		cp.qSince = now
 	}
 	// The rate at which acknowledgements came in over the last round's
 	// length.
@@ -508,7 +510,7 @@ func (s *Session) cpStartupTickLocked(now time.Time, w time.Duration) {
 	}
 	lossOver := known > 0 && float64(lossy) >= cpCommon*float64(known) &&
 		cpExcess(known, lost, expected/float64(known)) && float64(lost)-expected >= cpLossEvents*cpBurst*cpPkt
-	if cp.qTicks >= 2 || lossOver {
+	if !cp.qSince.IsZero() && now.Sub(cp.qSince) >= w || lossOver {
 		// B is what the pipe puts out now, not the most it ever did.
 		cp.set(min(cp.bw, r))
 		cp.over, cp.gain = true, 1
