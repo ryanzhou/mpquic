@@ -39,7 +39,7 @@ Each page describes one layer; the packages are under `internal/`.
 |---|---|---|
 | `mp` (`proto.go`, `transport.go`, `endpoints.go`) | path setup, authentication, frames, packet sizes | [protocol.md](protocol.md) |
 | `mp` (`session.go`, `sched.go`, `path.go`, `stream.go`, `sendqueue.go`) | streams, scheduling, acknowledgements, rescue, path failure | [session.md](session.md) |
-| `mp/rate.go`, `cc`, `cc/bbr` | the session rate (one congestion controller for all paths), the paths' pacing, and BBR per path as an alternative (vendored from Hysteria, MIT) | [congestion.md](congestion.md) |
+| `mp/rate.go`, `cc` | the session rate (one congestion controller for all paths) and the paths' pacing and windows | [congestion.md](congestion.md) |
 | `proxy` | SOCKS5, tunnel, remote dialer, UDP associations, reliable UDP, ICMP echo | [proxy.md](proxy.md) |
 | `ipstack`, `wg`, `tundev` | the packet front-ends: a userspace network stack behind WireGuard or a TUN interface | [packet-frontends.md](packet-frontends.md) |
 | `linkem` | UDP relay with link emulation (`mpquic relay`, and the testbed's links) | [../deployment.md](../deployment.md#relays), [../development.md](../development.md) |
@@ -104,7 +104,7 @@ which is where it improves on MPTCP.
 | lossy / slow subflow | penalise, still head-of-line blocks | look-ahead placement, per-chunk streams or datagrams, deadline rescue |
 | path failure | RTO-driven, seconds | datagram pings, ~0.6 s, plus deadline rescue (~1 RTT) |
 | per-connection HOL | all data on a subflow is one byte stream | one QUIC stream per (path, connection) |
-| CC | coupled (LIA/OLIA) Reno, one controller per subflow | one rate controller for the session (delivery-rate based, like BBR; loss counts beyond the paths' baselines), the paths pace at their shares; optional configured up/down rates |
+| CC | coupled (LIA/OLIA) Reno, one controller per subflow | one rate controller for the session (BBR's design; loss counts beyond the paths' baselines), the paths pace at their shares; optional configured up/down rates |
 | middleboxes | must pass TCP options | plain UDP; relays are stateless forwarders |
 
 There is one congestion controller per session, not per path (see

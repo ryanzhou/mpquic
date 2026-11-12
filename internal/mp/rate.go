@@ -17,37 +17,38 @@ import (
 // to more than it carries, each starts up on its own, and none of them
 // knows what the others lose.
 //
-// So the session has one rate, B, and the paths have none of their own: a
-// path's controller paces at the share it is given and bounds what it has in
-// flight (cc.follower). The session works in rounds of the longest round
-// trip, and every acknowledgement and loss is counted for the round its
-// packet was sent in (cc.Meter), so what a round delivered and lost is
-// exact. The rules, and where each comes from:
+// So the session has one rate, B, for all paths together, and shares it
+// out. A path's controller decides nothing: it paces at what it is given
+// and bounds what it has in flight (cc.follower). The session works in
+// rounds of the longest round trip, and every acknowledgement and loss is
+// counted for the round its packet was sent in (cc.Meter), so what a round
+// lost is exact. The rules, and where each comes from:
 //
 //   - B is the highest rate at which a round of the last ten was delivered.
-//     (BBR's bandwidth estimate: a path delivers no faster than its
+//     (BBR's bandwidth estimate: a pipe delivers no faster than its
 //     bottleneck, so the highest recent delivery rate is the bottleneck's;
 //     ten rounds outlast a probe cycle.) Rounds in which the application
-//     had less to send than B say nothing and are skipped.
+//     had less to send say nothing and are skipped.
 //   - Start-up sends twice what is being acknowledged (slow start). It ends
 //     when B stops growing (BBR: less than a quarter in three rounds), when
-//     every path's round trip rises (HyStart), or on loss (BBRv2).
+//     every path's round trip has been up for a round (HyStart), or on loss
+//     (BBRv2).
 //   - After that the session sends at B. Every eight rounds one round sends
 //     a quarter more, and the next one as much less (BBR's probe cycle). If
 //     the probe was delivered, B has risen with it, and the next probe
 //     follows at once and asks for twice as much more.
 //   - A drain (after the start-up, a probe, a cut) lasts until no more is
-//     in flight than the paths' shares need (BBR's drain).
+//     in flight than B needs (BBR's drain).
 //   - Loss counts when it comes with the rate: beyond what a path loses
 //     also when the pipe is not full (its baseline), and on all paths. Two
-//     such rounds at B: B is what they delivered (BBRv2 bounds its rate by
-//     loss in the same way; the baseline is what keeps random loss out of
-//     it). A probe answered by loss doubles the wait for the next (a
-//     policer makes every probe cost loss).
+//     such rounds at B: B comes down by the share that was lost. (BBRv2
+//     bounds its rate by loss in the same way; the baseline is what keeps
+//     random loss out of it.) A probe answered by loss doubles the wait
+//     for the next: a policer makes every probe cost loss.
 //
-// B is shared out equally, except that a path gets no more than it has
-// shown to carry: a path that its own window holds back while others are
-// not held back has a limit of its own (a slow relay).
+// B is shared out equally, except that a path gets no more than its own
+// rate, if it has one: a path that its window has held back (a relay slower
+// than its share) has a rate of its own, found and probed by the same rules.
 //
 // docs/design/congestion.md has the reasons at length.
 
