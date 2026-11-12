@@ -39,7 +39,7 @@ Each page describes one layer; the packages are under `internal/`.
 |---|---|---|
 | `mp` (`proto.go`, `transport.go`, `endpoints.go`) | path setup, authentication, frames, packet sizes | [protocol.md](protocol.md) |
 | `mp` (`session.go`, `sched.go`, `path.go`, `stream.go`, `sendqueue.go`) | streams, scheduling, acknowledgements, rescue, path failure | [session.md](session.md) |
-| `cc`, `cc/bbr`, `mp/coupling.go` | per-path BBR (vendored from Hysteria, MIT) and the session rate | [congestion.md](congestion.md) |
+| `cc`, `cc/bbr`, `mp/coupling.go` | BBRv3 on every path (ported from the IETF draft), the session rate, loss tolerance | [congestion.md](congestion.md) |
 | `proxy` | SOCKS5, tunnel, remote dialer, UDP associations, reliable UDP, ICMP echo | [proxy.md](proxy.md) |
 | `ipstack`, `wg`, `tundev` | the packet front-ends: a userspace network stack behind WireGuard or a TUN interface | [packet-frontends.md](packet-frontends.md) |
 | `linkem` | UDP relay with link emulation (`mpquic relay`, and the testbed's links) | [../deployment.md](../deployment.md#relays), [../development.md](../development.md) |
@@ -104,12 +104,13 @@ which is where it improves on MPTCP.
 | lossy / slow subflow | penalise, still head-of-line blocks | look-ahead placement, per-chunk streams or datagrams, deadline rescue |
 | path failure | RTO-driven, seconds | datagram pings, ~0.6 s, plus deadline rescue (~1 RTT) |
 | per-connection HOL | all data on a subflow is one byte stream | one QUIC stream per (path, connection) |
-| CC | coupled (LIA/OLIA) Reno | BBR per path, capped so that the paths' estimates add up to what the session delivers over all of them; optional configured up/down rates |
+| CC | coupled (LIA/OLIA) Reno | BBRv3 per path, capped so that the paths' estimates add up to what the session delivers over all of them; optional configured up/down rates and per-path loss tolerance |
 | middleboxes | must pass TCP options | plain UDP; relays are stateless forwarders |
 
 The congestion controllers are coupled through the session rate (see
-[congestion.md](congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow)): behind a common bottleneck the paths together take about
-what one BBR flow would; independent paths are not limited by it.
+[congestion.md](congestion.md#session-rate-the-paths-estimates-add-up-to-what-is-delivered)):
+behind a common bottleneck the paths together take about what one BBR flow
+would; independent paths are not limited by it.
 
 ## Threads
 

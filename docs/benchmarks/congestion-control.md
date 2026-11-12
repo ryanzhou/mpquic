@@ -1,7 +1,14 @@
 # Congestion control benchmarks
 
+> **These numbers predate the current controller.** They were measured with
+> the BBRv1 controller of earlier releases. Each path now runs BBR version 3
+> ([design/congestion.md](../design/congestion.md)); the page is being
+> regenerated. What changes most: far fewer packets dropped at policers and
+> shallow buffers, and random loss above 2% or reordering needs
+> `loss_tolerance` on that path to keep its rate.
+
 Each path runs its own BBRv1 sender (vendored from Hysteria, with mpquic's
-changes described in [design/congestion.md](../design/congestion.md#per-path-bbr)). This page
+changes described in [design/congestion.md](../design/congestion.md)). This page
 measures it: **one bulk stream over one emulated path at 150 ms RTT** (75 ms
 each way), produced by `scripts/cc-bench.py`. It runs `mpbench` with a single
 `internal/linkem` path (the same impairment in both directions), 15 s per run.
@@ -35,7 +42,7 @@ however deep the bottleneck buffer; CUBIC fills the buffer (+250–500 ms with
 ## Bufferbloat: before and after
 
 Stock BBRv1 (mpquic ≤ v0.1.0) had three problems with queues, fixed in the
-default profile (details in [design/congestion.md](../design/congestion.md#per-path-bbr)):
+default profile (details in [design/congestion.md](../design/congestion.md)):
 
 1. **A standing queue of one BDP** on a saturated path: the 0.75 drain phase
    ended after one min RTT whether or not the queue was gone, so BBR ended up
@@ -196,7 +203,7 @@ RTTs. A slow consumer (for example a slow SOCKS client) therefore stays at
   are rate-controlled as one flow: the paths' estimates are capped so that
   they add up to what the session delivers over all of them, instead of
   each path probing for the whole bottleneck. See the
-  [session rate](../design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow) and
+  [session rate](../design/congestion.md#session-rate-the-paths-estimates-add-up-to-what-is-delivered) and
   [multipath.md](multipath.md#common-bottlenecks-an-endpoints-line-is-slower-than-the-relays).
 
 Reproduce: `scripts/cc-bench.py [--rtt 150] [--suite bandwidth,window,loss,burst,buffer,jitter,bloat]`,

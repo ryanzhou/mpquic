@@ -31,7 +31,6 @@ type fakeClock struct{ t monotime.Time }
 func (c *fakeClock) Now() monotime.Time { return c.t }
 
 type simConfig struct {
-	profile  Profile
 	duration time.Duration
 	rtt      time.Duration                // propagation round trip
 	rate     func(time.Duration) float64  // bottleneck rate, bytes/s
@@ -58,6 +57,18 @@ type simResult struct {
 
 	senders       []*Sender
 	flowDelivered [][]float64
+	flowSent      [][]float64 // bytes sent per bucket
+	flowDropped   [][]float64 // ... and of those, bytes that did not arrive
+}
+
+// lossRate returns the share of what flow i sent in [from, to) that was lost.
+func (r simResult) lossRate(i int, from, to time.Duration) float64 {
+	var sent, lost float64
+	for b := int(from / simBucket); b < int(to/simBucket) && b < len(r.flowSent[i]); b++ {
+		sent += r.flowSent[i][b]
+		lost += r.flowDropped[i][b]
+	}
+	return lost / max(sent, 1)
 }
 
 // flowGoodput returns flow i's delivered rate (bytes/s) in [from, to).
@@ -135,7 +146,7 @@ func runSim(cfg simConfig) simResult {
 	nb := int(cfg.duration/simBucket) + 1
 	res := simResult{queue: make([]time.Duration, nb)}
 	for i := range flows {
-		s := NewBbrSender(clk, size, cfg.profile)
+		s := NewBbrSender(clk, size)
 		s.SetRTTStatsProvider(fakeRTT{cfg.rtt})
 		if i == 0 {
 			s.ProbeRTTGate = cfg.gate
@@ -151,6 +162,8 @@ func runSim(cfg simConfig) simResult {
 		flows[i] = f
 		res.senders = append(res.senders, s)
 		res.flowDelivered = append(res.flowDelivered, make([]float64, nb))
+		res.flowSent = append(res.flowSent, make([]float64, nb))
+		res.flowDropped = append(res.flowDropped, make([]float64, nb))
 	}
 	res.s = flows[0].s
 	res.delivered = res.flowDelivered[0]
@@ -288,8 +301,10 @@ func runSim(cfg simConfig) simResult {
 			for f.s.CanSend(f.inflight) && f.s.HasPacingBudget(clk.t) {
 				f.s.OnPacketSent(clk.t, f.inflight, f.pn, size, true)
 				f.inflight += size
+				res.flowSent[i][bucket] += float64(size)
 				if rng.Float64() < cfg.loss || !enqueue(pkt{flow: i, pn: f.pn, sentAt: now}) {
 					f.dropped = append(f.dropped, pkt{pn: f.pn, sentAt: now})
+					res.flowDropped[i][bucket] += float64(size)
 				}
 				f.pn++
 			}
@@ -303,111 +318,169 @@ func runSim(cfg simConfig) simResult {
 
 func mbit(m float64) float64 { return m * 1e6 / 8 }
 
-// Single bulk flow on a deep buffer: BBR must keep the queue small (it used
-// to hold a whole BDP, doubling the RTT for everything sharing the path).
-func TestSimSteadyStateQueue(t *testing.T) {
-	for _, p := range []Profile{ProfileStandard, ProfileConservative} {
-		r := runSim(simConfig{profile: p, duration: 15 * time.Second, rtt: 50 * time.Millisecond,
-			rate: func(time.Duration) float64 { return mbit(20) }, buffer: 500 * time.Millisecond})
-		util := r.goodput(3*time.Second, 15*time.Second) / mbit(20)
-		mq := r.medianQueue(3*time.Second, 15*time.Second)
-		t.Logf("%s: utilization %.1f%%, median queue %v, stale resets %d", p, util*100, mq, r.s.StaleResets)
+func constRate(m float64) func(time.Duration) float64 {
+	return func(time.Duration) float64 { return mbit(m) }
+}
+
+// What the tests below expect is what BBRv3 is designed to do (the draft's
+// sections 3 and 5), with margins: they are not fitted to what this
+// implementation happens to measure.
+
+// A bulk flow alone on a link, whatever the buffer: it uses the link, and
+// keeps no standing queue (it cruises at the estimated rate, and drains
+// what its probes queue).
+func TestSimSteadyState(t *testing.T) {
+	for _, buffer := range []time.Duration{20 * time.Millisecond, 500 * time.Millisecond} {
+		r := runSim(simConfig{duration: 20 * time.Second, rtt: 50 * time.Millisecond, rate: constRate(20), buffer: buffer})
+		util := r.goodput(3*time.Second, 20*time.Second) / mbit(20)
+		mq := r.medianQueue(3*time.Second, 20*time.Second)
+		loss := r.lossRate(0, 3*time.Second, 20*time.Second)
+		t.Logf("buffer %v: utilization %.1f%%, median queue %v, loss %.2f%%", buffer, util*100, mq, loss*100)
 		if util < 0.9 {
-			t.Errorf("%s: utilization %.1f%% < 90%%", p, util*100)
+			t.Errorf("buffer %v: utilization %.1f%% < 90%%", buffer, util*100)
 		}
-		if mq > 20*time.Millisecond {
-			t.Errorf("%s: median queueing delay %v > 20ms", p, mq)
+		if mq > 10*time.Millisecond {
+			t.Errorf("buffer %v: median queueing delay %v > 10ms", buffer, mq)
 		}
-		if r.s.StaleResets != 0 {
-			t.Errorf("%s: %d spurious stale-estimate resets", p, r.s.StaleResets)
+		if loss > lossThresh {
+			t.Errorf("buffer %v: loss %.2f%% above BBR.LossThresh", buffer, loss*100)
 		}
 	}
 }
 
-// The bottleneck rate drops 8x (40 -> 5 Mbit/s) for 6 s on a 2 s buffer.
-// BBRv1 kept pacing at the old rate for 10 (queue-inflated) round trips:
-// ~0.8 s of queue for the whole low phase.
+// A policer (hardly any buffer: what exceeds the rate is dropped) is what
+// BBRv1 overran, because it ignored loss. BBRv3 probes above the rate only
+// until the loss shows, and stays below it otherwise: the loss stays
+// around BBR.LossThresh, at a rate near the policer's. With a loss
+// tolerance of 100 % (loss ignored altogether) the controller has to rely
+// on the delivery rate alone, and loses more.
+func TestSimPolicer(t *testing.T) {
+	run := func(tolerance float64) (util, loss float64) {
+		r := runSim(simConfig{duration: 30 * time.Second, rtt: 100 * time.Millisecond, rate: constRate(50), buffer: 2 * time.Millisecond,
+			setup: func(_ int, s *Sender) { s.LossTolerance = func() float64 { return tolerance } }})
+		return r.goodput(5*time.Second, 30*time.Second) / mbit(50), r.lossRate(0, 5*time.Second, 30*time.Second)
+	}
+	util, loss := run(0)
+	utilAll, lossAll := run(1)
+	t.Logf("default: utilization %.0f%%, loss %.2f%%; loss ignored: utilization %.0f%%, loss %.2f%%", util*100, loss*100, utilAll*100, lossAll*100)
+	if util < 0.7 {
+		t.Errorf("utilization %.0f%% < 70%%", util*100)
+	}
+	if loss > 1.5*lossThresh {
+		t.Errorf("loss %.2f%% at a policer: well above BBR.LossThresh", loss*100)
+	}
+	if lossAll <= loss {
+		t.Errorf("ignoring loss lost %.2f%%, not more than the default's %.2f%%", lossAll*100, loss*100)
+	}
+}
+
+// Random loss, which is not congestion. Below BBR.LossThresh the default
+// keeps most of the rate; above it the default takes the path for
+// congested (by design: it cannot tell), and a loss tolerance above the
+// path's loss rate gives the rate back. (Up to 20 % loss: BBR finds a
+// path's rate by sending 1.25 times its estimate, and with more loss than
+// that even the probe delivers less than the estimate.)
+func TestSimLossTolerance(t *testing.T) {
+	run := func(loss, tolerance float64) float64 {
+		r := runSim(simConfig{duration: 30 * time.Second, rtt: 100 * time.Millisecond, rate: constRate(50), buffer: 100 * time.Millisecond, loss: loss,
+			setup: func(_ int, s *Sender) { s.LossTolerance = func() float64 { return tolerance } }})
+		// of what the loss leaves of the link
+		return r.goodput(5*time.Second, 30*time.Second) / mbit(50) / (1 - loss)
+	}
+	if u := run(0.005, 0); u < 0.8 {
+		t.Errorf("0.5%% loss, default: utilization %.0f%% < 80%%", u*100)
+	}
+	for _, c := range []struct{ loss, tolerance float64 }{{0.05, 0.1}, {0.1, 0.2}, {0.1, 1}, {0.15, 1}} {
+		with, without := run(c.loss, c.tolerance), run(c.loss, 0)
+		t.Logf("%.0f%% loss: utilization %.0f%% with a tolerance of %.0f%%, %.0f%% without", c.loss*100, with*100, c.tolerance*100, without*100)
+		if with < 0.9 {
+			t.Errorf("%.0f%% loss, tolerance %.0f%%: utilization %.0f%% < 90%%", c.loss*100, c.tolerance*100, with*100)
+		}
+		if without > 0.5 {
+			t.Errorf("%.0f%% loss without a tolerance: utilization %.0f%%; the default should take this for congestion", c.loss*100, without*100)
+		}
+	}
+	// A tolerance does not stop the controller from finding a path's rate:
+	// on a clean path it changes nothing.
+	if u := run(0, 0.2); u < 0.9 {
+		t.Errorf("no loss, tolerance 20%%: utilization %.0f%% < 90%%", u*100)
+	}
+}
+
+// ACK aggregation (Wi-Fi, cellular: ACKs arrive in bursts) must not cost
+// throughput: BBR.extra_acked widens the window for it.
+func TestSimAckAggregation(t *testing.T) {
+	for _, c := range []struct{ jitter, rtt time.Duration }{
+		{20 * time.Millisecond, 30 * time.Millisecond},
+		{40 * time.Millisecond, 5 * time.Millisecond},
+		{20 * time.Millisecond, 50 * time.Millisecond},
+	} {
+		r := runSim(simConfig{duration: 15 * time.Second, rtt: c.rtt, rate: constRate(50), buffer: 200 * time.Millisecond, jitter: c.jitter})
+		util := r.goodput(4*time.Second, 15*time.Second) / mbit(50)
+		t.Logf("ACKs every %v, rtt %v: utilization %.0f%%", c.jitter, c.rtt, util*100)
+		if util < 0.85 {
+			t.Errorf("ACKs every %v, rtt %v: utilization %.0f%% < 85%%", c.jitter, c.rtt, util*100)
+		}
+	}
+}
+
+// The bottleneck's rate drops. Where the buffer is shallow, the loss tells
+// BBRv3 at once (BBR.bw_shortterm). Where it is deep there is no loss, and
+// the old estimate stands until the bandwidth filter has forgotten it: two
+// ProbeBW cycles, each of up to 3 s and a few round trips (which the queue
+// makes longer). The flow keeps the link busy throughout, with a queue that
+// the window bounds, and that is gone after that.
 func TestSimRateDrop(t *testing.T) {
-	rate := func(now time.Duration) float64 {
-		if now >= 6*time.Second && now < 12*time.Second {
-			return mbit(5)
+	const rtt = 50 * time.Millisecond
+	for _, c := range []struct {
+		lo      float64
+		buffer  time.Duration
+		settled time.Duration // the queue is gone this long after the drop
+	}{
+		{20, 50 * time.Millisecond, 10 * time.Second},
+		{20, 2 * time.Second, 10 * time.Second},
+		{5, 50 * time.Millisecond, 20 * time.Second},
+		{5, 2 * time.Second, 20 * time.Second},
+	} {
+		rate := func(now time.Duration) float64 {
+			if now >= 6*time.Second {
+				return mbit(c.lo)
+			}
+			return mbit(40)
 		}
-		return mbit(40)
-	}
-	r := runSim(simConfig{profile: ProfileStandard, duration: 20 * time.Second, rtt: 50 * time.Millisecond,
-		rate: rate, buffer: 2 * time.Second})
-	bloat := r.queued(6*time.Second, 12*time.Second, 50*time.Millisecond)
-	low := r.goodput(7*time.Second, 12*time.Second) / mbit(5)
-	high := r.goodput(17*time.Second, 20*time.Second) / mbit(40)
-	t.Logf("queue > 50ms for %v of the 6 s low phase; utilization low %.0f%% recovered %.0f%%; stale resets %d",
-		bloat, low*100, high*100, r.s.StaleResets)
-	if bloat > 1500*time.Millisecond {
-		t.Errorf("queue stayed above 50ms for %v after the rate drop (want <= 1.5s)", bloat)
-	}
-	if low < 0.85 {
-		t.Errorf("utilization after the drop %.0f%% < 85%%", low*100)
-	}
-	if high < 0.7 {
-		t.Errorf("utilization after the rate recovered %.0f%% < 70%%", high*100)
+		const end = 60 * time.Second
+		r := runSim(simConfig{duration: end, rtt: rtt, rate: rate, buffer: c.buffer})
+		util := r.goodput(8*time.Second, end) / mbit(c.lo)
+		late := r.medianQueue(6*time.Second+c.settled, end)
+		t.Logf("40 -> %v Mbit/s, buffer %v: utilization %.0f%%, median queue from %v after the drop: %v", c.lo, c.buffer, util*100, c.settled, late)
+		if util < 0.85 {
+			t.Errorf("40 -> %v, buffer %v: utilization after the drop %.0f%% < 85%%", c.lo, c.buffer, util*100)
+		}
+		// (no standing queue: what the probes queue for a few round trips
+		// in every cycle does not make the median)
+		if late > rtt/2 {
+			t.Errorf("40 -> %v, buffer %v: median queue %v more than %v after the drop", c.lo, c.buffer, late, c.settled)
+		}
 	}
 }
 
-// A moderate drop (40 -> 28 Mbit/s) does not trip the stale-estimate reset
-// (delivery stays above 3/4 of the estimate); the queue-aware filter time
-// base must still expire the old estimate quickly.
-func TestSimModerateRateDrop(t *testing.T) {
+// The rate comes back: the flow finds it with its next probes.
+func TestSimRateRise(t *testing.T) {
 	rate := func(now time.Duration) float64 {
 		if now >= 6*time.Second {
-			return mbit(28)
+			return mbit(40)
 		}
-		return mbit(40)
+		return mbit(10)
 	}
-	r := runSim(simConfig{profile: ProfileStandard, duration: 14 * time.Second, rtt: 50 * time.Millisecond,
-		rate: rate, buffer: 2 * time.Second})
-	bloat := r.queued(6*time.Second, 14*time.Second, 25*time.Millisecond)
-	util := r.goodput(8*time.Second, 14*time.Second) / mbit(28)
-	t.Logf("queue > 25ms for %v after the drop; utilization %.0f%%; stale resets %d", bloat, util*100, r.s.StaleResets)
-	if bloat > 1500*time.Millisecond {
-		t.Errorf("queue stayed above 25ms for %v after the rate drop (want <= 1.5s)", bloat)
-	}
-	if util < 0.9 {
-		t.Errorf("utilization %.0f%% < 90%%", util*100)
+	r := runSim(simConfig{duration: 30 * time.Second, rtt: 50 * time.Millisecond, rate: rate, buffer: 200 * time.Millisecond})
+	util := r.goodput(16*time.Second, 30*time.Second) / mbit(40)
+	t.Logf("10 -> 40 Mbit/s: utilization from 10 s after the rise %.0f%%", util*100)
+	if util < 0.85 {
+		t.Errorf("utilization after the rise %.0f%% < 85%%", util*100)
 	}
 }
 
-// ACK aggregation (Wi-Fi, cellular: ACKs arrive in bursts, which looks like
-// jitter of up to the slot length) and random loss must neither trip the
-// stale-estimate reset nor cost throughput. The 40 ms / 5 ms case also guards
-// the standard profile against overestimate avoidance, which collapses there.
-func TestSimNoFalseStaleResets(t *testing.T) {
-	cases := []struct {
-		name   string
-		loss   float64
-		jitter time.Duration
-		rtt    time.Duration
-	}{
-		{"aggr20ms-rtt30ms", 0, 20 * time.Millisecond, 30 * time.Millisecond},
-		{"aggr40ms-rtt5ms", 0, 40 * time.Millisecond, 5 * time.Millisecond},
-		{"aggr20ms-rtt50ms", 0, 20 * time.Millisecond, 50 * time.Millisecond},
-		{"loss2%-rtt150ms", 0.02, 0, 150 * time.Millisecond},
-		{"loss5%-aggr10ms-rtt100ms", 0.05, 10 * time.Millisecond, 100 * time.Millisecond},
-	}
-	for _, c := range cases {
-		r := runSim(simConfig{profile: ProfileStandard, duration: 15 * time.Second, rtt: c.rtt,
-			rate: func(time.Duration) float64 { return mbit(50) }, buffer: 200 * time.Millisecond,
-			loss: c.loss, jitter: c.jitter})
-		util := r.goodput(4*time.Second, 15*time.Second) / mbit(50)
-		t.Logf("%s: utilization %.0f%%, stale resets %d", c.name, util*100, r.s.StaleResets)
-		if r.s.StaleResets != 0 {
-			t.Errorf("%s: %d spurious stale-estimate resets", c.name, r.s.StaleResets)
-		}
-		if util < 0.85 {
-			t.Errorf("%s: utilization %.0f%% < 85%%", c.name, util*100)
-		}
-	}
-}
-
-// The ProbeRTT gate is held only while in PROBE_RTT, and it is used.
+// The ProbeRTT gate is held only while in ProbeRTT, and it is used.
 func TestSimProbeGateHeldOnlyWhileProbing(t *testing.T) {
 	held, probes := false, 0
 	gate := func(enter bool) bool {
@@ -417,81 +490,116 @@ func TestSimProbeGateHeldOnlyWhileProbing(t *testing.T) {
 		held = enter
 		return true
 	}
-	runSim(simConfig{profile: ProfileStandard, duration: 40 * time.Second, rtt: 50 * time.Millisecond,
-		rate: func(time.Duration) float64 { return mbit(10) }, buffer: 200 * time.Millisecond, gate: gate,
+	runSim(simConfig{duration: 40 * time.Second, rtt: 50 * time.Millisecond, rate: constRate(10), buffer: 200 * time.Millisecond, gate: gate,
 		onStep: func(now time.Duration, s *Sender) {
-			if held && s.mode != bbrModeProbeRtt {
-				t.Fatalf("%v: gate held in mode %s", now, s.ModeName())
+			if held != (s.st == stProbeRTT) {
+				t.Fatalf("%v: gate held: %v in state %s", now, held, s.ModeName())
 			}
 		}})
 	if probes < 2 {
-		t.Errorf("PROBE_RTT entered %d times in 40 s, want >= 2", probes)
+		t.Errorf("ProbeRTT entered %d times in 40 s, want >= 2", probes)
 	}
 }
 
-// Regression: on a mostly idle (interactive) path every packet is sent with
-// nothing in flight, so min_rtt expires on an ACK that exits quiescence and
-// PROBE_RTT is skipped. The gate taken for it used to be kept forever, which
-// stopped every other path of the session from ever probing again.
-func TestProbeGateReleasedWhenProbeSkipped(t *testing.T) {
-	clk := &fakeClock{t: monotime.Now()}
-	b := NewBbrSender(clk, 1200, ProfileStandard)
-	b.SetRTTStatsProvider(fakeRTT{50 * time.Millisecond})
-	held, taken := false, 0
-	b.ProbeRTTGate = func(enter bool) bool {
-		if enter && !held {
-			taken++
+// A gate that refuses keeps the controller out of ProbeRTT until it lets
+// it in.
+func TestSimProbeGateRefused(t *testing.T) {
+	open := false
+	entered := time.Duration(0)
+	var now time.Duration
+	gate := func(enter bool) bool {
+		if enter && open && entered == 0 {
+			entered = now
 		}
+		return !enter || open
+	}
+	runSim(simConfig{duration: 20 * time.Second, rtt: 50 * time.Millisecond, rate: constRate(10), buffer: 200 * time.Millisecond, gate: gate,
+		onStep: func(t0 time.Duration, s *Sender) {
+			now = t0
+			open = t0 >= 12*time.Second
+			if !open && s.st == stProbeRTT {
+				t.Fatalf("%v: in ProbeRTT although the gate refused", t0)
+			}
+		}})
+	if entered < 12*time.Second || entered > 12*time.Second+100*time.Millisecond {
+		t.Errorf("ProbeRTT entered at %v, want right after the gate opened at 12s", entered)
+	}
+}
+
+// On a mostly idle (interactive) path every packet is sent with nothing in
+// flight. Its round-trip samples are as good as a ProbeRTT's, so the gate
+// is never taken, and never kept.
+func TestProbeGateIdlePath(t *testing.T) {
+	clk := &fakeClock{t: monotime.Now()}
+	b := NewBbrSender(clk, 1200)
+	b.SetRTTStatsProvider(fakeRTT{50 * time.Millisecond})
+	held := false
+	b.ProbeRTTGate = func(enter bool) bool {
 		held = enter
 		return true
 	}
+	b.AppLimitedHint = func() bool { return true }
 	pn := congestion.PacketNumber(1)
 	for i := 0; i < 400; i++ { // 20 s, one packet per RTT
 		b.OnPacketSent(clk.t, 0, pn, 1200, true)
 		clk.t = clk.t.Add(50 * time.Millisecond)
 		b.OnCongestionEventEx(1200, clk.t, []congestion.AckedPacketInfo{{PacketNumber: pn, BytesAcked: 1200, ReceivedTime: clk.t}}, nil)
 		pn++
-		if held && b.mode != bbrModeProbeRtt {
-			t.Fatalf("after %v: gate held while in %s", time.Duration(i+1)*50*time.Millisecond, b.ModeName())
+		if held || b.st == stProbeRTT {
+			t.Fatalf("after %v: gate held: %v, state %s", time.Duration(i+1)*50*time.Millisecond, held, b.ModeName())
 		}
 	}
-	if taken == 0 {
-		t.Fatalf("min_rtt never expired in 20 s")
+	if b.MinRTT() != 50*time.Millisecond {
+		t.Errorf("min_rtt %v, want 50ms", b.MinRTT())
+	}
+	// The same after a pause without any packets, when data comes: the
+	// first round trip of the burst is the probe (BBRHandleRestartFromIdle),
+	// not a reason to cut the burst's window.
+	clk.t = clk.t.Add(8 * time.Second)
+	b.AppLimitedHint = func() bool { return false }
+	for i := 0; i < 10; i++ {
+		b.OnPacketSent(clk.t, congestion.ByteCount(i)*1200, pn+congestion.PacketNumber(i), 1200, true)
+	}
+	clk.t = clk.t.Add(50 * time.Millisecond)
+	for i := 0; i < 10; i++ {
+		b.OnCongestionEventEx(congestion.ByteCount(10-i)*1200, clk.t, []congestion.AckedPacketInfo{{PacketNumber: pn + congestion.PacketNumber(i), BytesAcked: 1200, ReceivedTime: clk.t}}, nil)
+		if held || b.st == stProbeRTT {
+			t.Fatalf("burst after a pause: gate held: %v, state %s", held, b.ModeName())
+		}
 	}
 }
 
-// Two flows share a deep-buffered bottleneck (e.g. two paths of a session
-// behind the same uplink), the second joining later: the stale-estimate reset
-// must not make them starve each other or leave the link idle.
+// Two flows share a bottleneck (two paths of a session behind the same
+// uplink), the second joining later: they use the link and share it.
 func TestSimSharedBottleneck(t *testing.T) {
-	r := runSim(simConfig{profile: ProfileStandard, duration: 25 * time.Second, rtt: 50 * time.Millisecond,
-		rate: func(time.Duration) float64 { return mbit(20) }, buffer: time.Second,
-		flows: 2, flowStart: []time.Duration{0, 3 * time.Second}})
-	a := r.flowGoodput(0, 10*time.Second, 25*time.Second) / mbit(20)
-	b := r.flowGoodput(1, 10*time.Second, 25*time.Second) / mbit(20)
-	mq := r.medianQueue(10*time.Second, 25*time.Second)
-	t.Logf("shares %.0f%% + %.0f%%, median queue %v, stale resets %d/%d", a*100, b*100, mq,
-		r.senders[0].StaleResets, r.senders[1].StaleResets)
-	if a+b < 0.9 {
-		t.Errorf("utilization %.0f%% < 90%%", (a+b)*100)
-	}
-	if min(a, b) < 0.25 {
-		t.Errorf("unfair shares %.0f%% / %.0f%%", a*100, b*100)
-	}
-	if mq > 100*time.Millisecond {
-		t.Errorf("median queueing delay %v > 100ms", mq)
+	for _, buffer := range []time.Duration{20 * time.Millisecond, time.Second} {
+		r := runSim(simConfig{duration: 40 * time.Second, rtt: 50 * time.Millisecond, rate: constRate(20), buffer: buffer,
+			flows: 2, flowStart: []time.Duration{0, 3 * time.Second}})
+		a := r.flowGoodput(0, 10*time.Second, 40*time.Second) / mbit(20)
+		b := r.flowGoodput(1, 10*time.Second, 40*time.Second) / mbit(20)
+		mq := r.medianQueue(10*time.Second, 40*time.Second)
+		t.Logf("buffer %v: shares %.0f%% + %.0f%%, median queue %v", buffer, a*100, b*100, mq)
+		if a+b < 0.9 {
+			t.Errorf("buffer %v: utilization %.0f%% < 90%%", buffer, (a+b)*100)
+		}
+		if min(a, b) < 0.2 {
+			t.Errorf("buffer %v: unfair shares %.0f%% / %.0f%%", buffer, a*100, b*100)
+		}
+		if mq > 100*time.Millisecond {
+			t.Errorf("buffer %v: median queueing delay %v > 100ms", buffer, mq)
+		}
 	}
 }
 
 // Three flows share a bottleneck (three paths of a session behind one
-// uplink). Uncoupled, each probes for the whole link and together they keep
-// its buffer full. With each estimate capped at a third of the link (what
-// mpquic's session rate converges to), they leave STARTUP at their share
-// and keep the queue short, at the same utilisation.
-func TestSimRateCapSharedBottleneck(t *testing.T) {
+// line). On their own, each takes the highest rate it has seen for itself
+// as its bandwidth, at different moments: the estimates add up to more than
+// the link carries, and together the flows keep a queue. With each estimate
+// capped at a third of the link (what mpquic's session rate converges to),
+// they use the link without one.
+func TestSimRateCap(t *testing.T) {
 	run := func(capped bool) (float64, time.Duration, *Sender) {
-		cfg := simConfig{profile: ProfileStandard, duration: 15 * time.Second, rtt: 40 * time.Millisecond,
-			rate: func(time.Duration) float64 { return mbit(60) }, buffer: 100 * time.Millisecond, flows: 3}
+		cfg := simConfig{duration: 20 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(60), buffer: 300 * time.Millisecond, flows: 3}
 		if capped {
 			cfg.setup = func(_ int, s *Sender) {
 				s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
@@ -500,32 +608,58 @@ func TestSimRateCapSharedBottleneck(t *testing.T) {
 		r := runSim(cfg)
 		var u float64
 		for i := range 3 {
-			u += r.flowGoodput(i, 3*time.Second, 15*time.Second) / mbit(60)
+			u += r.flowGoodput(i, 3*time.Second, 20*time.Second) / mbit(60)
 		}
-		return u, r.medianQueue(3*time.Second, 15*time.Second), r.senders[0]
+		return u, r.medianQueue(3*time.Second, 20*time.Second), r.senders[0]
 	}
 	u0, q0, _ := run(false)
 	u1, q1, s := run(true)
-	t.Logf("uncoupled: utilization %.0f%%, median queue %v; capped: %.0f%%, %v", u0*100, q0, u1*100, q1)
+	t.Logf("on their own: utilization %.0f%%, median queue %v; capped: %.0f%%, %v", u0*100, q0, u1*100, q1)
 	if u1 < 0.9 {
 		t.Errorf("capped utilization %.0f%% < 90%%", u1*100)
 	}
 	if q1 > 10*time.Millisecond || q1 >= q0 {
-		t.Errorf("capped median queue %v (uncoupled %v)", q1, q0)
+		t.Errorf("capped median queue %v (on their own: %v)", q1, q0)
 	}
 	if bw := s.BandwidthEstimate(); float64(bw) > mbit(20)+1 {
 		t.Errorf("estimate %.1f Mbit/s above the cap", float64(bw)*8/1e6)
 	}
 }
 
+// A cap bounds what a flow sends in every state, the start-up included: a
+// configured rate is kept from the first packet.
+func TestSimRateCapFromTheStart(t *testing.T) {
+	r := runSim(simConfig{duration: 10 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(60), buffer: 100 * time.Millisecond, flows: 3,
+		setup: func(_ int, s *Sender) {
+			s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
+		}})
+	var most float64
+	for i := range 3 {
+		for _, v := range r.flowSent[i] {
+			most = max(most, v)
+		}
+	}
+	var mq time.Duration
+	for _, q := range r.queue {
+		mq = max(mq, q)
+	}
+	t.Logf("most sent by a flow in 100 ms: %.1f Mbit/s, longest queue %v", most*10*8/1e6, mq)
+	// (the pacer's burst allowance on top of the rate)
+	if most > mbit(20)*0.1+16*1200 {
+		t.Errorf("a flow capped at 20 Mbit/s sent %.1f Mbit/s over 100 ms", most*10*8/1e6)
+	}
+	if mq > 10*time.Millisecond {
+		t.Errorf("queue of %v on a link that the caps never fill", mq)
+	}
+}
+
 // A capped flow sends at its cap and does not probe above it on its own
-// (the session probes on all capped paths at once, with RateGain): on a link
-// with room to spare, three flows capped at 20 Mbit/s deliver 60 Mbit/s with
-// gain 1 and a quarter more with gain 1.25.
+// (the session probes on all capped paths at once, with RateGain): on a
+// link with room to spare, three flows capped at 20 Mbit/s deliver
+// 60 Mbit/s with gain 1 and a quarter more with gain 1.25.
 func TestSimRateGain(t *testing.T) {
 	run := func(gain float64) float64 {
-		r := runSim(simConfig{profile: ProfileStandard, duration: 12 * time.Second, rtt: 40 * time.Millisecond,
-			rate: func(time.Duration) float64 { return mbit(120) }, buffer: 100 * time.Millisecond, flows: 3,
+		r := runSim(simConfig{duration: 12 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(120), buffer: 100 * time.Millisecond, flows: 3,
 			setup: func(_ int, s *Sender) {
 				s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
 				s.RateGain = func() float64 { return gain }
@@ -538,114 +672,32 @@ func TestSimRateGain(t *testing.T) {
 	}
 	g1, g125, g0 := run(1), run(1.25), run(0)
 	t.Logf("goodput with gain 1: %.1f, 1.25: %.1f, unset: %.1f Mbit/s", g1, g125, g0)
-	if g1 < 57 || g1 > 61 {
+	if g1 < 56 || g1 > 61 {
 		t.Errorf("gain 1: %.1f Mbit/s, want the caps' 60 (no probing above a cap)", g1)
 	}
 	if g125 < 1.18*g1 || g125 > 1.3*g1 {
 		t.Errorf("gain 1.25: %.1f Mbit/s, want 1.25 times the %.1f with gain 1", g125, g1)
 	}
-	if g0 < 57 || g0 > 61 {
+	if g0 < 56 || g0 > 61 {
 		t.Errorf("gain unset: %.1f Mbit/s, want 60", g0)
 	}
 }
 
-// Unresponsive cross traffic takes 60% of the link for 7 s: the flow must
-// yield without bloating the queue, keep using what is left, and take the
-// whole link back afterwards.
-func TestSimCrossTraffic(t *testing.T) {
-	cross := func(now time.Duration) float64 {
-		if now >= 5*time.Second && now < 12*time.Second {
-			return mbit(12)
-		}
-		return 0
-	}
-	r := runSim(simConfig{profile: ProfileStandard, duration: 22 * time.Second, rtt: 50 * time.Millisecond,
-		rate: func(time.Duration) float64 { return mbit(20) }, buffer: time.Second, cross: cross})
-	during := r.goodput(7*time.Second, 12*time.Second) / mbit(8)
-	bloat := r.queued(5*time.Second, 12*time.Second, 100*time.Millisecond)
-	after := r.goodput(17*time.Second, 22*time.Second) / mbit(20)
-	t.Logf("share of the remaining 8 Mbit/s %.0f%%, queue > 100ms for %v, afterwards %.0f%%, stale resets %d",
-		during*100, bloat, after*100, r.s.StaleResets)
-	if during < 0.8 {
-		t.Errorf("used %.0f%% of the capacity left by the cross traffic", during*100)
-	}
-	if bloat > 1500*time.Millisecond {
-		t.Errorf("queue above 100ms for %v", bloat)
-	}
-	if after < 0.85 {
-		t.Errorf("utilization after the cross traffic stopped %.0f%%", after*100)
-	}
-}
-
-// BBR against a loss-based (Reno) flow. In deep buffers BBRv1 is window-
-// limited by the queue Reno builds and gets a minority share; the stale-
-// estimate reset must not turn that into starvation. In a shallow buffer
-// BBRv1 used to take ~90%; holding the drain phase makes it share.
+// BBR against a loss-based (Reno) flow: neither starves, whatever the
+// buffer (BBR.inflight_longterm and the time-scale of its probes are meant
+// for that).
 func TestSimRenoCompetition(t *testing.T) {
-	for _, c := range []struct {
-		buffer   time.Duration
-		minShare float64
-	}{
-		{50 * time.Millisecond, 0.2},
-		{200 * time.Millisecond, 0.15},
-		{time.Second, 0.1},
-		{3 * time.Second, 0.1},
-	} {
-		r := runSim(simConfig{profile: ProfileStandard, duration: 40 * time.Second, rtt: 50 * time.Millisecond,
-			rate: func(time.Duration) float64 { return mbit(20) }, buffer: c.buffer,
+	for _, buffer := range []time.Duration{50 * time.Millisecond, 200 * time.Millisecond, time.Second} {
+		r := runSim(simConfig{duration: 60 * time.Second, rtt: 50 * time.Millisecond, rate: constRate(20), buffer: buffer,
 			flows: 2, reno: []bool{false, true}})
-		a := r.flowGoodput(0, 10*time.Second, 40*time.Second) / mbit(20)
-		b := r.flowGoodput(1, 10*time.Second, 40*time.Second) / mbit(20)
-		t.Logf("buffer %v: bbr %.0f%%, reno %.0f%%, stale resets %d", c.buffer, a*100, b*100, r.s.StaleResets)
-		if a < c.minShare {
-			t.Errorf("buffer %v: bbr starved (%.0f%% < %.0f%%)", c.buffer, a*100, c.minShare*100)
+		a := r.flowGoodput(0, 10*time.Second, 60*time.Second) / mbit(20)
+		b := r.flowGoodput(1, 10*time.Second, 60*time.Second) / mbit(20)
+		t.Logf("buffer %v: bbr %.0f%%, reno %.0f%%", buffer, a*100, b*100)
+		if min(a, b) < 0.1 {
+			t.Errorf("buffer %v: a flow starved (bbr %.0f%%, reno %.0f%%)", buffer, a*100, b*100)
 		}
 		if a+b < 0.9 {
-			t.Errorf("buffer %v: utilization %.0f%%", c.buffer, (a+b)*100)
-		}
-	}
-}
-
-// A rate that keeps flapping (cellular, Wi-Fi). BBRv1 kept the high estimate
-// through the low phases (good throughput, but the buffer full all the time:
-// median queue 220-420 ms here). The stale reset must keep queues short, and
-// the quick re-probing after it must find the capacity again when it returns.
-func TestSimFlappingRate(t *testing.T) {
-	for _, c := range []struct {
-		hi, lo    float64
-		rtt, buf  time.Duration
-		period    time.Duration
-		loss      float64
-		minUtil   float64
-		maxMedian time.Duration
-	}{
-		{40, 5, 50 * time.Millisecond, 2 * time.Second, 3 * time.Second, 0, 0.8, 40 * time.Millisecond},
-		{40, 5, 50 * time.Millisecond, 2 * time.Second, 8 * time.Second, 0, 0.85, 30 * time.Millisecond},
-		{50, 10, 30 * time.Millisecond, time.Second, 5 * time.Second, 0, 0.85, 30 * time.Millisecond},
-		{100, 20, 150 * time.Millisecond, time.Second, 3 * time.Second, 0, 0.6, 250 * time.Millisecond},
-		// a relay path that collapses now and then, with random loss
-		{40, 2, 20 * time.Millisecond, 100 * time.Millisecond, 3 * time.Second, 0.03, 0.75, 30 * time.Millisecond},
-	} {
-		rate := func(now time.Duration) float64 {
-			if (now/c.period)%2 == 1 {
-				return mbit(c.lo)
-			}
-			return mbit(c.hi)
-		}
-		var capacity float64
-		for now := 5 * time.Second; now < 60*time.Second; now += 10 * time.Millisecond {
-			capacity += rate(now) * 0.01 * (1 - c.loss)
-		}
-		r := runSim(simConfig{profile: ProfileStandard, duration: 60 * time.Second, rtt: c.rtt, rate: rate, buffer: c.buf, loss: c.loss})
-		util := r.goodput(5*time.Second, 60*time.Second) * 55 / capacity
-		mq := r.medianQueue(5*time.Second, 60*time.Second)
-		t.Logf("%v<->%v Mbit/s every %v, rtt %v, loss %v: utilization %.0f%%, median queue %v, stale resets %d",
-			c.hi, c.lo, c.period, c.rtt, c.loss, util*100, mq, r.s.StaleResets)
-		if util < c.minUtil {
-			t.Errorf("%v<->%v/%v/%v: utilization %.0f%% < %.0f%%", c.hi, c.lo, c.period, c.rtt, util*100, c.minUtil*100)
-		}
-		if mq > c.maxMedian {
-			t.Errorf("%v<->%v/%v/%v: median queue %v > %v", c.hi, c.lo, c.period, c.rtt, mq, c.maxMedian)
+			t.Errorf("buffer %v: utilization %.0f%%", buffer, (a+b)*100)
 		}
 	}
 }

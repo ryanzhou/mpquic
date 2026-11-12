@@ -28,3 +28,43 @@ func TestProbeGateSerialises(t *testing.T) {
 		t.Fatal("meter without a gate must always be allowed")
 	}
 }
+
+func TestParseProfile(t *testing.T) {
+	// the variants of the earlier BBRv1 controller still parse, as BBR
+	for _, in := range []string{"", "bbr", "BBR", "bbr-aggressive", "bbr-conservative"} {
+		if p, err := ParseProfile(in); err != nil || p != ProfileBBR {
+			t.Errorf("ParseProfile(%q) = %q, %v", in, p, err)
+		}
+	}
+	if p, err := ParseProfile("cubic"); err != nil || p != ProfileCubic {
+		t.Errorf("ParseProfile(cubic) = %q, %v", p, err)
+	}
+	if _, err := ParseProfile("vegas"); err == nil {
+		t.Error("vegas accepted")
+	}
+}
+
+// Every moment without data reaches the controller once, however short.
+func TestAppLimitedHint(t *testing.T) {
+	m := &Meter{}
+	if m.appLimitedHint() {
+		t.Fatal("limited before anything was said")
+	}
+	m.SetAppLimited(true)
+	if !m.appLimitedHint() || !m.appLimitedHint() {
+		t.Fatal("no data, but not limited")
+	}
+	m.SetAppLimited(false)
+	if m.appLimitedHint() {
+		t.Fatal("data again, the moment without was reported, but still limited")
+	}
+	// a gap between two questions
+	m.SetAppLimited(true)
+	m.SetAppLimited(false)
+	if !m.appLimitedHint() {
+		t.Fatal("a moment without data went unreported")
+	}
+	if m.appLimitedHint() {
+		t.Fatal("reported twice")
+	}
+}

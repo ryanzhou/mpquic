@@ -15,7 +15,6 @@ import (
 	"github.com/apernet/quic-go"
 
 	"mpquic/internal/cc"
-	"mpquic/internal/cc/bbr"
 )
 
 // Client is the QUIC dialer: it maintains one session to a listener over many
@@ -27,7 +26,7 @@ type Client struct {
 	key     []byte
 	tlsConf *tls.Config
 	qconf   *quic.Config
-	profile bbr.Profile
+	profile string
 	sess    *Session
 	servers []string
 	wg      sync.WaitGroup
@@ -172,7 +171,7 @@ type Server struct {
 	key      []byte
 	tlsConf  *tls.Config
 	qconf    *quic.Config
-	profile  bbr.Profile
+	profile  string
 	acceptFn func(*Stream)
 
 	mu        sync.Mutex

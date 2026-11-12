@@ -76,7 +76,6 @@ type Path struct {
 	bw, cwnd     uint64
 	pacing       uint64
 	ccMode       string
-	staleResets  uint64 // BBR stale-estimate resets (rate drops)
 	// measured send rate (fallback when the controller exposes no estimate)
 	measRate  float64
 	measAt    time.Time
@@ -130,6 +129,9 @@ type Path struct {
 	reinjBytes, dupBytes uint64
 	// session rate (see coupling.go)
 	cps cpPath
+	// loss tolerance: what this end and the peer have configured for the
+	// path; the larger one applies
+	ownTol, peerTol float64
 
 	// owned by the send loop
 	sendStreams map[uint64]*quic.SendStream
@@ -580,7 +582,6 @@ func (p *Path) refreshStatsLocked() {
 		p.cwnd = m.Cwnd
 		p.pacing = m.Pacing
 		p.ccMode = m.Mode
-		p.staleResets = m.StaleResets
 	}
 }
 
@@ -648,10 +649,10 @@ func (p *Path) rescueCost(n int, now time.Time) float64 {
 
 // usable reports whether new data may be scheduled on the path (and whether
 // it counts as capacity in scheduling decisions): not during BBR ProbeRTT,
-// when its window is cut to 4 packets for ~200 ms.
+// when its window is cut to half a BDP for ~200 ms.
 func (p *Path) usable() bool { return p.state == stateActive && !p.benched }
 
-// benchedLocked: p is in BBR ProbeRTT (window cut to 4 packets for ~200 ms)
+// benchedLocked: p is in BBR ProbeRTT (window cut to half a BDP for ~200 ms)
 // and another path can carry new data meanwhile. With no alternative, a
 // probing path still sends.
 func (p *Path) benchedLocked() bool {
@@ -1003,7 +1004,15 @@ func (p *Path) statLocked() PathStat {
 		Name: p.name, Index: int(p.index), State: state, SRTT: p.srtt, MinRTT: p.minRTT,
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
-		StaleResets: p.staleResets, ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
-		SharedCap: p.cps.cap,
+		ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
+		SharedCap: p.cps.cap, LossTolerance: max(p.ownTol, p.peerTol),
+	}
+}
+
+// applyToleranceLocked hands the path's loss tolerance to its congestion
+// controller.
+func (p *Path) applyToleranceLocked() {
+	if p.meter != nil {
+		p.meter.SetLossTolerance(max(p.ownTol, p.peerTol))
 	}
 }

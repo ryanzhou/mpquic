@@ -11,19 +11,19 @@ import (
 
 // Session rate: the paths of a session are congestion-controlled as one flow
 //
-// Each path runs its own BBR, which measures that path: its bottleneck rate
-// and its round-trip time. That is all there is to it when the paths are
-// independent routes. Usually they are not: every path leaves through the
-// sending endpoint's uplink and arrives through the receiving endpoint's
-// downlink, and those are often slower than the relays. Each path's BBR
-// then takes the highest rate it has seen for itself as its bandwidth, and
-// the paths saw their best rates at different moments: the estimates add up
-// to more than the bottleneck carries. The paths together keep its buffer
-// full (latency for every stream), and where it drops instead (a shallow
-// buffer, a policer) they lose that excess all the time, which BBR ignores:
-// every lost packet is retransmitted, often rescued on another path as
-// well, and stalls the stream that waits for it. A bottleneck behind the
-// relays makes them carry all of that for nothing.
+// Each path runs its own BBR (version 3), which measures that path: its
+// bottleneck rate and its round-trip time, and obeys the loss on it. That
+// is all there is to it when the paths are independent routes. Usually they
+// are not: every path leaves through the sending endpoint's uplink and
+// arrives through the receiving endpoint's downlink, and those are often
+// slower than the relays. Each path's BBR then takes the highest rate it
+// has seen for itself as its bandwidth, and the paths saw their best rates
+// at different moments: the estimates add up to more than the bottleneck
+// carries. Where the bottleneck drops what is too much (a shallow buffer, a
+// policer), every path's BBR sees that. Where its buffer is deep nothing is
+// lost, and the paths together keep a queue of one or two round trips in
+// it: latency for every stream, as several BBR flows through one
+// bottleneck always cause, whoever they belong to.
 //
 // So the session measures what it delivers over all paths together, and the
 // paths' estimates have to add up to that (the idea of MPTCP's coupled
@@ -32,8 +32,9 @@ import (
 // the sum of their own rates, and then the session rate limits nobody.
 // Like BBR, the session rate is a matter of delivery rates. Delay is only
 // supporting evidence, because a round-trip time also grows with queues
-// that are not ours (the other direction's, other people's), and loss is
-// not judged at all, only what it leaves of the delivery rate.
+// that are not ours (the other direction's, other people's). Loss is the
+// business of each path's controller; the session only sees what it leaves
+// of the delivery rate.
 //
 //   - Rounds. The session works in rounds of the largest smoothed RTT of its
 //     paths (50 ms to 1 s, at most twice a path's base RTT). The delivery
@@ -46,33 +47,31 @@ import (
 //     which the session had no data for its paths). Rounds in which the
 //     network kept or dropped part of what *every* path sent show what a
 //     bottleneck that all of them pass carries: B is the maximum of the
-//     last ten of those. That is all there is to loss, as in BBR: a
-//     policer drops the same share from every path, and its rate is found
-//     this way; one path's own loss, however heavy, is that path's
-//     business.
+//     last ten of those. A policer drops the same share from every path,
+//     and its rate is found this way; one path's own loss, however heavy,
+//     is that path's business, and so is loss within a path's configured
+//     tolerance (Options.LossTolerance).
 //   - Shares. B is shared out max-min fairly: a path whose own estimate is
 //     below an equal share keeps it (its own bottleneck limits it), the
 //     others are capped at equal shares of the rest (bbr.Sender.RateCap).
 //     Only for 32 rounds after the pipe was last seen full, though:
 //     delivery has stopped growing although the network keeps part of what
 //     every path sends, or every path sees a queue. A bottleneck that all
-//     paths pass keeps showing that; independent paths do not (BBR's
-//     estimate for a path with random loss is what it sends, not what it
-//     delivers, so the estimates of lossy paths never add up to B), and
+//     paths pass keeps showing that; independent paths do not, and
 //     before the first time B only shows what was sent so far. A path in
 //     STARTUP gets a share when the pipe is full; otherwise it is left to
 //     find its rate.
 //   - Probing. Capped paths cannot find more capacity alone (and do not
-//     try: their own 1.25 phases are off), so the session probes on all of
-//     them at once (bbr.Sender.RateGain): one round at 1.25 B, then one at
-//     0.75 B while the ACKs come in, so that whatever the probe queued is
-//     gone again. If the probe was delivered (B grew by half of what it
-//     added), the session probes again right away, harder from the second
-//     success in a row (1.5, then 2; one success may be a policer's burst
-//     allowance). If not, it waits twice as long before the next probe: 2,
-//     4, then every 8 rounds, as often as BBR itself probes. No path is
-//     driven harder than its own probes would drive it: its share may be
-//     all that its own bottleneck carries.
+//     try: while capped they pace at the session's gain), so the session
+//     probes on all of them at once (bbr.Sender.RateGain): one round at
+//     1.25 B, then one at 0.75 B while the ACKs come in, so that whatever
+//     the probe queued is gone again. If the probe was delivered (B grew by
+//     half of what it added), the session probes again right away, harder
+//     from the second success in a row (1.5, then 2; one success may be a
+//     policer's burst allowance). If not, it waits twice as long before the
+//     next probe: 2, 4, then every 8 rounds. No path is driven harder than
+//     its own probes would drive it: its share may be all that its own
+//     bottleneck carries.
 //   - Queues. When every path that carried data saw a queue for a whole
 //     round (its lowest RTT sample above its base RTT), the bottleneck
 //     they all pass is congested. One path's own queue does not count.
@@ -109,12 +108,13 @@ const (
 	cpDrainEvery   = 8    // rounds between drains of a queue that stays
 	cpShareRounds  = 32   // rounds for which B is shared out after the pipe was seen full
 	cpGrowth       = 1.25 // delivery rate growth per round (session, STARTUP paths) below which a congested pipe is full
-	cpMaxBackoff   = 3    // probes at least every 2^3 rounds, the cadence of BBR's own gain cycle
+	cpMaxBackoff   = 3    // probes at least every 2^3 rounds
 	cpBaseWindow   = 30 * time.Second
 )
 
-// MPQUIC_COUPLE=0 turns the session rate off (like Options.NoCoupling), for
-// comparisons; MPQUIC_RATE_DEBUG=1 logs every round.
+// MPQUIC_COUPLE=0 turns the session rate off, for comparisons (every
+// path's controller is then on its own, and only a configured limit is
+// shared out); MPQUIC_RATE_DEBUG=1 logs every round.
 var cpDisabled = os.Getenv("MPQUIC_COUPLE") == "0"
 var cpDebug = os.Getenv("MPQUIC_RATE_DEBUG") != ""
 
@@ -241,7 +241,7 @@ func (s *Session) rateLimitLocked() uint64 {
 	return l
 }
 
-func (s *Session) coupled() bool { return !cpDisabled && !s.opt.NoCoupling }
+func (s *Session) coupled() bool { return !cpDisabled }
 
 // couplingTickLocked updates the session rate and the paths' shares of it.
 func (s *Session) couplingTickLocked(now time.Time) {
@@ -359,9 +359,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration) {
 		c.markAcked, c.markAt, c.marks = ma, mt, c.marks+1
 		delivered += c.rate
 		// Did the path deliver what it sent in that round?
+		// (Loss within a path's tolerance is that path's own, known loss:
+		// no sign of a bottleneck, for the session as for the path's
+		// controller.)
 		if c.sent1*cp.prevDt.Seconds() >= cpLoadedBytes {
 			measured++
-			if c.rate < cpTrim*c.sent1 {
+			if c.rate < (cpTrim-max(p.ownTol, p.peerTol))*c.sent1 {
 				kept++
 			}
 		}

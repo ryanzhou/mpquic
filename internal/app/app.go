@@ -220,15 +220,17 @@ func options(cfg *config.Config, log *slog.Logger) *mp.Options {
 		IdleTimeout:   time.Duration(cfg.Timeout) * time.Second,
 		StatsInterval: time.Duration(cfg.StatsInterval) * time.Second,
 		NoDup:         cfg.NoDup,
-		NoCoupling:    cfg.NoCoupling,
 		MaxSendRate:   cfg.Up.BytesPerSecond(),
 		MaxRecvRate:   cfg.Down.BytesPerSecond(),
-		MTU:           cfg.MTU,
-		Control:       socketMark(cfg.FWMark),
-		CertFile:      cfg.Cert,
-		KeyFile:       cfg.Key,
-		SNI:           cfg.SNI,
-		Logger:        log,
+		LossTolerance: float64(cfg.LossTolerance),
+
+		PathLossTolerance: cfg.PathLossTolerances(),
+		MTU:               cfg.MTU,
+		Control:           socketMark(cfg.FWMark),
+		CertFile:          cfg.Cert,
+		KeyFile:           cfg.Key,
+		SNI:               cfg.SNI,
+		Logger:            log,
 	}
 }
 

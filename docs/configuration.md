@@ -48,14 +48,14 @@ Reverse mode is described in [deployment.md](deployment.md#reverse-mode-the-loca
 
 | flag | config key | default | |
 |---|---|---|---|
-| `--congestion` | `congestion` | `bbr` | `bbr`, `bbr-aggressive`, `bbr-conservative`, `cubic` (quic-go built-in, for comparison) |
+| `--congestion` | `congestion` | `bbr` | `bbr` (BBR version 3 on every path) or `cubic` (quic-go built-in, for comparison) |
 | `--window` | `window` | `64MB` | maximum per-stream window (auto-tuned from 4 MB); one stream's rate ≤ window / slowest RTT |
 | `--chunk` | `chunk_size` | `16KB` | scheduling unit |
 | `--stats N` | `stats_interval` | off | log the session rate and per-path RTT/bandwidth/bytes every N s |
 | `--reverse` | `reverse` | false | reverse mode (set on both ends): the local listens, the remote dials back |
 | `--no-dup` | `no_dup` | false | disable redundant copies on idle paths |
-| `--up RATE` / `--down RATE` | `up` / `down` | measured | this endpoint's uplink / downlink rate, if known (`20mbit`, `"100 mbps"`; config numbers are bit/s). The session never sends more than `up` over all paths together and tells the peer to send no more than `down`; set them a little below the real rates (95%) and the line's buffer stays empty. Without them the session measures what it delivers over all paths and probes for more; see [session rate](design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow) |
-| `--no-coupling` | `no_coupling` | false | don't rate-control the paths together: each path's BBR probes for its bottleneck on its own, also when all paths share one (an endpoint's uplink or downlink) |
+| `--up RATE` / `--down RATE` | `up` / `down` | measured | this endpoint's uplink / downlink rate, if known (`20mbit`, `"100 mbps"`; config numbers are bit/s). The session never sends more than `up` over all paths together and tells the peer to send no more than `down`; set them a little below the real rates (95%) and the line's buffer stays empty. Without them the session measures what it delivers over all paths and probes for more; see [session rate](design/congestion.md#session-rate-the-paths-estimates-add-up-to-what-is-delivered) |
+| `--loss-tolerance PCT` | `loss_tolerance` | BBR's 2% | for paths known to lose packets at random: loss up to this share (`10%`, or `0.1`) is not taken for congestion; `100%` ignores loss. Per path: `loss_tolerance` in a `servers` entry. See [loss tolerance](design/congestion.md#loss-tolerance) |
 | `--race-connect` | `race_connect` | false | remote only (incl. reverse), aggressive: open each outbound TCP connection by racing up to 5 attempts started at 0, 100, 300, 600 and 1000 ms (each from a new source port, rotating over the target's IPs, IPv6/IPv4 interleaved); the first to connect wins and the rest are aborted. For networks or NATs that drop connection setup, where a lost SYN otherwise stalls the connection for 1 s, 3 s or more. An attempt that fails outright starts the next at once |
 | `--reliable-udp` | `reliable_udp` | false | local/tunnel only, needs `-u`: relay all UDP over streams (retransmitted, congestion-controlled, any size; in order, so a loss delays later datagrams of the same association) instead of QUIC datagrams, which drop payloads the path MTU cannot carry. Datagrams sent faster than the tunnel carries them are dropped once ~200 ms are queued. The remote needs `-u` too. See [reliable UDP](design/proxy.md#reliable-udp) |
 | `--mtu BYTES` | `mtu` | discover | path MTU (IP packet size, 1228–65535) of every path: fixed QUIC packet size, no MTU discovery. Only needed if the MTU drops mid-connection (see [packet sizes](design/protocol.md#packet-sizes-mtu)) |
@@ -102,21 +102,43 @@ the deployment.
   ~1.3 Gbit/s at 150 ms (see
   [benchmarks/congestion-control.md](benchmarks/congestion-control.md)).
 * `chunk_size` (16 KB) is the scheduling granularity.
-* `congestion`: `bbr` (default), `bbr-aggressive` (faster startup),
-  `bbr-conservative` (gentler startup; avoid on Wi-Fi/cellular paths with
-  low RTT, see [per-path BBR](design/congestion.md#per-path-bbr)), `cubic` (quic-go's built-in loss-based controller, for
-  comparison only: it collapses under random loss and fills deep buffers).
+* `congestion`: `bbr` (default: BBR version 3 on every path, with the
+  session rate over them, see
+  [congestion control](design/congestion.md)) or `cubic` (quic-go's built-in
+  loss-based controller, for comparison only: it collapses under random
+  loss and fills deep buffers). `bbr-aggressive` and `bbr-conservative`,
+  variants of the earlier controller, are accepted and mean `bbr`.
 * `no_dup`: disables duplication if the relay traffic is metered.
 * `up` / `down` (e.g. `"20mbit"`): this endpoint's uplink and downlink
   rates, if known. Ceilings for what the session sends and receives over
   all paths together; the rates are measured without them. Set them a
-  little below the real rates (95%) and the line's buffer stays empty. See
-  [session rate](design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow).
-* `no_coupling`: turns the session rate off; each path then probes for its
-  bottleneck on its own.
+  little below the real rates (95%) and the line's buffer stays empty,
+  also while a session starts. See
+  [session rate](design/congestion.md#session-rate-the-paths-estimates-add-up-to-what-is-delivered).
+* `loss_tolerance` (e.g. `"10%"`): for paths that are known to lose
+  packets at random. By default a path that loses more than 2% is taken to
+  be congested and slows down until it does not, which leaves a path with
+  5% random loss a fraction of its rate. With a tolerance, loss up to that
+  share is not taken for congestion. Set it per path where you can, in the
+  `servers` list of the dialing side:
+
+  ```json
+  "servers": [
+    "relay1.example.com:8388",
+    {"server": "relay2.example.com:8388", "loss_tolerance": "10%"}
+  ]
+  ```
+
+  The top-level key applies to every path of the endpoint. Either end's
+  setting covers both directions of a path. Set it to about twice the
+  path's loss rate (what is lost in one round trip varies), and only on
+  paths that need it: a tolerance is also what a policer or a full buffer
+  on that path may take before the path slows down. Above about 20% loss
+  it no longer helps. See
+  [loss tolerance](design/congestion.md#loss-tolerance).
 * `stats_interval` (`--stats N`): logs the session rate (`rate=`, `limit=`)
   and, per path, RTT, bandwidth estimate (`own=` when capped by the session
-  rate), bytes and `rate_drops` every N seconds: the first thing to look at
-  when a path misbehaves.
+  rate), bytes and loss every N seconds: the first thing to look at when a
+  path misbehaves.
 * `GOMAXPROCS` (environment): the number of threads is adapted to the load;
   setting it pins the number (see [design/README.md](design/README.md#threads)).

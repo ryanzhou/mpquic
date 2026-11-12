@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -154,5 +155,48 @@ func TestTUNConfig(t *testing.T) {
 	n.TUN.Routes[0], n.TUN.Addresses[0], n.TUN.Name = "x", "x", "x"
 	if c.TUN.Routes[0] != "10.0.0.0/8" || c.TUN.Addresses[0] != "10.99.0.1/24" || c.TUN.Name != "mpq0" {
 		t.Fatal("Clone shares the TUN config")
+	}
+}
+
+func TestLossTolerance(t *testing.T) {
+	for in, want := range map[string]Fraction{"10%": 0.1, "0.1": 0.1, " 2.5 % ": 0.025, "100%": 1, "1": 1, "0": 0, "0%": 0} {
+		if got, err := ParseFraction(in); err != nil || math.Abs(float64(got-want)) > 1e-12 {
+			t.Errorf("ParseFraction(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "some", "-1%", "101%", "1.5", "10", "NaN"} {
+		if _, err := ParseFraction(in); err == nil {
+			t.Errorf("ParseFraction(%q): no error", in)
+		}
+	}
+	var c Config
+	err := json.Unmarshal([]byte(`{"server": ["a", "b"], "loss_tolerance": "5%",
+		"servers": [{"server": "c", "loss_tolerance": 0.2}, "d", {"server": "e", "server_port": 9000, "loss_tolerance": "100%"}]}`), &c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LossTolerance != 0.05 {
+		t.Fatalf("loss_tolerance = %v", c.LossTolerance)
+	}
+	// one per server address, in the same order
+	addrs, tol := c.ServerAddrs(), c.PathLossTolerances()
+	want := []float64{0, 0, 0.2, 0, 1}
+	if len(addrs) != len(want) || len(tol) != len(want) {
+		t.Fatalf("%d addresses, %d tolerances", len(addrs), len(tol))
+	}
+	for i := range want {
+		if tol[i] != want[i] {
+			t.Fatalf("tolerances %v, want %v (servers %v)", tol, want, addrs)
+		}
+	}
+	b, _ := json.Marshal(struct {
+		A, B, C Fraction
+		D       Fraction `json:",omitempty"`
+	}{0.1, 0.025, 1, 0})
+	if string(b) != `{"A":"10%","B":"2.5%","C":"100%"}` {
+		t.Fatalf("marshal: %s", b)
+	}
+	if err := json.Unmarshal([]byte(`{"loss_tolerance": 30}`), &c); err == nil {
+		t.Fatal("a tolerance of 30 (no unit) accepted")
 	}
 }

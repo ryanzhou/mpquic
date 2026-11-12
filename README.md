@@ -107,6 +107,7 @@ per path.
 | `-b ADDR`, `-l PORT` | where the SOCKS5 proxy listens (127.0.0.1:1080) |
 | `-c FILE` | JSON config file instead of flags; see [`examples/`](examples) |
 | `--up RATE`, `--down RATE` | the rates of this end's line, if known |
+| `--loss-tolerance PCT` | for paths known to lose packets at random: how much loss is not congestion (default: 2%) |
 | `--reliable-udp` | carry UDP reliably, for datagrams too large for the paths and for lossy paths |
 | `--reverse` | the local has the public address and the remote connects to it |
 | `--stats N` | log the state of the session and of every path every N seconds |

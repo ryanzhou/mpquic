@@ -51,3 +51,13 @@ func TestTUNFlags(t *testing.T) {
 		t.Fatalf("plain local: %+v %v", cfg, err)
 	}
 }
+
+func TestLossToleranceFlag(t *testing.T) {
+	cfg, err := parseRole("remote", []string{"-s", "0.0.0.0", "-k", "pw", "--loss-tolerance", "10%"})
+	if err != nil || cfg.LossTolerance != 0.1 {
+		t.Fatalf("loss tolerance %v, %v", cfg, err)
+	}
+	if _, err := parseRole("remote", []string{"-s", "0.0.0.0", "-k", "pw", "--loss-tolerance", "10"}); err == nil {
+		t.Fatal("--loss-tolerance 10 accepted")
+	}
+}

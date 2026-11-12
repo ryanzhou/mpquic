@@ -28,9 +28,6 @@ type Metrics struct {
 	// packets sent / declared lost so far (quic-go only counts losses
 	// itself when its built-in controller is used)
 	PacketsSent, PacketsLost uint64
-	// StaleResets counts bandwidth estimates found stale (rate drop with a
-	// standing queue) and reset to the measured delivery rate.
-	StaleResets uint64
 	// RawBandwidth is the estimate without the rate cap (bytes/s).
 	RawBandwidth uint64
 	// AckedBytes / SentBytes count the bytes acknowledged and sent so far
@@ -58,10 +55,10 @@ type Meter struct {
 	lastMode string // of publish (the connection's goroutine)
 
 	appLimited atomic.Bool
+	hadNoData  atomic.Bool // ... at some moment since the controller last asked
 	probeGate  atomic.Pointer[ProbeGate]
 	sentPkts   atomic.Uint64
 	lostPkts   atomic.Uint64
-	stale      atomic.Uint64
 	rawBw      atomic.Uint64
 	acked      atomic.Uint64
 	sent       atomic.Uint64
@@ -73,6 +70,7 @@ type Meter struct {
 	rateCap    atomic.Uint64 // bytes/s, 0 = none
 	rateGain   atomic.Uint64 // math.Float64bits, 0 = none
 	restart    atomic.Bool
+	lossTol    atomic.Uint64 // math.Float64bits
 }
 
 var processStart = time.Now()
@@ -147,49 +145,67 @@ func (m *Meter) SetRateGain(g float64) { m.rateGain.Store(math.Float64bits(g)) }
 // in PROBE_BW; see bbr.Sender.Restart.
 func (m *Meter) Restart() { m.restart.Store(true) }
 
+// SetLossTolerance sets the share of loss (0..1) that the controller does
+// not take for congestion; see bbr.Sender.LossTolerance.
+func (m *Meter) SetLossTolerance(t float64) { m.lossTol.Store(math.Float64bits(t)) }
+
 // SetAppLimited tells the controller whether the application currently has
-// nothing to send on this connection.
+// nothing to send on this connection. Every moment without data counts,
+// however short: the controller is told at its next packet or
+// acknowledgement that there was one (appLimitedHint), as a TCP sender
+// notes the moment its send buffer runs empty. A path that the scheduler
+// feeds with gaps would otherwise have its lower delivery rate taken for
+// what it carries.
 func (m *Meter) SetAppLimited(v bool) {
+	if v {
+		m.hadNoData.Store(true)
+	}
 	if m.appLimited.Load() != v {
 		m.appLimited.Store(v)
 	}
 }
 
-var _ congestion.CongestionControlEx = (*Meter)(nil)
-
-// ParseProfile validates a congestion setting such as "bbr", "bbr-aggressive".
-func ParseProfile(s string) (bbr.Profile, error) {
-	s = strings.ToLower(strings.TrimSpace(s))
-	switch s {
-	case "", "bbr":
-		return bbr.ProfileStandard, nil
-	case "bbr-aggressive", "aggressive":
-		return bbr.ProfileAggressive, nil
-	case "bbr-conservative", "conservative":
-		return bbr.ProfileConservative, nil
-	case "cubic", "reno", "newreno":
-		return ProfileCubic, nil
-	}
-	return "", fmt.Errorf("unsupported congestion control %q (want bbr, bbr-aggressive, bbr-conservative, cubic)", s)
+func (m *Meter) appLimitedHint() bool {
+	had := m.hadNoData.Load() && m.hadNoData.Swap(false)
+	return m.appLimited.Load() || had
 }
 
-// ProfileCubic keeps quic-go's built-in CUBIC controller (for comparison).
-const ProfileCubic bbr.Profile = "cubic"
+var _ congestion.CongestionControlEx = (*Meter)(nil)
+
+// Congestion settings: BBR (version 3) on every path, or quic-go's built-in
+// CUBIC for comparison. "bbr-aggressive" and "bbr-conservative" named
+// variants of the earlier BBRv1 controller and now mean "bbr".
+const (
+	ProfileBBR   = "bbr"
+	ProfileCubic = "cubic"
+)
+
+// ParseProfile validates a congestion setting.
+func ParseProfile(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "bbr", "bbr-standard", "bbr-aggressive", "bbr-conservative":
+		return ProfileBBR, nil
+	case "cubic":
+		return ProfileCubic, nil
+	}
+	return "", fmt.Errorf("unsupported congestion control %q (bbr, cubic)", s)
+}
 
 // Install replaces the connection's congestion controller with a metered BBR.
 // It returns nil (keeping quic-go's built-in CUBIC) for ProfileCubic.
-func Install(conn *quic.Conn, profile bbr.Profile) *Meter {
+func Install(conn *quic.Conn, profile string) *Meter {
 	if profile == ProfileCubic {
 		return nil
 	}
 	// Seed with the connection's own initial packet size (see quic-go's
 	// Conn.InitialPacketSize): it is what quic-go sends until path MTU
 	// discovery reports more, and all it sends with a fixed MTU.
-	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize(), profile)}
-	m.s.AppLimitedHint = m.appLimited.Load
+	m := &Meter{s: bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize())}
+	m.s.AppLimitedHint = m.appLimitedHint
 	m.s.ProbeRTTGate = m.gate
 	m.s.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
 	m.s.RateGain = func() float64 { return math.Float64frombits(m.rateGain.Load()) }
+	m.s.LossTolerance = func() float64 { return math.Float64frombits(m.lossTol.Load()) }
 	conn.SetCongestionControl(m)
 	return m
 }
@@ -206,7 +222,6 @@ func (m *Meter) Snapshot() Metrics {
 
 		PacketsSent:  m.sentPkts.Load(),
 		PacketsLost:  m.lostPkts.Load(),
-		StaleResets:  m.stale.Load(),
 		RawBandwidth: m.rawBw.Load(),
 		AckedBytes:   m.acked.Load(),
 		SentBytes:    m.sent.Load(),
@@ -251,7 +266,6 @@ func (m *Meter) publish() {
 	m.bw.Store(m.s.BandwidthEstimate())
 	m.rawBw.Store(m.s.RawBandwidthEstimate())
 	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))
-	m.stale.Store(m.s.StaleResets)
 	if m.hasRTT.Load() {
 		m.minRTT.Store(int64(m.s.MinRTT()))
 		m.pacing.Store(m.s.PacingRateBytes())

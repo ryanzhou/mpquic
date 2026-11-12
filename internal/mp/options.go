@@ -42,18 +42,26 @@ type Options struct {
 	// NoDup disables opportunistic duplication of in-flight data onto idle
 	// faster paths (it is on by default; it only uses otherwise idle capacity).
 	NoDup bool
-	// NoCoupling disables the session rate: by default the paths' bandwidth
-	// estimates are capped so that they add up to what the session delivers
-	// over all of them together, which keeps paths behind a common
-	// bottleneck (an endpoint's uplink or downlink) from each probing for
-	// all of it (see coupling.go).
-	NoCoupling bool
 	// MaxSendRate / MaxRecvRate, if > 0, are ceilings for what the session
 	// sends and receives over all paths together, in bytes/s: the known
 	// rate of this endpoint's uplink and downlink. The receive limit is
-	// announced to the peer, which then sends no faster. The session still
-	// adapts below a limit; it never probes above it.
+	// announced to the peer, which then sends no faster. The paths still
+	// adapt below a limit; they never probe above it.
 	MaxSendRate, MaxRecvRate uint64
+	// LossTolerance (0..1) is for paths that are known to lose packets
+	// whatever the rate (a bad radio link, a route that drops at random):
+	// loss up to this share of what is sent is not taken for congestion.
+	// By default BBR accepts 2 % while it probes and slows down for any
+	// loss between probes, which costs most of the rate of a path that
+	// loses a few percent at random. At 1 loss is ignored altogether (as
+	// Hysteria's Brutal does); a path then relies on its delivery rate
+	// alone, and a policer or a shallow buffer on it drops what is sent
+	// above its rate. The value is announced to the peer, and a path uses
+	// the larger of what the two ends have configured for it.
+	LossTolerance float64
+	// PathLossTolerance (dialer side) is LossTolerance per server, in the
+	// order of the servers; 0 or missing: LossTolerance.
+	PathLossTolerance []float64
 	// MTU, if > 0, is the path MTU (IP packet size) of every path: QUIC
 	// packets get a fixed size that fits it (UDP payload = MTU - 28 for IPv4
 	// paths, - 48 for IPv6; 1200..1452) and path MTU discovery is off.

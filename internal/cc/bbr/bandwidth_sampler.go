@@ -493,6 +493,9 @@ type bandwidthSampler struct {
 
 	// True if connection option 'BSAO' is set.
 	overestimateAvoidance bool
+	// minRTT, if set, is the lowest round trip seen on the connection:
+	// rate samples over a shorter interval are discarded.
+	minRTT time.Duration
 
 	// True if connection option 'BBRB' is set.
 	limitMaxAckHeightTrackerBySendRate bool
@@ -818,6 +821,17 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime monotime.Time, packetNum
 	// always larger than the time of the previous packet, otherwise division by
 	// zero or integer underflow can occur.
 	if ackTime.Sub(a0.ackTime) <= 0 {
+		return *sample
+	}
+
+	// mpquic: a sample taken over less than the path's minimum round trip
+	// is not a reliable rate sample (draft-ietf-ccwg-bbr, GenerateRateSample:
+	// "if (RS.interval < C.min_rtt) return"). The data it counts was sent
+	// over a round trip; acknowledgements that arrive bunched make the
+	// interval shorter than that, and the rate too high.
+	if b.minRTT > 0 && ackTime.Sub(a0.ackTime) < b.minRTT {
+		sample.rtt = ackTime.Sub(sentPacketPointer.sentTime)
+		sentPacketToSendTimeState(sentPacketPointer, &sample.stateAtSend)
 		return *sample
 	}
 

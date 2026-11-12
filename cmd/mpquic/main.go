@@ -118,14 +118,18 @@ Common options (shadowsocks-compatible):
                     (-s = the local's address and relays forwarding to it)
 
 mpquic options:
-  --congestion CC   bbr (default), bbr-aggressive, bbr-conservative, cubic
+  --congestion CC   bbr (default; BBR version 3 on every path) or cubic
   --window SIZE     max per-stream window, auto-tuned from 4MB (default 64MB)
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths
   --up RATE         this endpoint's uplink rate, if known (e.g. 20mbit): never send more
   --down RATE       this endpoint's downlink rate (e.g. 100mbit): the peer never sends more
-  --no-coupling     do not rate-control the paths together (each path on its own)
+  --loss-tolerance PCT
+                    for paths known to lose packets at random: loss up to this
+                    share (e.g. 10%) is not taken for congestion; 100% ignores
+                    loss. Default: BBR's 2%. Per path: "loss_tolerance" in a
+                    "servers" entry of the config file
   --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
                     size, no MTU discovery (default: start at 1200-byte
                     packets and discover each path's MTU)
@@ -193,8 +197,8 @@ type commonFlags struct {
 	stats, mtu                 int
 	verbose, noDup, race       bool
 	reliableUDP                bool
-	noCoupling                 bool
 	up, down                   string
+	lossTol                    string
 	cert, key, sni, logLevel   string
 	plugin                     string
 	udp, udpOnly, reverse      bool
@@ -229,7 +233,7 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
 	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
-	fs.BoolVar(&f.noCoupling, "no-coupling", false, "do not rate-control the paths together")
+	fs.StringVar(&f.lossTol, "loss-tolerance", "", "share of loss not taken for congestion (e.g. 10%)")
 	fs.StringVar(&f.up, "up", "", "uplink rate of this endpoint (e.g. 20mbit)")
 	fs.StringVar(&f.down, "down", "", "downlink rate of this endpoint (e.g. 100mbit)")
 	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")
@@ -336,8 +340,12 @@ func (f *commonFlags) load() (*config.Config, error) {
 	if f.noDup {
 		cfg.NoDup = true
 	}
-	if f.noCoupling {
-		cfg.NoCoupling = true
+	if f.lossTol != "" {
+		t, err := config.ParseFraction(f.lossTol)
+		if err != nil {
+			return nil, fmt.Errorf("--loss-tolerance: %w", err)
+		}
+		cfg.LossTolerance = t
 	}
 	for _, x := range []struct {
 		v   string

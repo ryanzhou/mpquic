@@ -181,6 +181,15 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	// Also without a limit: the peer may remember one from before this end
 	// was restarted without it.
 	p.sendCtrl(encodeU64s(frLimit, s.opt.MaxRecvRate))
+	p.ownTol = s.opt.LossTolerance
+	if i := int(p.index); s.dialer && i < len(s.opt.PathLossTolerance) && s.opt.PathLossTolerance[i] > 0 {
+		p.ownTol = s.opt.PathLossTolerance[i]
+	}
+	p.ownTol = min(max(p.ownTol, 0), 1)
+	if p.ownTol > 0 {
+		p.applyToleranceLocked()
+		p.sendCtrl(encodeU64s(frTolerance, uint64(p.ownTol*1e6)))
+	}
 	if b := s.recentResetsLocked(time.Now()); len(b) > 0 {
 		p.sendCtrl(b)
 	}
@@ -459,6 +468,15 @@ func (s *Session) onCtrl(p *Path, typ uint64, body []byte) error {
 		}
 		s.mu.Lock()
 		s.cp.peerLimit = v[0]
+		s.mu.Unlock()
+	case frTolerance:
+		v, err := decodeU64s(body, 1)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		p.peerTol = float64(min(v[0], 1e6)) / 1e6
+		p.applyToleranceLocked()
 		s.mu.Unlock()
 	case frPathAck:
 		r := &byteReader{b: body}
@@ -809,8 +827,6 @@ type PathStat struct {
 	RecvBytes uint64
 	LostBytes uint64
 	Loss      float64 // estimated packet loss rate
-	// StaleResets: BBR bandwidth estimates reset after a rate drop
-	StaleResets uint64
 	// ReinjectBytes / DupBytes: chunk bytes sent again on this path, as
 	// reinjections (rescues of late or lost data, insurance copies) and
 	// opportunistic or eager duplicates. Included in SentBytes.
@@ -818,6 +834,9 @@ type PathStat struct {
 	// SharedCap: the path's share of the session rate (bytes/s), which caps
 	// its estimate; 0: not capped (its own estimate is below its share).
 	SharedCap uint64
+	// LossTolerance: the share of loss that the path's congestion
+	// controller does not take for congestion (0: BBR's own 2 %).
+	LossTolerance float64
 }
 
 // Stats returns per-path statistics.
@@ -840,9 +859,6 @@ func (s *Session) statsStringLocked() string {
 		st := p.statLocked()
 		fmt.Fprintf(&b, "%s[%s rtt=%v bw=%.1fMbit/s tx=%dMB rx=%dMB lost=%dKB", st.Name, st.State,
 			st.SRTT.Round(time.Millisecond), float64(st.Bandwidth)*8/1e6, st.SentBytes>>20, st.RecvBytes>>20, st.LostBytes>>10)
-		if st.StaleResets > 0 {
-			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
-		}
 		if st.SharedCap > 0 && st.SharedCap < p.cps.rawBw {
 			// capped at its share of the session rate; its own estimate
 			fmt.Fprintf(&b, " own=%.1fMbit/s", float64(p.cps.rawBw)*8/1e6)
