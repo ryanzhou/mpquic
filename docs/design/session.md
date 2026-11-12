@@ -173,11 +173,12 @@ The mechanisms, roughly in the order data meets them:
   messages stays in BBR STARTUP with its initial window; once it has carried
   a burst, it is rated at most twice its measured bandwidth instead of its
   initial-window rate, so a 1 Mbit/s relay isn't mistaken for a fast one.
-* **BBR ProbeRTT.** BBR cuts a path's window to 4 packets for ~200 ms every
-  ~10 s. While another path can carry the traffic, a path in ProbeRTT takes
-  no new data and the chunk stuck in its sender is resent elsewhere. The ProbeRTT interval is jittered per path
-  (7.5–12.5 s), and the paths of a session take turns: a path doesn't enter
-  ProbeRTT while another one is in it.
+* **BBR ProbeRTT.** Every 5 s without a new lowest round trip, BBR cuts a
+  path's window to half of what fits in the path for ~200 ms. While
+  another path can carry the traffic, a path in ProbeRTT takes no new data
+  and the chunk stuck in its sender is resent elsewhere. The paths of a
+  session take turns: a path doesn't enter ProbeRTT while another one is
+  in it.
 
 ## Path failure detection
 

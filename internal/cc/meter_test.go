@@ -28,3 +28,18 @@ func TestProbeGateSerialises(t *testing.T) {
 		t.Fatal("meter without a gate must always be allowed")
 	}
 }
+
+func TestParseProfile(t *testing.T) {
+	// the variants of the earlier BBRv1 controller still parse, as BBR
+	for _, in := range []string{"", "bbr", "BBR", "bbr-aggressive", "bbr-conservative"} {
+		if p, err := ParseProfile(in); err != nil || p != ProfileBBR {
+			t.Errorf("ParseProfile(%q) = %q, %v", in, p, err)
+		}
+	}
+	if p, err := ParseProfile("cubic"); err != nil || p != ProfileCubic {
+		t.Errorf("ParseProfile(cubic) = %q, %v", p, err)
+	}
+	if _, err := ParseProfile("vegas"); err == nil {
+		t.Error("vegas accepted")
+	}
+}

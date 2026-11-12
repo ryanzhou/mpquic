@@ -648,10 +648,10 @@ func (p *Path) rescueCost(n int, now time.Time) float64 {
 
 // usable reports whether new data may be scheduled on the path (and whether
 // it counts as capacity in scheduling decisions): not during BBR ProbeRTT,
-// when its window is cut to 4 packets for ~200 ms.
+// when its window is cut to half a BDP for ~200 ms.
 func (p *Path) usable() bool { return p.state == stateActive && !p.benched }
 
-// benchedLocked: p is in BBR ProbeRTT (window cut to 4 packets for ~200 ms)
+// benchedLocked: p is in BBR ProbeRTT (window cut to half a BDP for ~200 ms)
 // and another path can carry new data meanwhile. With no alternative, a
 // probing path still sends.
 func (p *Path) benchedLocked() bool {

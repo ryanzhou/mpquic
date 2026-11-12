@@ -264,8 +264,9 @@ func (b *Sender) initPacingRate() {
 // OnPacketSent implements the SendAlgorithm interface.
 func (b *Sender) OnPacketSent(sentTime monotime.Time, bytesInFlight congestion.ByteCount, packetNumber congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
 	appLimited := b.AppLimitedHint != nil && b.AppLimitedHint()
-	// BBRHandleRestartFromIdle
-	if bytesInFlight == 0 && appLimited {
+	// BBRHandleRestartFromIdle: nothing in flight, and the application had
+	// run out of data (now, or when the last packets were sent).
+	if bytesInFlight == 0 && (appLimited || b.sampler.IsAppLimited()) {
 		b.idleRestart = true
 		if b.isInProbeBW() {
 			b.setPacingRateWithGain(1)

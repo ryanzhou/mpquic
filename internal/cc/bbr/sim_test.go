@@ -552,6 +552,21 @@ func TestProbeGateIdlePath(t *testing.T) {
 	if b.MinRTT() != 50*time.Millisecond {
 		t.Errorf("min_rtt %v, want 50ms", b.MinRTT())
 	}
+	// The same after a pause without any packets, when data comes: the
+	// first round trip of the burst is the probe (BBRHandleRestartFromIdle),
+	// not a reason to cut the burst's window.
+	clk.t = clk.t.Add(8 * time.Second)
+	b.AppLimitedHint = func() bool { return false }
+	for i := 0; i < 10; i++ {
+		b.OnPacketSent(clk.t, congestion.ByteCount(i)*1200, pn+congestion.PacketNumber(i), 1200, true)
+	}
+	clk.t = clk.t.Add(50 * time.Millisecond)
+	for i := 0; i < 10; i++ {
+		b.OnCongestionEventEx(congestion.ByteCount(10-i)*1200, clk.t, []congestion.AckedPacketInfo{{PacketNumber: pn + congestion.PacketNumber(i), BytesAcked: 1200, ReceivedTime: clk.t}}, nil)
+		if held || b.st == stProbeRTT {
+			t.Fatalf("burst after a pause: gate held: %v, state %s", held, b.ModeName())
+		}
+	}
 }
 
 // Two flows share a bottleneck (two paths of a session behind the same

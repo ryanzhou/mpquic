@@ -16,6 +16,7 @@ func TestRoundTrip(t *testing.T) {
 		`{"role":"tunnel","server":["a:1"],"password":"pw","tunnel_address":"10.0.0.1:22","chunk_size":"8KB"}`,
 		`{"role":"tunnel","server":["a:1"],"password":"pw","tunnel_address":"10.0.0.1:53","mode":"tcp_and_udp","reliable_udp":true}`,
 		`{"role":"local","reverse":true,"password":"pw","local_port":1081}`,
+		`{"role":"local","server":["a:1"],"servers":[{"server":"b:2","loss_tolerance":"20%"}],"password":"pw","loss_tolerance":"5%","up":"20mbit"}`,
 		`{"role":"relay","relays":[{"listen":":9000","target":"h:8388"},{"listen":"0.0.0.0:9001","target":"h:8388","link":"delay=30ms,loss=0.5%","rev":"rate=10mbit"}]}`,
 	} {
 		var c config.Config

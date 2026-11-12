@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -232,7 +233,7 @@ func (f *Fraction) UnmarshalJSON(b []byte) error {
 
 // MarshalJSON writes the fraction as a percentage.
 func (f Fraction) MarshalJSON() ([]byte, error) {
-	return json.Marshal(strconv.FormatFloat(float64(f)*100, 'f', -1, 64) + "%")
+	return json.Marshal(strconv.FormatFloat(math.Round(float64(f)*1e6)/1e4, 'f', -1, 64) + "%")
 }
 
 // ParseFraction parses "10%" or "0.1".

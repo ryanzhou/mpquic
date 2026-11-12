@@ -2,9 +2,7 @@
 # Paths behind a common bottleneck: relays that are not the limit (or less
 # so) behind the sending endpoint's uplink (--shared) or in front of the
 # receiving endpoint's downlink (--shared-rx), and controls without a common
-# bottleneck. Each scenario runs with the session rate (the default) and
-# without it (--no-coupling: every path's BBR on its own), and prints one
-# line per run:
+# bottleneck. Prints one line per scenario:
 #   steady goodput
 #   relay: what the relays carried beyond the goodput, and the packets dropped
 #          at the uplink / at the relays / at the downlink
@@ -12,7 +10,7 @@
 #   est:   the sender's path estimates added up (p50/p90/max, Mbit/s)
 #   echo:  p50/p90 of a 100-byte round trip during the transfer (idle)
 #   p10:   goodput per 100 ms (10th percentile, minimum) and the longest stall
-# Usage: [DUR=12s] [MODES="coupled uncoupled"] scripts/shared-bench.sh [mpbench binary] [scenario...]
+# Usage: [DUR=12s] scripts/shared-bench.sh [mpbench binary] [scenario...]
 set -u
 B=${1:-./bin/mpbench}; shift || true
 P3="--path delay=10ms --path delay=25ms --path delay=40ms"
@@ -58,16 +56,12 @@ names=("$@")
 for n in "${names[@]}"; do
   [ -n "${S[$n]:-}" ] || { echo "unknown scenario $n (have: ${order[*]})" >&2; exit 1; }
   read -r -a args <<<"${S[$n]}"
-  for mode in ${MODES:-coupled uncoupled}; do
-    extra=()
-    [ "$mode" = uncoupled ] && extra=(--no-coupling)
-    out=$($B "${args[@]}" "${extra[@]}" --duration "${DUR:-12s}" --single=false 2>/dev/null)
-    steady=$(sed -nE 's/^bulk .*steady=([0-9.]+) Mbit.*/\1/p' <<<"$out" | tail -1)
-    relay=$(sed -nE 's/^relays .*goodput \(\+([0-9.-]+)%\); dropped: uplink ([0-9.]+)% relays ([0-9.]+)% downlink ([0-9.]+)%/relay +\1% drop \2\/\3\/\4%/p' <<<"$out" | tail -1)
-    wire=$(sed -nE 's/^wire .*reinject ([0-9.]+)% dup ([0-9.]+)%\).*/cp \1+\2%/p' <<<"$out" | tail -1)
-    est=$(sed -nE 's/^estimate .*p50=([0-9.]+) p90=([0-9.]+) max=([0-9.]+) .*/est \1\/\2\/\3/p' <<<"$out" | tail -1)
-    echo_=$(sed -nE 's/^loaded .*p50=([0-9.]+)ms p90=([0-9.]+)ms.*idle_p50=([0-9.]+)ms/echo \1\/\2 (idle \3)/p' <<<"$out" | tail -1)
-    jit=$(sed -nE 's/^jitter .*p10=([0-9.]+) .*min=([0-9.]+) .*stall=(.*)/p10 \1 min \2 stall \3/p' <<<"$out" | tail -1)
-    printf "%-22s %-9s %6s Mbit/s | %-34s | %-13s | %-22s | %-26s | %s\n" "$n" "$mode" "$steady" "$relay" "$wire" "$est" "$echo_" "$jit"
-  done
+  out=$($B "${args[@]}" --duration "${DUR:-12s}" --single=false 2>/dev/null)
+  steady=$(sed -nE 's/^bulk .*steady=([0-9.]+) Mbit.*/\1/p' <<<"$out" | tail -1)
+  relay=$(sed -nE 's/^relays .*goodput \(\+([0-9.-]+)%\); dropped: uplink ([0-9.]+)% relays ([0-9.]+)% downlink ([0-9.]+)%/relay +\1% drop \2\/\3\/\4%/p' <<<"$out" | tail -1)
+  wire=$(sed -nE 's/^wire .*reinject ([0-9.]+)% dup ([0-9.]+)%\).*/cp \1+\2%/p' <<<"$out" | tail -1)
+  est=$(sed -nE 's/^estimate .*p50=([0-9.]+) p90=([0-9.]+) max=([0-9.]+) .*/est \1\/\2\/\3/p' <<<"$out" | tail -1)
+  echo_=$(sed -nE 's/^loaded .*p50=([0-9.]+)ms p90=([0-9.]+)ms.*idle_p50=([0-9.]+)ms/echo \1\/\2 (idle \3)/p' <<<"$out" | tail -1)
+  jit=$(sed -nE 's/^jitter .*p10=([0-9.]+) .*min=([0-9.]+) .*stall=(.*)/p10 \1 min \2 stall \3/p' <<<"$out" | tail -1)
+  printf "%-22s %6s Mbit/s | %-34s | %-13s | %-22s | %-26s | %s\n" "$n" "$steady" "$relay" "$wire" "$est" "$echo_" "$jit"
 done

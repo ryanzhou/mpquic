@@ -21,7 +21,7 @@ maps the packages to the pages.
 | [design/README.md](design/README.md) | architecture, roles and reverse mode, why one QUIC connection per path, comparison with MPTCP |
 | [design/protocol.md](design/protocol.md) | path setup and authentication, frames, packet sizes |
 | [design/session.md](design/session.md) | streams, scheduling, acknowledgements, lossy paths, path failure |
-| [design/congestion.md](design/congestion.md) | per-path BBR and the session rate |
+| [design/congestion.md](design/congestion.md) | BBRv3 on every path, configured rates, loss tolerance |
 | [design/proxy.md](design/proxy.md) | TCP, UDP associations, reliable UDP, ping |
 | [design/packet-frontends.md](design/packet-frontends.md) | the userspace network stack behind WireGuard and the TUN interface |
 
