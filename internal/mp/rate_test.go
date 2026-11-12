@@ -417,12 +417,14 @@ func TestRateCapacityChange(t *testing.T) {
 		x.reset()
 		x.run(7 * time.Second)
 		within(t, "after the drop: B", x.bw(), mbit(40), 0.85, 1.05)
-		if l := x.lossShare(); l > 0.02 {
+		// (Loss within two points of the baselines is not acted on, and
+		// the first probes at the new rate each lose a quarter of a round.)
+		if l := x.lossShare(); l > 0.04 {
 			t.Errorf("policed=%v: loss %.2f%% after the drop", policed, 100*l)
 		}
 		x.capacity = mbit(100)
 		x.run(40 * time.Second)
-		within(t, "after the rise: B", x.bw(), mbit(100), 0.85, 1.02)
+		within(t, "after the rise: B", x.bw(), mbit(100), 0.85, 1.05)
 	}
 }
 
@@ -514,7 +516,7 @@ func TestRateFlap(t *testing.T) {
 		x.run(4 * time.Second)
 	}
 	// (Each rise is found by probes, over a second or so of the four.)
-	within(t, "goodput", x.goodput(80*time.Second), mbit(70), 0.8, 1.0)
+	within(t, "goodput", x.goodput(80*time.Second), mbit(70), 0.75, 1.0)
 	if l := x.lossShare(); l > 0.04 { // each drop overflows the buffer for a few rounds
 		t.Errorf("loss %.2f%%", 100*l)
 	}

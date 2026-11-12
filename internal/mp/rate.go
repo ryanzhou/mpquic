@@ -174,19 +174,16 @@ func (r *cpRate) lossAnswered(v float64) {
 	r.ceil = v
 }
 
-// judge decides, at the end of round k, what the probe of round r.at
-// showed: its packets were acknowledged in that round and the next, and
-// both have been counted by k = r.at+3 (a round's delivery counts two
-// rounds later, when its losses are known).
-//
-// Paths differ in delay, so a probe's packets reach the receiver interleaved
-// with those of the rounds around it, and only part of what a delivered
-// probe added shows in any one round: a third at least. A quarter counts.
-func (r *cpRate) judge(k int64, lossy bool) {
+// judge decides, at the end of round k = r.at+3, what the probe of round
+// r.at showed. Its packets were acknowledged in that round and the next
+// (which is sent at the rate itself, so that nothing else changes), and
+// mean is the delivery rate of the two together: if all of what the probe
+// added was delivered, half of it shows there. A quarter counts.
+func (r *cpRate) judge(k int64, lossy bool, mean float64) {
 	if r.at < 0 || k < r.at+3 {
 		return
 	}
-	found := !lossy && r.bw >= r.bw0*(1+(r.g0-1)/4)
+	found := !lossy && mean >= r.bw0*(1+(r.g0-1)/4)
 	switch {
 	case found:
 		// There is more. The next probe at once, and for twice as much
@@ -253,11 +250,21 @@ func cpDelivery(r2, r3 *cpRound, base float64) (v float64, ok bool) {
 	return min(r2.out/(1-min(base, 0.5)), max(r2.sent, r3.sent)), true
 }
 
+// cpProbed is the delivery rate (as a send rate) of rounds a and a+1
+// together, a probe and the round after it, of the rounds in hist.
+func cpProbed(hist *[8]cpRound, a int64, base float64) float64 {
+	h := func(r int64) *cpRound { return &hist[((r%8)+8)%8] }
+	d := func(r int64) float64 {
+		return min(h(r).out/(1-min(base, 0.5)), max(h(r).sent, h(r-1).sent))
+	}
+	return (d(a) + d(a+1)) / 2
+}
+
 // coupling is the session's part (sess.mu held).
 type coupling struct {
 	roundAt time.Time
 	roundNo int64 // the round under way
-	hist    [4]cpRound
+	hist    [8]cpRound
 
 	cpRate // B
 	phase  cpPhase
@@ -286,7 +293,7 @@ type cpPath struct {
 	baseAt time.Time
 
 	acked0 uint64 // bytes acknowledged when the round began
-	hist   [4]cpRound
+	hist   [8]cpRound
 
 	// lossBase is the share the path loses whatever the rate (random
 	// loss), as rounds show it in which the pipe was clearly not full.
@@ -436,9 +443,10 @@ func (s *Session) cpStartRoundLocked(now time.Time) {
 //     round's length (HyStart: the common bottleneck is filling its
 //     buffer; and it was busy all that time, so what came out in it is
 //     what it carries), or
-//   - the last two rounds lost more than the paths' baselines, on all paths,
-//     and it is not one burst (BBRv2 ends its start-up on loss in the same
-//     way).
+//   - the last two rounds lost more than the paths' baselines, on all paths
+//     whose baselines are known (the first rounds, while the pipe is not
+//     full, show them), and it is not one burst (BBRv2 ends its start-up
+//     on loss in the same way).
 //
 // From then on the session sends no more than is delivered.
 func (s *Session) cpStartupTickLocked(now time.Time, w time.Duration) {
@@ -466,7 +474,7 @@ func (s *Session) cpStartupTickLocked(now time.Time, w time.Duration) {
 		}
 		pk, pl := t0.Acked+t0.Lost+t1.Acked+t1.Lost, t0.Lost+t1.Lost
 		known, lost, expected = known+pk, lost+pl, expected+float64(pk)*c.lossBase
-		if cpExcess(pk, pl, c.lossBase) {
+		if c.lossOK && cpExcess(pk, pl, c.lossBase) {
 			lossy += pk
 		}
 		if t0.Sent+t1.Sent >= cpLoadedBytes {
@@ -506,7 +514,7 @@ func (s *Session) cpStartupTickLocked(now time.Time, w time.Duration) {
 	// A queue or loss says something about B only while the session sends
 	// what it may: one with little to send (the acknowledgements of a
 	// download) sees the other direction's queue and loss, not its own.
-	if allowed == 0 || used < cpStartBusy*allowed || !cp.hist[(k+3)%4].busy {
+	if allowed == 0 || used < cpStartBusy*allowed || !cp.hist[(k+7)%8].busy {
 		return
 	}
 	lossOver := known > 0 && float64(lossy) >= cpCommon*float64(known) &&
@@ -524,7 +532,7 @@ func (s *Session) cpStartupTickLocked(now time.Time, w time.Duration) {
 func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	cp := &s.cp
 	k := cp.roundNo
-	h := func(r int64) *cpRound { return &cp.hist[((r%4)+4)%4] }
+	h := func(r int64) *cpRound { return &cp.hist[((r%8)+8)%8] }
 	r1, r2, r3 := h(k-1), h(k-2), h(k-3)
 
 	// All paths: what rounds k-1 and k-2 sent and lost, what the baselines
@@ -541,11 +549,11 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if p.meter == nil || p.state == stateDead {
 			continue
 		}
-		ph := func(r int64) *cpRound { return &c.hist[((r%4)+4)%4] }
+		ph := func(r int64) *cpRound { return &c.hist[((r%8)+8)%8] }
 		t0, t1, t2 := p.meter.RoundStats(k), p.meter.RoundStats(k-1), p.meter.RoundStats(k-2)
 		blocked := p.meter.TakeBlocked()
 		// The path's part in round k.
-		pr := cpRound{dt: dt, plain: cp.gain == 1 && c.down == 0 && c.tryAt != k, sent: float64(t0.Sent) / dt.Seconds()}
+		pr := cpRound{dt: dt, plain: cp.phase == cpCruise && c.down == 0 && (c.tryAt < 0 || k > c.tryAt+1), sent: float64(t0.Sent) / dt.Seconds()}
 		if acked := p.meter.Acked(); acked >= c.acked0 {
 			pr.out = float64(acked-c.acked0) / dt.Seconds()
 		}
@@ -586,65 +594,6 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 			}
 		}
 
-		// The path's own rate: what a relay carries that is slower than the
-		// path's share of B, or that polices. It is found like B, but only
-		// from rounds in which the path's window held it back: the highest
-		// rate at which it delivered in the last ten of those (a path that
-		// delivers what it is given has shown no limit). It is known after
-		// three such rounds (acknowledgements that stall for a moment hold
-		// a path back, too), and from then on the path gets no more than
-		// that (cpShareLocked). And like B:
-		//
-		//   - When the path loses beyond its baseline for two rounds at its
-		//     plain share (not in a probe), its rate comes down by what it
-		//     lost.
-		//   - It is probed, one round at a quarter more and then as much
-		//     less until what that queued is gone, but with the other paths
-		//     getting that much less and more: that costs a common
-		//     bottleneck nothing, and shows what the path carries even
-		//     when the common bottleneck is full.
-		own := &c.own
-		if own.hold == 0 {
-			own.init()
-			c.tryAt = -1
-		}
-		base := min(c.lossBase, 0.5)
-		// (A round counts for the path's own rate if the path could not
-		// carry what it was given, or was being probed; and one in which
-		// it delivered more than that rate always does.)
-		if v, ok := cpDelivery(ph(k-2), ph(k-3), base); ok && k-3 > own.cut && (ph(k-2).held || own.bw > 0 && v > own.bw) {
-			own.push(v)
-		}
-		if c.bound || own.bw == 0 {
-			c.free = 0
-		} else if c.free++; c.free > cpRounds {
-			// An equal share of B has been less than its own rate for ten
-			// rounds: that says nothing about the path any more.
-			own.forget(k)
-		}
-		own.judge(k, ph(own.at).lossy)
-		if c.down > 0 {
-			if c.drainN++; float64(p.meter.Snapshot().InFlight) <= own.bw*c.noQueue() || c.drainN >= cpMaxDrain {
-				c.down = 0
-			}
-		}
-		switch p1, p2 := ph(k-1), ph(k-2); {
-		case c.tryAt == k:
-			c.down, c.drainN = max(2-own.probeGain, 0.5), 0
-		case x2 && x1 && p1.plain && p2.plain && c.lossOK && k-2 > own.cut:
-			// (as for B: what was not lost beyond the baseline is what the
-			// path takes, of the rate it was paced at)
-			v := own.bw
-			if v == 0 || float64(c.cap) < v {
-				v = float64(c.cap)
-			}
-			excess := float64(t1.Lost+t2.Lost)/float64(t1.Sent+t2.Sent) - c.lossBase
-			own.set(v * max(1-excess, cpCut))
-			own.counted = cpOwnKnown
-			own.lossAnswered(own.bw)
-			own.cut, own.next = k, k+own.hold
-		}
-		own.relax(k)
 	}
 	busy := allowed > 0 && used >= cpBusyFrac*allowed
 	if cp.phase == cpStartup {
@@ -663,19 +612,104 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	lossyRound1 := ok1 && float64(lossy1) >= cpCommon*float64(s1) && cpExcess(s1, l1, e1/float64(s1))
 	r2.lossy = ok2 && float64(lossy2) >= cpCommon*float64(s2) && cpExcess(s2, l2, e2/float64(s2))
 
-	// The baselines: a round shows what a path loses anyway if the pipe was
-	// clearly not full, that is, if the session and the path sent clearly
-	// less in it than they put out now, two rounds later (the round after a
-	// probe; a start-up's rounds while the rate still doubles).
-	if r2.sent < cpClearly*out {
-		for _, p := range s.paths {
-			if p.meter == nil || p.state == stateDead {
-				continue
+	for _, p := range s.paths {
+		c := &p.cps
+		if p.meter == nil || p.state == stateDead {
+			continue
+		}
+		ph := func(r int64) *cpRound { return &c.hist[((r%8)+8)%8] }
+		t1, t2 := p.meter.RoundStats(k-1), p.meter.RoundStats(k-2)
+		x1 := t1.Sent >= cpLoadedBytes && cpExcess(t1.Sent, t1.Lost, c.lossBase)
+		x2 := ph(k - 2).lossy
+		// The path's own rate: what a relay carries that is slower than the
+		// path's share of B, or that polices. It is found like B, but only
+		// from rounds in which the path's window held it back: the highest
+		// rate at which it delivered in the last ten of those (a path that
+		// delivers what it is given has shown no limit). It is known after
+		// three such rounds (acknowledgements that stall for a moment hold
+		// a path back, too), and from then on the path gets no more than
+		// that (cpShareLocked). And like B:
+		//
+		//   - When the path loses beyond its baseline for two rounds at its
+		//     plain share (not in a probe), and the session does not (that
+		//     is B's business), its rate comes down by what it lost.
+		//   - It is probed, one round at a quarter more and then as much
+		//     less until what that queued is gone, but with the other paths
+		//     getting that much less and more: that costs a common
+		//     bottleneck nothing, and shows what the path carries even
+		//     when the common bottleneck is full.
+		own := &c.own
+		if own.hold == 0 {
+			own.init()
+			c.tryAt = -1
+		}
+		base := min(c.lossBase, 0.5)
+		// (A round counts for the path's own rate if the path could not
+		// carry what it was given, or was being probed; and one in which
+		// it delivered more than that rate always does.)
+		if q2, q3 := ph(k-2), ph(k-3); k-3 <= own.cut {
+		} else if q2.held && q3.held {
+			// (whatever it lost: a relay whose buffer overflows passes
+			// what it carries)
+			own.push(min(q2.out/(1-base), max(q2.sent, q3.sent)))
+		} else if v, ok := cpDelivery(q2, q3, base); ok && own.bw > 0 && v > own.bw {
+			own.push(v)
+		}
+		if c.bound || own.bw == 0 {
+			c.free = 0
+		} else if c.free++; c.free > cpRounds {
+			// An equal share of B has been less than its own rate for ten
+			// rounds: that says nothing about the path any more.
+			own.forget(k)
+		}
+		own.judge(k, ph(own.at).lossy || ph(own.at+1).lossy, cpProbed(&c.hist, own.at, base))
+		if c.down > 0 {
+			if c.drainN++; float64(p.meter.Snapshot().InFlight) <= own.bw*c.noQueue() || c.drainN >= cpMaxDrain {
+				c.down = 0
 			}
-			c := &p.cps
-			if t2 := p.meter.RoundStats(k - 2); t2.Sent >= cpLoadedBytes && c.hist[((k-2)%4+4)%4].sent < cpClearly*c.hist[(k%4+4)%4].out {
-				c.learn(t2.Sent, t2.Lost)
+		}
+		switch p1, p2 := ph(k-1), ph(k-2); {
+		case c.tryAt >= 0 && k == c.tryAt+1:
+			c.down, c.drainN = max(2-own.g0, 0.5), 0
+		case x2 && x1 && c.lossOK && !r2.lossy && !lossyRound1 && p1.plain && p2.plain && k-2 > own.cut:
+			// (as for B: what was not lost beyond the baseline is what the
+			// path takes, of the rate it was paced at; or of the rate at
+			// which it sent, if its window held it to that)
+			v := own.bw
+			if v == 0 || float64(c.cap) < v {
+				v = float64(c.cap)
 			}
+			if p1.held && p2.held {
+				v = min(v, max(p1.sent, p2.sent))
+			}
+			excess := float64(t1.Lost+t2.Lost)/float64(t1.Sent+t2.Sent) - c.lossBase
+			own.set(v * max(1-excess, cpCut))
+			own.counted = cpOwnKnown
+			own.lossAnswered(own.bw)
+			own.cut, own.next = k, k+own.hold
+			// (half of it until what queued at the relay is gone, like
+			// the session after a cut)
+			c.down, c.drainN = 0.5, 0
+		}
+		own.relax(k)
+	}
+
+	// The baselines: what a path loses whatever the rate. A round shows
+	// that if the pipe was clearly not full in it: the session and the
+	// path sent clearly less than they put out now, two rounds later.
+	// These are the round after a probe, the round at half rate after a
+	// cut for loss (so loss that does not come with the rate is in the
+	// baseline two rounds after it was taken for the pipe's, and is not
+	// acted on again), and a start-up's rounds while the rate still
+	// doubles.
+	for _, p := range s.paths {
+		if p.meter == nil || p.state == stateDead {
+			continue
+		}
+		c := &p.cps
+		t2 := p.meter.RoundStats(k - 2)
+		if t2.Sent >= cpLoadedBytes && c.hist[((k-2)%8+8)%8].sent < cpClearly*c.hist[(k%8+8)%8].out && r2.sent < cpClearly*out {
+			c.learn(t2.Sent, t2.Lost)
 		}
 	}
 
@@ -709,7 +743,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if v, ok := cpDelivery(r2, r3, base2); ok && k-3 > cp.cut {
 			cp.push(v)
 		}
-		cp.judge(k, h(cp.at).lossy)
+		cp.judge(k, h(cp.at).lossy || h(cp.at+1).lossy, cpProbed(&cp.hist, cp.at, base2))
 		// Loss beyond the baselines on all paths, in two rounds in a row
 		// that were paced at B: B is more than the pipe takes (a policer, a
 		// buffer that is full). What was not lost is what it takes: B
@@ -735,9 +769,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	switch {
 	case cp.phase == cpDrain && was != cpDrain:
 		cp.drainN = 0 // begun above: after the start-up, or a cut
+	case cp.phase == cpProbe && k == cp.at:
+		// One more round at B, in which the probe's packets are
+		// acknowledged: the two rounds together show what it delivered.
 	case cp.phase == cpProbe:
-		// While the probe's acknowledgements come in, send as much less as
-		// the probe sent more: what it queued is gone by the time we know.
+		// Then as much less as the probe sent more: what it queued is
+		// gone again.
 		cp.phase, cp.drainN = cpDrain, 0
 	case cp.phase == cpDrain:
 		// Until no more is in flight than B needs over a round trip
@@ -755,10 +792,12 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 	switch {
 	case cp.phase == cpStartup:
 		cp.gain = cpStartGain
-	case cp.phase == cpProbe:
+	case cp.phase == cpProbe && was != cpProbe:
 		cp.gain = cp.probeGain
+	case cp.phase == cpProbe:
+		cp.gain = 1
 	case cp.phase == cpDrain && was == cpProbe:
-		cp.gain = max(2-h(k).gain, 0.5) // as much less as the probe sent more
+		cp.gain = max(2-cp.g0, 0.5) // as much less as the probe sent more
 	case cp.phase == cpDrain && was != cpDrain:
 		cp.gain = 0.5 // after a start-up or a cut, a round's worth may be queued
 	case cp.phase == cpCruise:
@@ -775,8 +814,10 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		if p.meter == nil || p.state == stateDead {
 			continue
 		}
-		c.tryAt = -1
-		if own := &c.own; cp.phase == cpCruise && was == cpCruise && busy && c.bound && c.down == 0 && own.at < 0 && k >= own.next &&
+		if c.tryAt >= 0 && k > c.tryAt {
+			c.tryAt = -1
+		}
+		if own := &c.own; c.tryAt < 0 && cp.phase == cpCruise && was == cpCruise && busy && c.bound && c.down == 0 && own.at < 0 && k >= own.next &&
 			own.bw*own.probeGain <= c.fair {
 			c.tryAt, own.at, own.bw0, own.g0 = k+1, k+1, own.bw, own.probeGain
 		}
@@ -785,7 +826,7 @@ func (s *Session) cpRoundLocked(now time.Time, dt time.Duration, limit uint64) {
 		var b strings.Builder
 		for _, p := range s.paths {
 			if c := &p.cps; p.meter != nil && p.state != stateDead {
-				fmt.Fprintf(&b, " %d:%.1f", p.id, c.hist[(k%4+4)%4].out*8/1e6)
+				fmt.Fprintf(&b, " %d:%.1f", p.id, c.hist[(k%8+8)%8].out*8/1e6)
 				if c.bound {
 					fmt.Fprintf(&b, "<%.1f", c.own.bw*8/1e6)
 				}
@@ -859,7 +900,7 @@ func (s *Session) cpShareLocked(limit uint64) {
 			// that cannot follow.) And not before it is known.
 			return 0
 		case c.tryAt == cp.roundNo:
-			return c.own.bw * c.own.probeGain
+			return c.own.bw * c.own.g0
 		case c.down > 0:
 			return c.own.bw * c.down
 		}
