@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"mpquic/internal/cc"
 	"mpquic/internal/config"
 	"mpquic/internal/ipstack"
 	"mpquic/internal/linkem"
@@ -100,6 +101,9 @@ func Validate(role string, cfg *config.Config) error {
 	}
 	if cfg.EffectivePassword() == "" {
 		return errors.New("password is required (-k or \"password\")")
+	}
+	if _, err := cc.ParseProfile(cfg.Congestion); err != nil {
+		return err
 	}
 	if err := checkPort("server port", cfg.ServerPort); err != nil {
 		return err
@@ -212,9 +216,11 @@ func options(cfg *config.Config, log *slog.Logger) *mp.Options {
 		Password:      cfg.EffectivePassword(),
 		Window:        int64(cfg.Window),
 		ChunkSize:     int(cfg.ChunkSize),
+		Congestion:    cfg.Congestion,
 		IdleTimeout:   time.Duration(cfg.Timeout) * time.Second,
 		StatsInterval: time.Duration(cfg.StatsInterval) * time.Second,
 		NoDup:         cfg.NoDup,
+		NoCoupling:    cfg.NoCoupling,
 		MaxSendRate:   cfg.Up.BytesPerSecond(),
 		MaxRecvRate:   cfg.Down.BytesPerSecond(),
 		MTU:           cfg.MTU,

@@ -86,8 +86,11 @@ decides what this path should send, in priority order:
 
    *Estimates.* `owd = min(SRTT, max(latest RTT, min RTT)) / 2`: it reacts
    immediately when a queue drains, and smoothly when one builds.
-   `rate` is the path's share of the session rate (see
-   [congestion.md](congestion.md#shares)). `stall_q` charges a path whose writer has been blocked
+   `rate = max(BBR bottleneck bandwidth, cwnd / (2·minRTT))` while BBR is in
+   STARTUP or has no estimate; the second term keeps the estimate sane while
+   BBR's own estimate is still application-limited (capped at twice the
+   measured bandwidth once the path has carried a burst; see "Lossy and
+   misbehaving paths"). `stall_q` charges a path whose writer has been blocked
    much longer than its rate implies, which happens with a silently dead path.
 
 3. **Opportunistic duplication (only on otherwise idle capacity).** An idle
@@ -142,7 +145,8 @@ The mechanisms, roughly in the order data meets them:
   paths will have delivered by the time its chunk arrives, pessimistically:
   `ahead = R_total · (safe_p − est_front)`. `safe` is a path's delivery
   estimate plus a margin: jitter, and on lossy paths the time to notice a
-  loss and resend on the best path. The front is carried by the path with the
+  loss and resend on the best path; paths in BBR STARTUP (whose queue is
+  still growing) get one more RTT. The front is carried by the path with the
   lowest `safe`, so a lossy path with a short RTT takes data from ahead too,
   instead of leaving holes right at the front. Estimates include a decaying
   record of recent queueing-delay spikes (`late`), so a relay whose
@@ -165,10 +169,15 @@ The mechanisms, roughly in the order data meets them:
   interactive transfer placed on a lossy path is also queued for a copy on
   the best other path (same token bucket as eager redundancy). Its latency is
   then bounded by what the clean path alone would deliver.
-* **Honest rate of thin paths.** A path whose relay is slower than its
-  share of the session rate is held to what it delivers (see
-  [congestion.md](congestion.md#a-paths-own-rate)), so a 1 Mbit/s relay
-  isn't mistaken for a fast one.
+* **Honest rate of thin paths.** A path that only ever carried small
+  messages stays in BBR STARTUP with its initial window; once it has carried
+  a burst, it is rated at most twice its measured bandwidth instead of its
+  initial-window rate, so a 1 Mbit/s relay isn't mistaken for a fast one.
+* **BBR ProbeRTT.** BBR cuts a path's window to 4 packets for ~200 ms every
+  ~10 s. While another path can carry the traffic, a path in ProbeRTT takes
+  no new data and the chunk stuck in its sender is resent elsewhere. The ProbeRTT interval is jittered per path
+  (7.5–12.5 s), and the paths of a session take turns: a path doesn't enter
+  ProbeRTT while another one is in it.
 
 ## Path failure detection
 

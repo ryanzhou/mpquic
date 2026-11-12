@@ -38,6 +38,7 @@ type Config struct {
 	// "server_port", i.e. its own public address) and the remote dials the
 	// local through the "server" list (the local's address and relays).
 	Reverse       bool   `json:"reverse,omitempty"`
+	Congestion    string `json:"congestion,omitempty"`
 	Window        Size   `json:"window,omitempty"`
 	ChunkSize     Size   `json:"chunk_size,omitempty"`
 	StatsInterval int    `json:"stats_interval,omitempty"`
@@ -47,6 +48,7 @@ type Config struct {
 	Key           string `json:"key,omitempty"`
 	SNI           string `json:"sni,omitempty"`
 	NoDup         bool   `json:"no_dup,omitempty"`
+	NoCoupling    bool   `json:"no_coupling,omitempty"` // paths are not rate-controlled together
 	// Up / Down: the rate of this endpoint's uplink / downlink ("20mbit";
 	// a number is bit/s), if known. The session then sends no more than Up
 	// over all paths together, and tells the peer to send no more than

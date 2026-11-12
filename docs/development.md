@@ -61,6 +61,7 @@ of [benchmarks/congestion-control.md](benchmarks/congestion-control.md).
 |---|---|
 | `MPQUIC_TRACE=1` | log every scheduling decision |
 | `MPQUIC_RATE_DEBUG=1` | log every round of the session rate |
+| `MPQUIC_COUPLE=0` | turn the session rate off (as `--no-coupling`) |
 | `MPQUIC_DGRAM_LOSS=FRACTION` | the path loss from which stream data travels as datagrams (default 0.08) |
 | `GOMAXPROCS=N` | pin the number of threads |
 

@@ -29,6 +29,7 @@ type Form struct {
 	LocalPort   string
 	Tunnel      string
 	Relays      string // one relay per line, see FormatRelays
+	Congestion  string
 	Window      string
 	Chunk       string
 	Timeout     string
@@ -91,6 +92,7 @@ func FormFromConfig(c *config.Config) Form {
 		LocalPort:   itoa(c.LocalPort),
 		Tunnel:      c.TunnelAddress,
 		Relays:      FormatRelays(c.Relays),
+		Congestion:  c.Congestion,
 		Window:      size(c.Window),
 		Chunk:       size(c.ChunkSize),
 		Timeout:     itoa(c.Timeout),
@@ -192,6 +194,7 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		c.LocalAddress = strings.TrimSpace(f.LocalAddr)
 		num("Listen port", f.LocalPort, &c.LocalPort)
 		c.TunnelAddress = strings.TrimSpace(f.Tunnel)
+		c.Congestion = strings.TrimSpace(f.Congestion)
 		sz("Window", f.Window, &c.Window)
 		sz("Chunk size", f.Chunk, &c.ChunkSize)
 		num("Idle timeout", f.Timeout, &c.Timeout)

@@ -405,16 +405,43 @@ type serverOpener struct{ s *Server }
 
 func (o *serverOpener) OpenStream() (*Stream, error) { return o.s.OpenStream() }
 
-// A path's rate is its share of the session rate; before it has one, the
-// initial window per round trip.
-func TestPathRate(t *testing.T) {
-	p := &Path{srtt: 20 * time.Millisecond, minRTT: 20 * time.Millisecond}
-	if got, want := p.rate(), float64(cpStartWindow)/0.02; got != want {
-		t.Fatalf("fresh path: rate %.0f, want %.0f", got, want)
+// A path that only ever carried small messages stays in BBR STARTUP with its
+// initial window; once it carried a burst, its rate must follow the measured
+// bandwidth rather than the (optimistic) window-based floor.
+func TestRateThinPathInStartup(t *testing.T) {
+	p := &Path{srtt: 20 * time.Millisecond, minRTT: 20 * time.Millisecond, cwnd: 32 * 1200, bw: 2 << 10, ccMode: "startup"} // bw from pings
+	floor := float64(p.cwnd) / (2 * p.minRTT.Seconds())
+	if got := p.rate(); got != floor {
+		t.Fatalf("fresh path: rate %.0f, want window floor %.0f", got, floor)
 	}
-	p.bw = 100 << 10
+	p.bw = 100 << 10 // 100 KB/s measured after a burst
+	p.burstSeen = true
+	if got := p.rate(); got > 2*float64(p.bw) {
+		t.Fatalf("thin path: rate %.0f exceeds 2x measured %d", got, p.bw)
+	}
+	p.ccMode = "probe_bw"
 	if got := p.rate(); got != float64(p.bw) {
-		t.Fatalf("rate %.0f, want the share %d", got, p.bw)
+		t.Fatalf("probe_bw: rate %.0f, want %d", got, p.bw)
+	}
+}
+
+// A ProbeRTT path sits out only if another path can carry the traffic; the
+// last working path must never be benched.
+func TestBenchedNeedsAlternative(t *testing.T) {
+	s := &Session{}
+	a := &Path{sess: s, state: stateActive, ccMode: "probe_rtt"}
+	s.paths = []*Path{a}
+	if a.benchedLocked() {
+		t.Fatal("only path benched")
+	}
+	b := &Path{sess: s, state: stateActive, ccMode: "probe_rtt"}
+	s.paths = append(s.paths, b)
+	if a.benchedLocked() || b.benchedLocked() {
+		t.Fatal("benched although the alternative is itself probing")
+	}
+	b.ccMode = "probe_bw"
+	if !a.benchedLocked() || b.benchedLocked() {
+		t.Fatal("probing path not benched although a good one exists")
 	}
 }
 

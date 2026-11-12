@@ -40,7 +40,9 @@ var roleLabels = []string{
 }
 
 var (
-	logLevels = []string{"info", "debug", "warn", "error"}
+	congestionValues = []string{"", "bbr-aggressive", "bbr-conservative", "cubic"}
+	congestionLabels = []string{"bbr (default)", "bbr-aggressive", "bbr-conservative", "cubic (quic-go built-in)"}
+	logLevels        = []string{"info", "debug", "warn", "error"}
 )
 
 const logTab = 2
@@ -56,7 +58,7 @@ type ui struct {
 	status winsvc.Status
 
 	mw                                     *walk.MainWindow
-	nameCB, roleCB, logCB                  *walk.ComboBox
+	nameCB, roleCB, congCB, logCB          *walk.ComboBox
 	reverseCB, udpCB, noDupCB, showPwCB    *walk.CheckBox
 	raceCB, reliableCB                     *walk.CheckBox
 	statusLbl, hintLbl, pathsLbl, portLbl  *walk.Label
@@ -228,6 +230,8 @@ func (u *ui) create() error {
 				}},
 				{Title: "Advanced", Layout: VBox{}, Children: []Widget{
 					GroupBox{AssignTo: &u.quicGB, Title: "QUIC", Layout: Grid{Columns: 3}, Children: []Widget{
+						Label{Text: "Congestion control:", TextAlignment: AlignFar},
+						ComboBox{AssignTo: &u.congCB, Model: congestionLabels, ColumnSpan: 2},
 						Label{Text: "Max stream window:", TextAlignment: AlignFar},
 						LineEdit{AssignTo: &u.windowLE, CueBanner: "64MB", ColumnSpan: 2},
 						Label{Text: "Chunk size:", TextAlignment: AlignFar},
@@ -302,6 +306,18 @@ func indexOf(list []string, v string) int {
 	return -1
 }
 
+func congestionIndex(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "bbr-aggressive", "aggressive":
+		return 1
+	case "bbr-conservative", "conservative":
+		return 2
+	case "cubic", "reno", "newreno":
+		return 3
+	}
+	return 0
+}
+
 // crlf converts newlines for the Win32 edit control.
 func crlf(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\r\n")
@@ -319,6 +335,7 @@ func (u *ui) setForm(f Form) {
 	u.lportLE.SetText(f.LocalPort)
 	u.tunnelLE.SetText(f.Tunnel)
 	u.relaysTE.SetText(crlf(f.Relays))
+	u.congCB.SetCurrentIndex(congestionIndex(f.Congestion))
 	u.windowLE.SetText(f.Window)
 	u.chunkLE.SetText(f.Chunk)
 	u.timeoutLE.SetText(f.Timeout)
@@ -338,6 +355,10 @@ func (u *ui) readForm() Form {
 	if i := u.roleCB.CurrentIndex(); i >= 0 && i < 4 {
 		role = []string{"local", "tunnel", "remote", "relay"}[i]
 	}
+	cong := ""
+	if i := u.congCB.CurrentIndex(); i > 0 && i < len(congestionValues) {
+		cong = congestionValues[i]
+	}
 	level := "info"
 	if i := u.logCB.CurrentIndex(); i >= 0 && i < len(logLevels) {
 		level = logLevels[i]
@@ -354,6 +375,7 @@ func (u *ui) readForm() Form {
 		LocalPort:   strings.TrimSpace(u.lportLE.Text()),
 		Tunnel:      strings.TrimSpace(u.tunnelLE.Text()),
 		Relays:      nl(u.relaysTE.Text()),
+		Congestion:  cong,
 		Window:      strings.TrimSpace(u.windowLE.Text()),
 		Chunk:       strings.TrimSpace(u.chunkLE.Text()),
 		Timeout:     strings.TrimSpace(u.timeoutLE.Text()),
@@ -708,7 +730,7 @@ func (u *ui) refreshLog() {
 func (u *ui) smokeTest() error {
 	for _, js := range []*config.Config{
 		{Role: "local", Server: config.StringList{"203.0.113.10", "relay:9000"}, ServerPort: 8443, Password: "pw", Mode: "tcp_and_udp",
-			LocalAddress: "0.0.0.0", LocalPort: 1081, Window: 32 << 20, Timeout: 60, LogLevel: "debug", StatsInterval: 30},
+			LocalAddress: "0.0.0.0", LocalPort: 1081, Congestion: "bbr-aggressive", Window: 32 << 20, Timeout: 60, LogLevel: "debug", StatsInterval: 30},
 		{Role: "tunnel", Server: config.StringList{"a:1"}, Password: "pw", TunnelAddress: "10.0.0.1:22", ChunkSize: 8 << 10, NoDup: true},
 		{Role: "remote", Reverse: true, Server: config.StringList{"198.51.100.7:8388"}, Password: "pw", Cert: `C:\c.pem`, Key: `C:\k.pem`, SNI: "x", RaceConnect: true},
 		{Role: "relay", Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:8388", Link: "delay=40ms", Rev: "loss=1%"}}, LogLevel: "warn"},

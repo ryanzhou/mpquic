@@ -1,70 +1,24 @@
 # Congestion control benchmarks
 
-**One bulk stream over one emulated path**, at 150 ms RTT (75 ms each way)
-unless noted: `mpbench` with a single `internal/linkem` path (the same
-impairment in both directions).
+Each path runs its own BBRv1 sender (vendored from Hysteria, with mpquic's
+changes described in [design/congestion.md](../design/congestion.md#per-path-bbr)). This page
+measures it: **one bulk stream over one emulated path at 150 ms RTT** (75 ms
+each way), produced by `scripts/cc-bench.py`. It runs `mpbench` with a single
+`internal/linkem` path (the same impairment in both directions), 15 s per run.
 
-* **Mbit/s**: steady-state goodput after the first 2 s. The link rate
-  includes UDP/IP overhead, so the ceiling is ~96% of it.
+* **Mbit/s**: steady-state goodput after the first 2 s. **eff** is goodput
+  divided by the link rate. The link rate includes UDP/IP overhead, so the
+  ceiling is ~96%.
 * **ramp**: time until the first 0.5 s interval reaches 90% of the steady rate.
 * **+latency p50/p90**: what the transfer adds to the latency of other
   streams through the tunnel: a 100-byte echo every 100 ms during the
   transfer, minus the idle echo time. This is bufferbloat as the user sees it.
-* **dropped**: packets dropped at the link (random loss included).
 
-## One path: the session controller and per-path BBR
+`bbr` is the default. `cubic` is quic-go's built-in loss-based controller,
+selectable with `--congestion cubic` for comparison. Single runs; flapping
+links and high rates vary by several percent between runs.
 
-With one path the session's rate controller
-([design](../design/congestion.md)) does the whole job. The table compares
-it with the previous release, where every path ran its own BBR (still
-available as `--no-coupling`), on the same machine; 12 s runs, single runs.
-
-| link | per-path BBR: Mbit/s | ramp | +latency p50/p90 | dropped | session: Mbit/s | ramp | +latency p50/p90 | dropped |
-|---|---|---|---|---|---|---|---|---|
-| 10 Mbit/s | 9.2 | 1.5s | +12/+39 ms | 0.97% | **9.5** | 1.0s | +4/+11 ms | 0.54% |
-| 100 Mbit/s | 90.9 | 2.0s | +6/+33 ms | 0.65% | **96.7** | 2.5s | +10/+22 ms | 0.60% |
-| 300 Mbit/s | 269.4 | 2.5s | +8/+49 ms | 1.02% | **278.5** | 3.0s | +1/+25 ms | 0.57% |
-| 1 Gbit/s | 885.1 | 4.5s | +10/+60 ms | 0.37% | **886.2** | 3.5s | +17/+89 ms | 0.00% |
-| unlimited | 607.1 | 2.5s | +2/+169 ms | 0.00% | **938.3** | 3.0s | +0/+8 ms | 0.00% |
-| 100 Mbit/s, 0.5% loss | 90.8 | 2.0s | +4/+39 ms | 1.04% | **95.7** | 2.5s | +3/+12 ms | 0.94% |
-| 100 Mbit/s, 2% loss | 92.5 | 2.5s | +2/+27 ms | 2.77% | **96.2** | 2.5s | +3/+21 ms | 2.41% |
-| 100 Mbit/s, 5% loss | 86.3 | 2.0s | +2/+25 ms | 5.37% | **93.9** | 3.0s | +2/+154 ms | 5.29% |
-| 100 Mbit/s, 10% loss | 75.9 | 2.5s | +0/+0 ms | 10.27% | **77.6** | 3.0s | +22/+206 ms | 10.18% |
-| 100 Mbit/s, 2% loss in bursts of 5 | 96.8 | 2.5s | +2/+19 ms | 3.06% | **94.7** | 2.5s | +17/+41 ms | 2.68% |
-| 100 Mbit/s, 5 ms buffer | 92.2 | 2.0s | +4/+6 ms | 6.51% | **90.6** | 2.5s | +2/+4 ms | 1.68% |
-| 100 Mbit/s, 20 ms buffer | 94.0 | 2.0s | +8/+20 ms | 4.17% | **90.1** | 2.0s | +2/+3 ms | 1.70% |
-| 100 Mbit/s, 300 ms buffer | 92.8 | 1.5s | +8/+47 ms | 0.00% | **95.0** | 2.0s | +2/+11 ms | 0.00% |
-| 100 Mbit/s, 10 ms jitter | 92.4 | 2.5s | +24/+51 ms | 0.76% | **94.5** | 2.5s | +20/+31 ms | 0.57% |
-| 100 Mbit/s, 2% reordered | 92.4 | 2.0s | +2/+28 ms | 0.46% | **94.0** | 2.5s | +2/+21 ms | 0.47% |
-| policer, 100 Mbit/s | 99.0 | 2.5s | +1/+3 ms | 14.50% | **94.7** | 2.5s | +1/+2 ms | 2.70% |
-| 20 Mbit/s, 2 s buffer | 18.4 | 1.5s | +11/+47 ms | 0.00% | **19.1** | 1.5s | +9/+15 ms | 0.00% |
-| 40 ↔ 5 Mbit/s every 3 s, 2 s buffer | 9.4 | 1.0s | +154/+1585 ms | 3.25% | **8.6** | 1.0s | +155/+2002 ms | 11.47% |
-| 100 ↔ 20 Mbit/s every 3 s, 1 s buffer | 34.0 | 1.5s | +49/+1004 ms | 5.92% | **33.1** | 1.5s | +6/+752 ms | 7.56% |
-| 100 Mbit/s at 20 ms RTT | 95.3 | 1.0s | +5/+10 ms | 0.00% | **94.6** | 1.0s | +2/+7 ms | 0.00% |
-| 100 Mbit/s, 5% loss, at 20 ms RTT | 92.2 | 1.0s | +2/+24 ms | 4.96% | **93.1** | 1.0s | +3/+25 ms | 5.10% |
-
-* On a steady link the two are close, the session a little higher (it
-  does not cycle through BBR's 0.75 phase every eight round trips) and
-  with less added latency.
-* **A policer** is where they differ most: BBR follows the highest rate
-  the policer let through and keeps probing above it (14.5% dropped); the
-  session backs off below it and probes rarely (2.7%), at 95 instead of
-  99 Mbit/s. Shallow buffers (5–20 ms) likewise: 1.7% dropped instead of
-  4–7%, at 90 instead of 92–94 Mbit/s.
-* **Random loss** is not taken for congestion by either: 94–96 Mbit/s up
-  to 5% loss and ~78 at 10%, and 88–96 when 2% loss comes in bursts (the
-  latency's tail is longer at 5–10% loss: p90 +150–200 ms against +25).
-* **A rate that flaps over a deep buffer** is the session's weak spot: the
-  same goodput, but when the rate drops by 5–8× the queue that built up at
-  the old rate overflows a 1–2 s buffer more often than with BBR's stale
-  estimate reset (7–18% dropped against 3–6% in three runs each).
-
-The rest of this page was measured with per-path BBR and describes that
-controller in detail; it applies to `--no-coupling` today. `cubic` is
-quic-go's built-in loss-based controller, selectable with `--congestion
-cubic` for comparison.
-
-## Per-path BBR: headline
+## Headline
 
 | link | BBR goodput | note |
 |---|---|---|
@@ -81,7 +35,7 @@ however deep the bottleneck buffer; CUBIC fills the buffer (+250–500 ms with
 ## Bufferbloat: before and after
 
 Stock BBRv1 (mpquic ≤ v0.1.0) had three problems with queues, fixed in the
-default profile (details in [design/congestion.md](../design/congestion.md#without-the-session-rate-bbr-per-path)):
+default profile (details in [design/congestion.md](../design/congestion.md#per-path-bbr)):
 
 1. **A standing queue of one BDP** on a saturated path: the 0.75 drain phase
    ended after one min RTT whether or not the queue was gone, so BBR ended up
@@ -242,7 +196,7 @@ RTTs. A slow consumer (for example a slow SOCKS client) therefore stays at
   are rate-controlled as one flow: the paths' estimates are capped so that
   they add up to what the session delivers over all of them, instead of
   each path probing for the whole bottleneck. See the
-  [session rate](../design/congestion.md#the-session-rate) and
+  [session rate](../design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow) and
   [multipath.md](multipath.md#common-bottlenecks-an-endpoints-line-is-slower-than-the-relays).
 
 Reproduce: `scripts/cc-bench.py [--rtt 150] [--suite bandwidth,window,loss,burst,buffer,jitter,bloat]`,

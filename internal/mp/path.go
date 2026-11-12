@@ -73,8 +73,15 @@ type Path struct {
 	srtt, rttvar time.Duration
 	minRTT       time.Duration
 	latestRTT    time.Duration
-	bw, cwnd     uint64 // the rate the path paces at (its share of the session rate), and its window
-	lost         uint64
+	bw, cwnd     uint64
+	pacing       uint64
+	ccMode       string
+	staleResets  uint64 // BBR stale-estimate resets (rate drops)
+	// measured send rate (fallback when the controller exposes no estimate)
+	measRate  float64
+	measAt    time.Time
+	measBytes uint64
+	lost      uint64
 	// loss estimates: QUIC packet loss of what we send (EWMA), and round-trip
 	// loss of ping datagrams
 	lossRate    float64
@@ -98,12 +105,15 @@ type Path struct {
 	rxDirty   bool
 	rxAt      time.Time
 	busy      bool
-	busyChunk *chunk // chunk the send loop is currently writing
+	busyChunk *chunk    // chunk the send loop is currently writing
+	burstAt   time.Time // first multi-packet chunk sent (see rate)
 	// late: recent peak queueing delay beyond what SRTT includes (seconds,
 	// see updateLateLocked)
 	queuePeak float64
 	late      float64
 	lateAt    time.Time
+	burstSeen bool // ... and acknowledged: bw reflects the bottleneck
+	benched   bool // in ProbeRTT and another path can stand in (see usable)
 	busySince time.Time
 	busyLen   int
 	pings     []pingRec
@@ -140,6 +150,9 @@ func newPath(s *Session, name string, index uint64, conn *quic.Conn, meter *cc.M
 		sendStreams: make(map[uint64]*quic.SendStream),
 		lastPong:    now,
 		lastRecv:    now,
+	}
+	if meter != nil {
+		meter.SetProbeGate(&s.probeGate)
 	}
 	p.refreshStatsLocked()
 	return p
@@ -550,10 +563,24 @@ func (p *Path) refreshStatsLocked() {
 			p.lossPktSent, p.lossPktLost, p.lossAt = sent, lost, now
 		}
 	}
+	if now := time.Now(); now.Sub(p.measAt) >= 100*time.Millisecond {
+		b := p.sentBytes.Load()
+		if !p.measAt.IsZero() {
+			inst := float64(b-p.measBytes) / now.Sub(p.measAt).Seconds()
+			p.measRate = max(inst, p.measRate*0.95)
+		}
+		p.measAt, p.measBytes = now, b
+	}
+	if !p.burstSeen && !p.burstAt.IsZero() && time.Since(p.burstAt) > 2*p.srttOrDefault() {
+		p.burstSeen = true
+	}
 	if p.meter != nil {
 		m := p.meter.Snapshot()
-		p.bw = m.Rate
+		p.bw = m.Bandwidth
 		p.cwnd = m.Cwnd
+		p.pacing = m.Pacing
+		p.ccMode = m.Mode
+		p.staleResets = m.StaleResets
 	}
 }
 
@@ -620,22 +647,57 @@ func (p *Path) rescueCost(n int, now time.Time) float64 {
 }
 
 // usable reports whether new data may be scheduled on the path (and whether
-// it counts as capacity in scheduling decisions).
-func (p *Path) usable() bool { return p.state == stateActive }
+// it counts as capacity in scheduling decisions): not during BBR ProbeRTT,
+// when its window is cut to 4 packets for ~200 ms.
+func (p *Path) usable() bool { return p.state == stateActive && !p.benched }
 
-// rate is the rate the path sends at (bytes/s): its share of the session
-// rate. Before it has one (a path that just joined), it is the initial
-// window per round trip, which is what the session's start-up begins with.
+// benchedLocked: p is in BBR ProbeRTT (window cut to 4 packets for ~200 ms)
+// and another path can carry new data meanwhile. With no alternative, a
+// probing path still sends.
+func (p *Path) benchedLocked() bool {
+	if p.state != stateActive || !p.probingRTT() {
+		return false
+	}
+	for _, q := range p.sess.paths {
+		if q != p && q.state == stateActive && !q.probingRTT() {
+			return true
+		}
+	}
+	return false
+}
+
+// rate is the estimated sending rate in bytes/s. BBR's bottleneck estimate is
+// unreliable while the path is application-limited (e.g. it only carried
+// ACKs), so it is floored by cwnd/(2*minRTT), which equals the bottleneck
+// rate in BBR steady state (cwnd = 2*BDP) and is optimistic during startup.
 func (p *Path) rate() float64 {
 	r := float64(p.bw)
-	if r == 0 {
-		mr := p.minRTT
-		if mr <= 0 {
-			mr = p.srttOrDefault()
-		}
-		r = float64(cpStartWindow) / mr.Seconds()
+	mr := p.minRTT
+	if mr <= 0 {
+		mr = p.srttOrDefault()
 	}
-	return max(r, 16<<10)
+	// The cwnd floor covers BBR's estimate being app-limited (paths left
+	// idle); once out of STARTUP with a real estimate, trust it (on thin
+	// paths the floor would overestimate badly). A path that only ever
+	// carried small messages stays in STARTUP indefinitely, with its initial
+	// window: once it has carried a burst (so that BBR's estimate reflects
+	// the bottleneck rather than ping traffic), the floor is capped at twice
+	// the measured rate (BBR's STARTUP growth per round), so a thin path is
+	// not mistaken for a fast one just because it was never loaded.
+	if c := float64(p.cwnd) / (2 * mr.Seconds()); c > r && (p.bw == 0 || p.ccMode == "startup" || p.ccMode == "") {
+		if p.bw > 0 && p.burstSeen {
+			c = min(c, 2*r)
+		}
+		r = max(r, c)
+	}
+	if p.meter == nil && p.bw == 0 {
+		// controller without a bandwidth estimate (cubic): measured rate
+		r = max(p.measRate, float64(32*1200)/mr.Seconds())
+	}
+	if r < 16<<10 {
+		r = 16 << 10
+	}
+	return r
 }
 
 // penalty is extra delay (seconds) if the path's writer seems stuck.
@@ -741,6 +803,10 @@ func (p *Path) chunksPerStream() int {
 	}
 	return 64
 }
+
+// probingRTT: BBR periodically cuts its window to 4 packets for ~200 ms to
+// re-measure the minimum RTT; no new data should be handed to it meanwhile.
+func (p *Path) probingRTT() bool { return p.ccMode == "probe_rtt" }
 
 // est is the estimated delivery time (seconds from now) of n bytes sent now,
 // including the expected loss-recovery delay and recent lateness.
@@ -935,8 +1001,9 @@ func (p *Path) statLocked() PathStat {
 	state := p.state.String()
 	return PathStat{
 		Name: p.name, Index: int(p.index), State: state, SRTT: p.srtt, MinRTT: p.minRTT,
-		Bandwidth: p.bw, Cwnd: p.cwnd,
+		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
-		ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
+		StaleResets: p.staleResets, ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
+		SharedCap: p.cps.cap,
 	}
 }

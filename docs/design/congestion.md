@@ -1,324 +1,231 @@
-# Congestion control (`internal/mp/rate.go`, `internal/cc`)
+# Congestion control (`internal/cc`, `internal/mp/coupling.go`)
 
-A session has **one** congestion controller for all its paths. It decides
-one rate for the session; the paths only carry their share of it. This page
-says what the controller does and, for every rule, why it is there and where
-it comes from. Measurements:
-[common bottlenecks](../benchmarks/multipath.md#common-bottlenecks-an-endpoints-line-is-slower-than-the-relays),
-[single path](../benchmarks/congestion-control.md).
+Every path has its own QUIC connection and its own congestion controller;
+the session then makes the paths behave as one flow where they share a
+bottleneck. The first part of this page is about one path, the second about
+all of them together. Measurements:
+[single path](../benchmarks/congestion-control.md),
+[common bottlenecks](../benchmarks/multipath.md#common-bottlenecks-an-endpoints-line-is-slower-than-the-relays).
 
-## Why one controller
+## Per-path BBR
 
-Every path is a QUIC connection of its own, and the obvious design gives
-each its own congestion controller. That is what mpquic did first: a BBR per
-path, and later a layer in the session that capped the BBRs' estimates so
-that they added up to what the session delivered.
+BBR (vendored from Hysteria, MIT) runs per path. BBR is a good fit here: it
+tolerates random loss, it gives an explicit bottleneck-bandwidth estimate the
+scheduler can use, and it keeps queues short. One change matters for
+multipath. A path that the scheduler deliberately leaves idle only carries
+ACKs and pings, and stock BBR's bytes-in-flight heuristic mistakes that for a
+saturated pipe. The bandwidth estimate then collapses to ~0.5 Mbit/s, cwnd to
+4 packets, and BBR leaves STARTUP. The next burst then ramps up over many
+seconds. The scheduler therefore tells BBR exactly when a path's sender is
+idle (an app-limited hint), so samples from idle periods are ignored. This
+alone doubled post-idle throughput in one scenario (45 → 76 Mbit/s).
 
-But the paths of a session are not independent. Every one leaves through
-the sending endpoint's uplink and arrives through the receiving endpoint's
-downlink, and those are often slower than the relays (a home line in front
-of relays in data centres). A controller per path has each path probe for
-the whole line. Five paths through 200 Mbit/s relays in front of a
-500 Mbit/s policer each found "200", started up on their own and sent
-1.3–1.7 Gbit/s into a line that passes 0.5; in the steady state the relays
-still carried a fifth more than was delivered, because a controller that
-only sees its own path cannot know what the others lose.
+Further changes keep queues short (bufferbloat), since every stream of
+a session shares the paths' bottleneck queues: a bulk download's queue is
+latency added to every interactive stream through the tunnel. See
+[../benchmarks/congestion-control.md](../benchmarks/congestion-control.md)
+for measurements.
 
-So the session has the rate, and the scheduler decides which path carries
-what (see [session.md](session.md)). There is no other congestion control:
-the per-path BBR is gone.
+* **Drain to target.** Stock BBRv1 paces at a max-filtered bandwidth estimate
+  that is a little above the real rate, and its 0.75 gain phase ends after
+  one min RTT whether or not the queue built by the 1.25 probe has drained.
+  It ends up limited by its 2·BDP window with a standing queue of a whole
+  BDP, which doubles the path RTT under load. The default profile holds the
+  0.75 phase until bytes in flight are down to the BDP.
+* **Stale estimate reset.** When the bottleneck rate drops (cellular, Wi-Fi,
+  a relay whose uplink gets busy), BBRv1 keeps pacing at the old rate until
+  the old samples leave its 10-round max filter. With a deep buffer nothing
+  is lost, the queue grows to the 2·BDP window, and the rounds the filter
+  counts stretch with the queue: an 8× drop kept ~0.8 s of queue for many
+  seconds. BBR never holds a queue for a whole min RTT on its own, so if for
+  `max(2·minRTT, 100 ms)` every RTT sample shows a queue of at least
+  `max(minRTT/2, 10 ms)` *and* the delivery rate stays below ¾ of the
+  estimate, the estimate is replaced by the measured delivery rate and the
+  queue is drained. The long interval spans ACK-aggregation bursts (Wi-Fi,
+  cellular), which otherwise look like rate drops. Delivery samples marked
+  app-limited count too while the application has data: BBR marks them
+  whenever bytes in flight dip below the BDP (e.g. in loss recovery), and
+  after a rate drop that mark lasts a whole queue-inflated round trip. The max filter itself still
+  counts real round trips: a wall-clock window made BBR starve against
+  loss-based flows filling a deep buffer, where the inflated RTT really is the
+  feedback loop. Resets are counted per path and shown in the
+  session's stats log line as `rate_drops=N`.
+* **Regrowth after a rate drop.** BBRv1 grows its estimate by at most 25%
+  per gain cycle (8 min RTTs), so after a reset a rate that comes back (a
+  flapping link) would take ~10 s to be used again at 150 ms RTT. For 10 s
+  after a reset, while the estimate is below the old one, the gain cycle
+  therefore re-probes (1.25) right after each drain, and once the estimate
+  has grown by 15% since a probe started BBR re-enters STARTUP. In the
+  simulator, on a link flapping between 40 and 5 Mbit/s every 3 s (50 ms
+  RTT) this uses ~93% of the capacity with a median queue of ~15 ms; stock
+  BBRv1 used ~97% but kept the buffer full (median queue 170–260 ms).
+* **ProbeRTT turn-taking** (see [session.md](session.md#lossy-and-misbehaving-paths),
+  "BBR ProbeRTT") only holds the session-wide turn while
+  actually in ProbeRTT. A path whose min RTT expired on the first ACK after
+  an idle period skips ProbeRTT; it used to keep the turn forever, so no other
+  path of the session ever probed again.
 
-## The design in short
+The `bbr-conservative` profile's overestimate avoidance (Chromium's "A0"
+sampler) is not used by default: under ACK aggregation on low-RTT paths (ACKs
+in 10–40 ms bursts on a 5–10 ms path) it collapses the estimate to a few
+percent of the link.
 
-The controller is BBR's design, applied to the session instead of a
-connection, with BBRv2's use of loss. Two things are added that a single
-connection does not need: a baseline for each path's random loss, and a
-rate for a path whose relay is slower than its share.
+## Session rate: the paths are congestion-controlled as one flow
 
-| | rule | from |
-|---|---|---|
-| **rate** | *B* is the highest rate at which the session's data was delivered in one of the last ten rounds | BBR's bandwidth estimate |
-| **start-up** | send twice what is acknowledged, until *B* stops growing, the round trips rise, or loss shows | slow start; BBR's "full pipe"; HyStart++; BBRv2 |
-| **probe** | every eight rounds one round at 1.25·*B*, one at *B*, then one as much less; a probe that was delivered is followed at once by a larger one | BBR's probe cycle |
-| **drain** | after a start-up, a probe or a cut: send less until no more is in flight than *B* needs | BBR's drain |
-| **loss** | two rounds that lose beyond the paths' baselines, on all paths: *B* comes down by the share that was lost; probes that are answered by loss become rare | BBRv2's loss bound; exponential back-off |
-| **paths** | a path paces at its share and may have two round trips' worth of it in flight | BBR's window |
-| **shares** | *B* is shared equally; a path whose window has held it back has a rate of its own, found by the same rules, and gets no more than that | max-min fairness |
+The relays are usually independent, but the paths are not: every path
+leaves through the sending endpoint's uplink and arrives through the
+receiving endpoint's downlink, and those are often slower than the relays (a
+100/20 Mbit/s home line in front of three relays in data centres). Each
+path's BBR measures its own delivery rate and keeps the highest it has seen.
+Behind a common bottleneck the paths see their best rates at different
+moments (one path gets more while another drains or probes its RTT), so the
+estimates add up to more than the bottleneck carries. Left alone, the paths
+keep its buffer full, which is latency for every stream of the session.
+Where it drops instead (a shallow buffer, a policer), they lose the excess
+all the time, and BBR ignores loss: behind a 50 Mbit/s policer three paths
+sent 60–160 Mbit/s by their estimates and lost a quarter of it. Every lost
+packet is retransmitted by QUIC, often rescued on another path as well, and
+stalls the stream that waits for it. If the bottleneck is the receiver's
+downlink, all of that crosses the relays first: they carried 47% more than
+the session delivered.
 
-Everything below is these rules in detail.
+MPTCP solves this with coupled congestion control: at a common bottleneck
+the subflows together behave like one flow. Hysteria solves it by being told
+the rates of the two ends. The session does both
+(`internal/mp/coupling.go`). Like BBR, it works with delivery rates. Delay
+only supports what the rates say, because a round-trip time also grows with
+queues that are not the session's (the other direction's: a download's ACKs
+behind an upload on the same uplink; or other people's traffic), and loss
+is not judged at all, only what it leaves of the delivery rate. And
+congestion is only what *all* paths show at once: one path's own queue or
+loss is that path's business.
 
-## Rounds, and what is measured
+* **Rounds and delivery rate.** The session works in rounds of the largest
+  smoothed RTT of its paths (50 ms to 1 s, at most twice a path's base RTT).
+  The delivery rate of a round is how fast the bytes *sent in it* came out
+  at the other end: per path, what was acknowledged between the round's
+  start and end, each shifted by that path's RTT and timed from ACK to ACK
+  (`cc.Meter.Mark`), and never more than was sent. It is known one round
+  later. (Counting the ACKs that happen to arrive during a round instead
+  mixes several rounds' sends when the paths' RTTs differ; a 25% probe then
+  showed as 6%.)
+* **Session rate.** *B* is the highest delivery rate seen. It stands while
+  what is sent is delivered: that only shows a lower bound (as do rounds in
+  which the paths had no data to send), and counting such rounds would let
+  *B* sink whenever the paths happen to send a little less than their
+  shares. Rounds in which *every* path delivered clearly less than it sent
+  (below 0.98) show what a bottleneck that all of them pass carries, and
+  *B* is the maximum of the last ten of those. That is all there is to
+  loss, as in BBR: a policer drops the same share from every path, so its
+  rate is found this way, and loss that all paths have costs nothing as
+  long as the probes (1.25) more than make up for it. One path's own loss,
+  however heavy, changes nothing.
+* **Shares.** *B* is shared out max-min fairly as a cap on each path's BBR
+  estimate (`bbr.Sender.RateCap`; pacing, cwnd and STARTUP's exit use the
+  capped estimate): a path whose own estimate is below an equal share keeps
+  it, since its own bottleneck limits it, and the others get equal shares of
+  the rest. So the estimates add up to what the session measurably
+  delivers. Equal shares keep every path loaded: a path in ProbeRTT or
+  failing leaves only its share to take over, and rescues have capacity
+  everywhere. (The scheduler still puts small transfers on the fastest
+  path.)
+* **When.** *B* is shared out for 32 rounds after the pipe was last seen
+  full: every path delivers less than it sends, or every path sees a queue
+  (below), while delivery has stopped growing (the session's by less than
+  25% per round, and no path in STARTUP is growing with the session's
+  total growing along: at the start all paths overshoot at the same
+  moment, and a slow one may still be ramping). A probe doesn't count, as
+  it fills every path's own bottleneck too. Paths behind a common
+  bottleneck keep showing this, so nothing has to be detected or
+  remembered. Independent paths stop showing it and are left alone again;
+  they must be, because BBR's estimate for a path with random loss is what
+  it *sends*, so the estimates of lossy paths never add up to what is
+  delivered, and capping them would take from the clean paths (four paths
+  with 20/10/5/1% loss lost a tenth of their throughput that way). Before
+  the first time, *B* only shows what has been sent so far, and it lags a
+  fast path that ramps up within one round of a slow one. A path in
+  STARTUP gets a share when the pipe is full, which ends its STARTUP;
+  otherwise it is left to find its rate.
+* **Probing.** A capped path can't find more capacity alone, and doesn't
+  try: its own 1.25 gain phases are off, its drain phases remain. Instead
+  the session probes on all capped paths at once (`bbr.Sender.RateGain`):
+  one round at 1.25·*B*, then one at 0.75·*B* while the ACKs come in, so
+  that whatever the probe queued is gone again by the time its result is
+  known. If the probe was delivered (*B* grew by half of what it added),
+  the session probes again right away, from the second success in a row at
+  1.5 and then 2 (one success may be a policer's burst allowance).
+  Otherwise it waits twice as long before the next probe: 2, 4, then every
+  8 rounds, which is as often as BBR itself probes. No path is driven
+  harder than its own probes would drive it (1.25 times its own estimate):
+  its share may be all that its own bottleneck carries.
+* **Queues.** When every path that carried data saw a queue for a whole
+  round (its lowest RTT sample at least `max(3 ms, shortest base RTT / 10)`
+  above its base RTT, the lowest of the last 15–30 s), the bottleneck they
+  all pass is congested.
+  * If such rounds also delivered clearly less than *B* (their average, of
+    up to three, is below 0.9·*B*), the capacity dropped, and *B* follows
+    at once. A queue with all of *B* delivered changes nothing: it may not
+    be ours, and following the delivery rate down for it would never end.
+  * A maximum of noisy samples is a few percent high, and the paths' own
+    drain phases then keep taking back what queues. So while *B* limits
+    every path and all of them see a queue, *B* is trimmed: if the session
+    delivered clearly less on average over 10 such rounds (below 0.98·*B*,
+    loss aside), *B* is that average.
+  * A queue that stays for two rounds is drained by a round at 0.75·*B*, at
+    most every 8 rounds. If the queue doesn't shrink, it isn't the
+    session's, and it becomes part of the paths' base RTT.
+* **Known rates** (`up` / `down`, the Hysteria part). If an endpoint's
+  uplink or downlink rate is configured, the session never sends more than
+  `up` over all paths together, and it announces `down` to the peer (a
+  control frame; older peers ignore it), which then sends no more than
+  that. The limit is a ceiling for *B*, obeyed from the first packet (also
+  in STARTUP, and with a single path) and never probed: every path's share
+  of it bounds what the path paces at, not only its estimate, and at the
+  start, when no path has an estimate, the shares are equal. Below it everything
+  above still applies, so a line that is slower than configured is handled
+  as without the option. Set them a little below the real rates (95%) and
+  the bottleneck's queue stays empty.
+* **Path failure.** When a path fails (suspect or closed), the others
+  restart STARTUP to take over what it carried.
 
-The session works in **rounds**. A round is as long as the longest smoothed
-round trip of the active paths (but no longer than twice that path's base
-RTT, so that a queue does not slow the controller down), at least 50 ms and
-at most 1 s: what is sent in one round is acknowledged in the next, and 50 ms
-is enough packets to measure a rate and a loss share.
+With a single path and no configured limit, the session rate is only
+measured, and the path's BBR is on its own.
 
-Every path's controller (`cc.Meter`) counts each packet for the round it was
-sent in, and each acknowledgement and loss for the round of its packet,
-however much later it is known. So at the end of round *k* the session knows
-exactly what round *k*−2 sent and lost (its losses took a second round to
-be noticed), and what round *k*−1 lost so far. From that, and from the bytes
-acknowledged during the round, it has:
-
-* **the delivery rate** of a round: the rate at which acknowledgements came
-  in during it, but no more than was sent in it or the round before (whose
-  packets they acknowledge). Acknowledgements that arrive in a bunch are not
-  capacity; BBR takes the longer of the send and the acknowledgement
-  interval for the same reason. A round counts only if the session had the
-  data to send what it could (85% of it): what an application-limited round
-  delivers says nothing about the pipe. This is BBR's rule for
-  application-limited samples.
-* **the loss of a round**, per path, against the path's baseline (below).
-* **a queue**: a path sees one if its round trips are above its base RTT by
-  an eighth, at least 4 ms and at most 16 ms. These are HyStart++'s
-  thresholds (RFC 9406): less is jitter. The base RTT is the lowest of the
-  last 10 s (BBR's window for its minimum RTT): a connection's lifetime
-  minimum would make a path whose route got longer look queued forever.
-
-### Loss is judged against a baseline
-
-mpquic is meant to run over lossy paths, so loss as such cannot mean
-congestion. What tells the two apart is that congestion loss comes with the
-rate and random loss does not. So every path has a **baseline**: the share
-it loses when the pipe is clearly not full. A round shows that if the
-session, and the path, sent less than 0.9 of what they put out two rounds
-later: the round after a probe, the round at half rate after a cut for loss
-(so loss that does not come with the rate is in the baseline two rounds
-after it was taken for the pipe's, and is not acted on again), and a
-start-up's rounds while the rate still doubles. The baseline is the loss of
-such rounds together, later ones counting more, and it is known once they
-add up to 200 packets: one small round says little (two lost of a hundred
-is as likely as none).
-
-A path's round is **lossy** if it lost more than the baseline by 2% of what
-it sent (BBRv2's loss threshold), and by more than chance explains: three
-standard deviations, for losses that come in bursts of four packets, as
-random loss on real links does. A round is lossy *for the session* if that
-holds for the paths that carried three quarters of it, and for all of them
-together. Loss on one path only is that path's own business (below).
-
-## The session rate *B*
-
-**Start-up.** The session sends twice the rate at which acknowledgements
-are arriving (measured continuously, over the last round's length), so the
-rate doubles every round trip, as slow start does with its window. It ends
-
-* when *B* has grown by less than a quarter in three rounds: the pipe is
-  full (BBR);
-* or when every path has seen a queue for a round's length: the common
-  bottleneck is filling its buffer (HyStart). A whole round, because the
-  bottleneck was then busy all that time, so what came out in it is what it
-  carries; a session's first burst alone raises the round trip for a
-  moment;
-* or when the last two rounds are lossy on all paths, by at least 32
-  packets: BBRv2 ends its start-up on loss in the same way, and asks for
-  eight loss events, so that one burst of random loss does not end it. Only
-  paths whose baselines are known count: the first rounds, while the pipe
-  is not full, show them, and until then a path's random loss cannot be
-  told from the pipe's.
-
-The last two are checked at every tick, not only at the end of a round: a
-round at twice the pipe's rate queues or loses a round's worth. *B* is then
-what the pipe puts out at that moment, and the session drains. What leaves
-the sender overshoots by up to a factor of two for about one round trip, as
-with any slow start; what arrives is never more than the line carries.
-
-A queue or loss ends the start-up only while the session sends at least
-what was delivered. One with little to send (the acknowledgements of a
-download) sees the other direction's queue and loss, not its own.
-
-**At *B*.** After the start-up the session sends at *B*, and *B* is the
-highest delivery rate of the last ten rounds that counted. A pipe delivers
-no faster than its bottleneck, so the highest recent delivery rate is the
-bottleneck's rate; ten rounds outlast a probe cycle, so a rate that a probe
-found is confirmed or forgotten by the next. (Rounds that do not count do
-not age the others: *B* is not forgotten while the application is idle.)
-When the capacity drops, *B* follows after ten rounds at the latest;
-meanwhile the paths' windows hold what queues to a round trip's worth.
-
-**Probes.** Every eight rounds one round sends 1.25·*B*, the next sends
-*B*, and the one after that as much less as the probe sent more, so that
-what the probe queued is gone again: BBR's cycle, with a round in between.
-A probe's packets are acknowledged partly in its own round and partly in
-the next (paths differ in delay), so the two rounds together show what it
-delivered, and the round in between must not change anything else. When
-their losses are known, the session judges the probe:
-
-* If the two rounds together delivered more than *B* by at least a quarter
-  of what the probe added, there is more (all of it would show as half).
-  The next probe follows at once and asks for twice as much more (1.5, then
-  2): a capacity that is far away is found in a few steps, as in slow
-  start.
-* If not, *B* is what it was before the probe. A rate that kept every
-  slightly higher sample would creep above what the pipe carries and keep a
-  queue there.
-* If the probe's round was lossy, loss answered it (below).
-
-**Drains.** After a start-up, a probe or a cut the session sends less: half
-of *B* after a start-up or a cut (a round's worth may be queued), and after
-a probe as much less as the probe sent more. A drain lasts until no more is
-in flight than *B* needs over the paths' round trips without a queue, which
-is BBR's drain target, and two rounds at most: round trips also grow with
-queues that are not ours, and sending less does not shorten those.
-
-**Loss.** Two lossy rounds in a row that were paced at *B* mean that *B* is
-more than the pipe takes: a policer, or a buffer that is full. What was not
-lost is what it takes, so *B* comes down by the share that was lost beyond
-the baselines (a policer passes its rate of whatever arrives faster, and so
-does a full buffer), but not below half of *B* at once. This does not depend
-on the session having sent at *B* all the time: what it sent, it paced at
-*B*. Two rounds, because a policer lets a burst pass before it drops.
-
-Probing such a ceiling costs loss every time, so each time loss answers at
-about the same rate (within 15%), the wait for the next probe doubles, from
-8 rounds up to 128. At another rate it starts over, and it also starts over
-when *B* has fallen far below the ceiling (the capacity dropped: what was
-learned there does not hold probes back here).
-
-## The paths
-
-A path's congestion controller (`cc.follower`) decides nothing about rates.
-
-* It **paces** at the rate the session gives it: its share of *B* times the
-  round's gain.
-* It **bounds what is in flight** to what its share needs over two round
-  trips without a queue (on short paths: one round trip and 25 ms, quic-go's
-  maximum ACK delay; never less than quic-go's initial window of 32
-  packets). This is BBR's window. A path that carries its share has one
-  round trip's worth in flight, so the second is room for a queue of one
-  round trip. A path that carries less than it is given (a slow relay, a
-  bottleneck whose capacity dropped) queues that much and no more, and a
-  path that stops delivering stops sending.
-
-The window is for the path's share of *B* as it was measured, not for the
-rate of the moment: a round that sends less to drain a queue must not find
-its window shrunk below what is in flight, and before the session has
-measured a rate the window is the initial window, whatever the first round
-is paced at. And it is for what the path is given, not for what it
-delivers: a window that follows the delivery rate shrinks when the path
-delivers less because the window holds it back, and so shrinks itself.
-
-### Shares
-
-*B* (times the round's gain) is shared out among the usable paths
-**max-min fairly**: equal shares, except that a path gets no more than its
-own rate (next section), and the others share the rest. Equal shares keep
-every path loaded, so a failing path leaves only its share to be taken
-over, and loss recovery always has capacity on every path. Which stream's
-data goes on which path is the scheduler's decision, not the rate
-controller's: small transfers still go to the fastest path.
-
-A path that is not usable (suspect) keeps a minimal share for its pings.
-Before the session has a rate, every path is paced at twice the initial
-window per round trip: the path's shortest one (the smoothed RTT begins with
-the handshake's, which may be many times the path's), or 50 ms until there
-is a sample. A path gets its share when it joins, not at the session's next
-tick.
-
-### A path's own rate
-
-A relay may be slower than its path's share of *B*, or police. Such a path
-has a **rate of its own**, and it is the same thing as *B*, for one path:
-the highest rate at which the path delivered in the last ten rounds, found
-and probed by the same code (`cpRate`).
-
-* Only rounds in which the path's **window held it back** count (and rounds
-  in which it delivered more than its rate): a path that delivers what it
-  is given has shown no limit, and holding it to what it happened to carry
-  would freeze whatever split the paths began with. Such rounds count
-  whatever the path lost in them: a relay whose buffer overflows passes
-  what it carries. The rate is known after three such rounds:
-  acknowledgements that stall for a moment hold a path back, too.
-* **Loss**: a path that is lossy for two rounds at its plain share, while
-  the session is not (that is *B*'s business), has its rate come down by
-  what it lost, like *B*, and gets half of it until what queued at the
-  relay is gone. This needs the path's baseline: a relay that polices is
-  found this way, a path with random loss is not.
-* **Probes**: every eight rounds a path that is held to its own rate gets a
-  quarter more for a round, its rate for the next, and then as much less
-  until what that queued is gone, with the same judgement and the same
-  back-off as the session's probes (if a quarter more is still within an equal share of *B*; a path
-  that gets about an equal share is probed with the session). The other paths get that much less and more, so the probe costs a
-  common bottleneck nothing, and it shows what the path carries even when
-  the common bottleneck is full.
-* A path's rate is forgotten when an equal share of *B* has been less than
-  it for ten rounds, and at the end of a start-up (what a path delivered
-  while the rates doubled says little).
-
-In the start-up the paths' rates are not applied: they are two rounds old,
-and the rates double every round. A path that cannot follow is held by its
-window.
-
-## Configured rates
-
-`up` / `down` (see [configuration](../configuration.md)) are ceilings for
-*B*: an endpoint's own uplink, and what the peer is told about the downlink.
-At the ceiling the session does not probe. With both set a little below the
-line's rates there is no overshoot at the start, nothing is dropped at a
-policer, and nothing queues.
-
-## The constants
-
-| constant | value | what | why this value |
-|---|---|---|---|
-| round | longest RTT, 50 ms–1 s | the unit of all measurements | one round trip: what is sent is acknowledged a round later |
-| `cpRounds` | 10 | rounds whose highest delivery rate is *B* | BBR |
-| `cpStartGain` | 2 | start-up | slow start |
-| `cpStartGrowth`, `cpStartRounds` | 1.25, 3 | the pipe is full | BBR |
-| `cpLossEvents` | 8 bursts | loss that ends a start-up | BBRv2 |
-| `cpProbeGain`, `cpProbeEvery` | 1.25, 8 | a probe and its cycle | BBR |
-| `cpMaxProbeGain` | 2 | probes that keep finding more | slow start's rate of growth |
-| `cpMaxHold` | 128 rounds | the longest wait between probes | a policed line is probed every 6–30 s |
-| `cpSameCeil` | 15% | "the same ceiling" | wider than a probe's error, narrower than a probe |
-| `cpMaxDrain` | 2 rounds | the longest drain | a round's worth is queued at most (the windows) |
-| `cpLossExcess` | 2% | loss that counts | BBRv2 |
-| `cpBurst` | 4 packets | random loss comes in bursts | counted singly, every burst would be significant |
-| `cpCut` | 0.5 | the most *B* comes down at once | TCP's halving |
-| `cpCommon` | 75% | "all paths" | all but a small one |
-| `cpBasePkts`, `cpBaseKeep` | 200, 0.75 | a baseline is known; older rounds fade | 2% of 200 is four packets, one burst |
-| `cpClearly` | 0.9 | "clearly less" | beyond a round's measuring error |
-| `cpBusyFrac`, `cpStartBusy` | 0.85, 0.5 | the session had the data for the round | at twice the rate, sending what was delivered is half |
-| `cpOwnKnown` | 3 rounds | a path's own rate is known | longer than a stall of acknowledgements |
-| queue threshold | RTT/8, 4–16 ms | a path sees a queue | HyStart++ (RFC 9406) |
-| `cpBaseWindow` | 10 s | base RTT | BBR |
-| window | 2 round trips, ≥ 32 packets | what a path may have in flight | BBR; quic-go's initial window |
+The session's stats log line shows `rate=<B>` (and `limit=`); a path whose
+estimate is capped shows its own estimate as `own=`. `no_coupling` turns the
+session rate off (configured limits still apply). Measurements: see
+[../benchmarks/multipath.md](../benchmarks/multipath.md#common-bottlenecks-an-endpoints-line-is-slower-than-the-relays).
 
 ## Limitations
 
-* **Start-up overshoots**, like any slow start: the sender sends up to
-  twice what the line carries for about one round trip before the first
-  loss or queue can be seen. With `up` / `down` configured there is no
-  overshoot.
-* **A drop in capacity is followed late.** *B* is the highest delivery rate
-  of ten rounds, so it follows a drop after up to ten rounds, unless loss
-  shows first (two rounds). Meanwhile the paths' windows hold the queue to
-  about a round trip's worth, which is latency for every stream. A line
-  whose rate changes all the time (a radio link) is carried less evenly
-  than a steady one. This is BBR's behaviour, and the price of a rate that
-  does not follow every dip.
-* **Probing a policer costs loss.** Each probe that hits the ceiling loses
-  up to a fifth of one round. The back-off makes that rare (one probe in
-  128 rounds once the ceiling is confirmed), at the price of finding more
-  capacity late when the policer's rate goes up.
-* **Loss that every path has and that changes** (all paths over the same
-  radio link) is taken for congestion when it rises: *B* comes down by
-  about the loss rate, until rounds below *B* (after the cut, after every
-  probe) have put it into the baselines.
-* **A queue that is not ours** in front of the acknowledgements (an upload
-  filling the uplink while a download runs) lengthens the round trips. A
-  path whose round trip more than doubles that way is held back by its
-  window until the base RTT has caught up, after 5–10 s.
-* **A relay slower than its share** keeps a queue of up to a round trip
-  (what its window allows) while its rate is being found, and part of that
-  afterwards: a path that is held to its own rate sends exactly what the
-  relay takes, so what a probe queued is drained, but not more.
-
-## Seeing what it does
-
-The session's stats log line shows `rate=<B>` (and `limit=` if configured);
-a path that is held to a rate of its own shows it as `own=`.
-`MPQUIC_RATE_DEBUG=1` logs one line per round: the phase, what was sent and
-acknowledged, the loss of the last two rounds against the baselines, *B*,
-and each path's rate.
+* The session rate treats all paths of a session alike. If only some of
+  them share a bottleneck while another has spare capacity of its own, the
+  pipe is rarely "full" for all of them at once, and the paths behind the
+  common bottleneck behave as uncoupled paths.
+* Independent paths with heavy random loss or outages look full together
+  now and then, and their estimates are then capped for 32 rounds although
+  nothing is shared: about 5–8% less bulk throughput than with
+  `no_coupling` in the benchmarks. If the paths are
+  known to be independent, `no_coupling` avoids that.
+* A policer is followed the way BBR follows one: by the highest of the
+  delivery rates it lets through, which is a few percent above its rate,
+  and by probes every 8 rounds. About 9% of the packets were dropped at a
+  50 Mbit/s policer (24% before the session rate; a variant that judged
+  loss directly got to 4%, but took a tenth of the throughput from paths
+  with random loss). A buffer of a few milliseconds behaves alike. With
+  `down` (or `up`) set below the policed rate nothing is dropped.
+* A session probe adds a quarter of a round of queue at a bottleneck that
+  is already full, for two rounds in ten: tens of milliseconds for the
+  other streams, which the paths' own probes cost before as well. With
+  `up` / `down` set there are no probes.
+* Queues are judged by round-trip times, which also grow with a queue in
+  the ACK direction (an upload filling the receiver's uplink while it
+  downloads). The session rate therefore never comes down for a queue
+  alone, and a queue that draining doesn't shrink is taken into the base
+  RTT; until then (a few rounds) the pipe may look full when it isn't.
+* A sudden rate drop still costs one window's worth of queue: what is already
+  in flight (up to 2·BDP at the old rate) has to drain at the new rate before
+  the queue is gone (~1 s for an 8× drop at 50 ms RTT), and smaller drops
+  (< 25%) are left to BBR's 10-round filter.
+* Against a loss-based flow filling a deep buffer, BBRv1 gets a minority
+  share (~20% against Reno in the simulator), as before.

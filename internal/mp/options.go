@@ -21,6 +21,8 @@ type Options struct {
 	// ChunkSize is the maximum scheduling unit (bytes). Smaller chunks give
 	// finer-grained scheduling at the cost of per-chunk overhead.
 	ChunkSize int
+	// Congestion selects the per-path congestion controller.
+	Congestion string
 	// IdleTimeout resets proxied streams without activity (ss "timeout").
 	IdleTimeout time.Duration
 	// PathIdleTimeout is the QUIC idle timeout of a path connection.
@@ -40,6 +42,12 @@ type Options struct {
 	// NoDup disables opportunistic duplication of in-flight data onto idle
 	// faster paths (it is on by default; it only uses otherwise idle capacity).
 	NoDup bool
+	// NoCoupling disables the session rate: by default the paths' bandwidth
+	// estimates are capped so that they add up to what the session delivers
+	// over all of them together, which keeps paths behind a common
+	// bottleneck (an endpoint's uplink or downlink) from each probing for
+	// all of it (see coupling.go).
+	NoCoupling bool
 	// MaxSendRate / MaxRecvRate, if > 0, are ceilings for what the session
 	// sends and receives over all paths together, in bytes/s: the known
 	// rate of this endpoint's uplink and downlink. The receive limit is
