@@ -127,7 +127,8 @@ type Path struct {
 	// chunk bytes scheduled as copies of data already sent (sess.mu held):
 	// reinjections/rescues and opportunistic duplicates
 	reinjBytes, dupBytes uint64
-	rateCap              uint64 // share of a configured rate limit (bytes/s, 0 = none; ratelimit.go)
+	// session rate (see coupling.go)
+	cps cpPath
 	// loss tolerance: what this end and the peer have configured for the
 	// path; the larger one applies
 	ownTol, peerTol float64
@@ -1004,7 +1005,7 @@ func (p *Path) statLocked() PathStat {
 		Bandwidth: p.bw, Cwnd: p.cwnd, Pacing: p.pacing, CCMode: p.ccMode,
 		SentBytes: p.sentBytes.Load(), RecvBytes: p.recvBytes.Load(), LostBytes: p.lost, Loss: p.loss(),
 		ReinjectBytes: p.reinjBytes, DupBytes: p.dupBytes,
-		RateCap: p.rateCap, LossTolerance: max(p.ownTol, p.peerTol),
+		SharedCap: p.cps.cap, LossTolerance: max(p.ownTol, p.peerTol),
 	}
 }
 

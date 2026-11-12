@@ -723,12 +723,12 @@ func (b *bench) bulk(cmd byte, dur time.Duration, n int) {
 		var per []string
 		for _, st := range senderEnd {
 			x := fmt.Sprintf("%.1f", float64(st.Bandwidth)*8/1e6)
-			if st.RateCap > 0 {
+			if st.SharedCap > 0 {
 				x += "*"
 			}
 			per = append(per, x)
 		}
-		fmt.Printf("estimate sender's sum of path estimates: p10=%.1f p50=%.1f p90=%.1f max=%.1f Mbit/s (at the end: %s; *: bound by a configured rate) goodput %.1f\n",
+		fmt.Printf("estimate sender's sum of path estimates: p10=%.1f p50=%.1f p90=%.1f max=%.1f Mbit/s (at the end: %s; *: capped) goodput %.1f\n",
 			est[len(est)/10], est[len(est)/2], est[len(est)*9/10], est[len(est)-1], strings.Join(per, " + "), ss)
 	}
 	if len(loaded) > 0 && len(idle) > 0 {

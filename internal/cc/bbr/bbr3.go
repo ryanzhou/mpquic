@@ -190,11 +190,16 @@ type Sender struct {
 	// (enter=false), so that only one path of a session probes at a time.
 	ProbeRTTGate   func(enter bool) bool
 	holdsProbeGate bool
-	// RateCap, if set, returns an upper bound for the pacing rate (0:
-	// none): the path's share of a configured rate of the line that all
-	// paths pass. A known rate is not probed: the bound also holds for
-	// the start-up and for ProbeBW_UP.
+	// RateCap, if set, returns an upper bound for BBR.bw (0: none): the
+	// path's share of what the session delivers over all its paths
+	// together, or of a configured rate. The pacing rate and the window
+	// follow the bounded estimate; BBR.max_bw keeps the path's own samples.
 	RateCap func() Bandwidth
+	// RateGain, if set, returns the pacing gain that applies in ProbeBW
+	// while RateCap bounds the estimate (0: 1). A bounded path does not
+	// probe for more on its own (that would only move its share of the
+	// common bottleneck): the session probes on all bounded paths at once.
+	RateGain func() float64
 	// LossTolerance, if set and positive, is for a path that is known to
 	// lose packets whatever the rate: loss up to this share of what is
 	// sent is not taken for congestion, neither when probing (where it
@@ -885,6 +890,22 @@ func (b *Sender) resetShortTermModel() {
 
 func (b *Sender) boundBWForModel() {
 	b.bw = min(b.maxBw, b.bwShort)
+	if c := b.rateCap(); c > 0 && c < b.bw { // mpquic
+		b.bw = c
+	}
+}
+
+func (b *Sender) rateCap() Bandwidth {
+	if b.RateCap == nil {
+		return 0
+	}
+	return b.RateCap()
+}
+
+// capped: the session's bound, not the path's own model, sets BBR.bw.
+func (b *Sender) capped() bool {
+	c := b.rateCap()
+	return c > 0 && c < min(b.maxBw, b.bwShort)
 }
 
 // ---- the draft: control parameters (5.6) ----
@@ -896,19 +917,23 @@ func (b *Sender) setPacingRateWithGain(gain float64) {
 	}
 }
 
-// bandwidthForPacer is the pacing rate for the pacer, in bytes/s: within
-// the session's bound for this path (mpquic), and never zero.
-
-func (b *Sender) setPacingRate() { b.setPacingRateWithGain(b.pacingGain) }
-
-func (b *Sender) bandwidthForPacer() congestion.ByteCount {
-	rate := b.pacingRate
-	if b.RateCap != nil {
-		if c := b.RateCap(); c > 0 {
-			rate = min(rate, c)
+func (b *Sender) setPacingRate() {
+	gain := b.pacingGain
+	if b.isInProbeBW() && b.capped() { // mpquic: the session's gain, see RateGain
+		gain = 1
+		if b.RateGain != nil {
+			if g := b.RateGain(); g > 0 {
+				gain = g
+			}
 		}
 	}
-	return max(congestion.ByteCount(rate/BytesPerSecond), minPacingRate)
+	b.setPacingRateWithGain(gain)
+}
+
+// bandwidthForPacer is the pacing rate for the pacer, in bytes/s: never
+// zero.
+func (b *Sender) bandwidthForPacer() congestion.ByteCount {
+	return max(congestion.ByteCount(b.pacingRate/BytesPerSecond), minPacingRate)
 }
 
 func (b *Sender) minPipeCwnd() congestion.ByteCount { return minPipeCwndPackets * b.mds }
@@ -1038,6 +1063,24 @@ func (b *Sender) ModeName() string { return b.st.String() }
 
 // BandwidthEstimate is BBR.bw in bytes/s.
 func (b *Sender) BandwidthEstimate() uint64 { return uint64(b.bw / BytesPerSecond) }
+
+// RawBandwidthEstimate is BBR.max_bw in bytes/s: the path's own estimate,
+// whatever bounds apply to it.
+func (b *Sender) RawBandwidthEstimate() uint64 { return uint64(b.maxBw / BytesPerSecond) }
+
+// Restart makes a controller in ProbeBW start up again (mpquic: another
+// path of the session went away, and what it carried should be taken over
+// within a few round trips).
+func (b *Sender) Restart() {
+	if !b.isInProbeBW() {
+		return
+	}
+	b.fullBwReached = false
+	b.inflightLong = infBytes
+	b.resetShortTermModel()
+	b.resetFullBW()
+	b.enterStartup()
+}
 
 // PacingRateBytes is the pacing rate in bytes/s.
 func (b *Sender) PacingRateBytes() uint64 { return uint64(b.bandwidthForPacer()) }

@@ -591,35 +591,68 @@ func TestSimSharedBottleneck(t *testing.T) {
 	}
 }
 
-// A rate cap bounds what a flow sends, in every state: three flows capped
-// at a third of the link each (a configured rate, shared out by the
-// session) use the link without ever filling it.
+// Three flows share a bottleneck (three paths of a session behind one
+// line). On their own, each takes the highest rate it has seen for itself
+// as its bandwidth, at different moments: the estimates add up to more than
+// the link carries, and together the flows keep a queue. With each estimate
+// capped at a third of the link (what mpquic's session rate converges to),
+// they use the link without one.
 func TestSimRateCap(t *testing.T) {
-	r := runSim(simConfig{duration: 15 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(60), buffer: 100 * time.Millisecond, flows: 3,
-		setup: func(_ int, s *Sender) {
-			s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
-		}})
-	var u, most float64
-	for i := range 3 {
-		u += r.flowGoodput(i, 3*time.Second, 15*time.Second) / mbit(60)
-		for _, v := range r.flowSent[i] {
-			most = max(most, v)
+	run := func(capped bool) (float64, time.Duration, *Sender) {
+		cfg := simConfig{duration: 20 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(60), buffer: 300 * time.Millisecond, flows: 3}
+		if capped {
+			cfg.setup = func(_ int, s *Sender) {
+				s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
+			}
 		}
+		r := runSim(cfg)
+		var u float64
+		for i := range 3 {
+			u += r.flowGoodput(i, 3*time.Second, 20*time.Second) / mbit(60)
+		}
+		return u, r.medianQueue(3*time.Second, 20*time.Second), r.senders[0]
 	}
-	var mq time.Duration
-	for _, q := range r.queue {
-		mq = max(mq, q)
+	u0, q0, _ := run(false)
+	u1, q1, s := run(true)
+	t.Logf("on their own: utilization %.0f%%, median queue %v; capped: %.0f%%, %v", u0*100, q0, u1*100, q1)
+	if u1 < 0.9 {
+		t.Errorf("capped utilization %.0f%% < 90%%", u1*100)
 	}
-	t.Logf("utilization %.0f%%, longest queue %v, most sent by a flow in 100 ms: %.1f Mbit/s", u*100, mq, most*10*8/1e6)
-	if u < 0.9 {
-		t.Errorf("utilization %.0f%% < 90%%", u*100)
+	if q1 > 10*time.Millisecond || q1 >= q0 {
+		t.Errorf("capped median queue %v (on their own: %v)", q1, q0)
 	}
-	// (the pacer's burst allowance on top of the rate)
-	if most > mbit(20)*0.1+16*1200 {
-		t.Errorf("a flow capped at 20 Mbit/s sent %.1f Mbit/s over 100 ms", most*10*8/1e6)
+	if bw := s.BandwidthEstimate(); float64(bw) > mbit(20)+1 {
+		t.Errorf("estimate %.1f Mbit/s above the cap", float64(bw)*8/1e6)
 	}
-	if mq > 10*time.Millisecond {
-		t.Errorf("queue of %v on a link that the caps never fill", mq)
+}
+
+// A capped flow sends at its cap and does not probe above it on its own
+// (the session probes on all capped paths at once, with RateGain): on a
+// link with room to spare, three flows capped at 20 Mbit/s deliver
+// 60 Mbit/s with gain 1 and a quarter more with gain 1.25.
+func TestSimRateGain(t *testing.T) {
+	run := func(gain float64) float64 {
+		r := runSim(simConfig{duration: 12 * time.Second, rtt: 40 * time.Millisecond, rate: constRate(120), buffer: 100 * time.Millisecond, flows: 3,
+			setup: func(_ int, s *Sender) {
+				s.RateCap = func() Bandwidth { return Bandwidth(mbit(20)) * BytesPerSecond }
+				s.RateGain = func() float64 { return gain }
+			}})
+		var u float64
+		for i := range 3 {
+			u += r.flowGoodput(i, 4*time.Second, 12*time.Second)
+		}
+		return u * 8 / 1e6
+	}
+	g1, g125, g0 := run(1), run(1.25), run(0)
+	t.Logf("goodput with gain 1: %.1f, 1.25: %.1f, unset: %.1f Mbit/s", g1, g125, g0)
+	if g1 < 56 || g1 > 61 {
+		t.Errorf("gain 1: %.1f Mbit/s, want the caps' 60 (no probing above a cap)", g1)
+	}
+	if g125 < 1.18*g1 || g125 > 1.3*g1 {
+		t.Errorf("gain 1.25: %.1f Mbit/s, want 1.25 times the %.1f with gain 1", g125, g1)
+	}
+	if g0 < 56 || g0 > 61 {
+		t.Errorf("gain unset: %.1f Mbit/s, want 60", g0)
 	}
 }
 
