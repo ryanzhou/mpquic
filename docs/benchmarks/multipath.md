@@ -1,5 +1,12 @@
 # Multipath benchmarks
 
+> **These numbers predate the current controller.** They were measured with
+> the BBRv1 controller of earlier releases. Each path now runs BBR version 3
+> ([design/congestion.md](../design/congestion.md)); the page is being
+> regenerated. What changes most: far fewer packets dropped at policers and
+> shallow buffers, and random loss above 2% or reordering needs
+> `loss_tolerance` on that path to keep its rate.
+
 All numbers come from `scripts/bench-matrix.sh`, which runs `mpbench`. Each
 run is a complete in-process testbed on one Linux host (8 cores): a target
 TCP server, an mpquic remote, one emulated UDP relay per path
@@ -123,7 +130,7 @@ crossed the relays). The relays themselves are not limited unless noted;
 their RTTs are 20/50/80 ms. **before** is the previous release (pairwise
 shared-bottleneck detection); **after** is the session rate, the ACK pacing
 and the rate-sized chunks described in the design
-([session rate](../design/congestion.md#session-rate-the-paths-are-congestion-controlled-as-one-flow),
+([session rate](../design/congestion.md#session-rate-the-paths-estimates-add-up-to-what-is-delivered),
 [receive side](../design/session.md#receive-side)). Single 12 s runs, so differences of a few percent mean
 little.
 
