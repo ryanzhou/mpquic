@@ -104,9 +104,7 @@ const (
 	cpPathBackoff = 1 // ... up to twice
 )
 
-// MPQUIC_COUPLE=0 gives every path a BBR of its own (like
-// Options.NoCoupling), for comparisons; MPQUIC_RATE_DEBUG=1 logs every round.
-var cpDisabled = os.Getenv("MPQUIC_COUPLE") == "0"
+// MPQUIC_RATE_DEBUG=1 logs every round.
 var cpDebug = os.Getenv("MPQUIC_RATE_DEBUG") != ""
 
 type cpPhase int
@@ -322,35 +320,9 @@ func (s *Session) rateLimitLocked() uint64 {
 	return l
 }
 
-func (s *Session) coupled() bool { return !cpDisabled && !s.opt.NoCoupling }
-
 // couplingTickLocked updates the session rate and the paths' shares of it.
 func (s *Session) couplingTickLocked(now time.Time) {
 	limit := s.rateLimitLocked()
-	if !s.coupled() {
-		// Every path has a BBR of its own. A configured limit is split
-		// equally among them.
-		n := 0
-		for _, p := range s.paths {
-			if p.meter != nil && p.state == stateActive {
-				n++
-			}
-		}
-		for _, p := range s.paths {
-			if p.meter == nil {
-				continue
-			}
-			c := uint64(0)
-			if limit > 0 && n > 0 {
-				c = limit / uint64(n)
-			}
-			if p.cps.cap != c {
-				p.cps.cap = c
-				p.meter.SetRateCap(c)
-			}
-		}
-		return
-	}
 	cp := &s.cp
 	round := cpMinRound
 	for _, p := range s.paths {

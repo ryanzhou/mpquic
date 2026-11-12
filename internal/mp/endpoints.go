@@ -15,7 +15,6 @@ import (
 	"github.com/apernet/quic-go"
 
 	"mpquic/internal/cc"
-	"mpquic/internal/cc/bbr"
 )
 
 // Client is the QUIC dialer: it maintains one session to a listener over many
@@ -27,7 +26,6 @@ type Client struct {
 	key     []byte
 	tlsConf *tls.Config
 	qconf   *quic.Config
-	profile bbr.Profile
 	sess    *Session
 	servers []string
 	wg      sync.WaitGroup
@@ -41,15 +39,11 @@ func NewClient(servers []string, opt *Options) (*Client, error) {
 		return nil, errors.New("no server addresses")
 	}
 	o := opt.withDefaults()
-	prof, err := cc.ParseProfile(o.Congestion)
-	if err != nil {
-		return nil, err
-	}
 	var id [16]byte
 	rand.Read(id[:])
 	c := &Client{
 		opt: o, key: deriveKey(o.Password), tlsConf: clientTLSConfig(o.SNI),
-		qconf: quicConfig(o), profile: prof, servers: servers,
+		qconf: quicConfig(o), servers: servers,
 	}
 	c.sess = newSession(o, id, true, o.StreamHandler)
 	for i, addr := range servers {
@@ -124,7 +118,7 @@ func (c *Client) runPath(index uint64, addr string) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	meter := cc.Install(conn, c.profile, !cpDisabled && !c.opt.NoCoupling)
+	meter := cc.Install(conn)
 	ctrl, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		conn.CloseWithError(errCodeShutdown, "")
@@ -172,7 +166,6 @@ type Server struct {
 	key      []byte
 	tlsConf  *tls.Config
 	qconf    *quic.Config
-	profile  bbr.Profile
 	acceptFn func(*Stream)
 
 	mu        sync.Mutex
@@ -189,17 +182,13 @@ func NewServer(opt *Options, handler func(*Stream)) (*Server, error) {
 	if handler == nil {
 		handler = o.StreamHandler
 	}
-	prof, err := cc.ParseProfile(o.Congestion)
-	if err != nil {
-		return nil, err
-	}
 	tc, err := serverTLSConfig(o.CertFile, o.KeyFile)
 	if err != nil {
 		return nil, err
 	}
 	s := &Server{
 		opt: o, key: deriveKey(o.Password), tlsConf: tc, qconf: quicConfig(o),
-		profile: prof, acceptFn: handler, sessions: make(map[[16]byte]*Session),
+		acceptFn: handler, sessions: make(map[[16]byte]*Session),
 	}
 	if o.MTU > 0 {
 		// The packet size depends on the client's address family.
@@ -268,7 +257,7 @@ func (s *Server) Close() {
 }
 
 func (s *Server) handleConn(conn *quic.Conn) {
-	meter := cc.Install(conn, s.profile, !cpDisabled && !s.opt.NoCoupling)
+	meter := cc.Install(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), s.opt.HandshakeTimeout)
 	defer cancel()
 	ctrl, err := conn.AcceptStream(ctx)

@@ -12,7 +12,6 @@
   "mode": "tcp_and_udp",
   "timeout": 300,
 
-  "congestion": "bbr",
   "window": "64MB",
   "stats_interval": 60
 }

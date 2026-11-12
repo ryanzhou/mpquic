@@ -1,76 +1,47 @@
-// Package cc wires congestion controllers into quic-go connections and exposes
-// their internal state (bandwidth estimate, cwnd, bytes in flight) to the
-// multipath scheduler in a goroutine-safe way.
+// Package cc is the congestion controller of a path's QUIC connection: it
+// paces at the rate the session gives the path, bounds what the path has in
+// flight (follower), and counts what became of the packets of each of the
+// session's rounds (Meter), which is what the session's rate controller
+// works from (internal/mp/rate.go).
 package cc
 
 import (
-	"fmt"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/monotime"
-
-	"mpquic/internal/cc/bbr"
 )
 
-// Metrics is a snapshot of congestion-controller state.
+// Metrics is a snapshot of a path's controller.
 type Metrics struct {
-	Bandwidth uint64 // bytes/s, 0 if unknown
-	Cwnd      uint64 // bytes
-	InFlight  uint64 // bytes
-	MinRTT    time.Duration
-	Pacing    uint64 // bytes/s
-	Mode      string
+	Rate     uint64 // the rate the path paces at (bytes/s)
+	Cwnd     uint64 // what it may have in flight (bytes)
+	InFlight uint64 // bytes
 	// packets sent / declared lost so far (quic-go only counts losses
 	// itself when its built-in controller is used)
 	PacketsSent, PacketsLost uint64
-	// StaleResets counts bandwidth estimates found stale (rate drop with a
-	// standing queue) and reset to the measured delivery rate.
-	StaleResets uint64
 }
 
-// sender is a path's congestion controller: a follower of the session's
-// rate, or a BBR of its own.
-type sender interface {
-	congestion.CongestionControlEx
-	ModeName() string
-	BandwidthEstimate() uint64
-	PacingRateBytes() uint64
-	MinRTT() time.Duration
-	Restart()
-}
-
-// Meter wraps a path's congestion controller and publishes its state, and
-// the path's counters, through atomics. All CongestionControl methods are
-// invoked from the quic-go connection goroutine.
+// Meter wraps a path's follower and publishes its state, and the path's
+// counters, through atomics. All CongestionControl methods are invoked from
+// the quic-go connection goroutine.
 type Meter struct {
-	s      sender
-	rate   atomic.Uint64 // bytes/s, for a follower (see SetRate)
+	s      *follower
+	rate   atomic.Uint64 // bytes/s (see SetRate)
 	round  atomic.Int64
 	rounds [meterRounds]meterRound
-	hasRTT atomic.Bool
 
-	bw       atomic.Uint64
 	cwnd     atomic.Uint64
 	inflight atomic.Uint64
-	minRTT   atomic.Int64
-	pacing   atomic.Uint64
-	mode     atomic.Value
-	lastMode string // of publish (the connection's goroutine)
 
 	appLimited atomic.Bool
-	probeGate  atomic.Pointer[ProbeGate]
 	sentPkts   atomic.Uint64
 	lostPkts   atomic.Uint64
-	stale      atomic.Uint64
 	acked      atomic.Uint64
-	rateCap    atomic.Uint64 // bytes/s, 0 = none
-	restart    atomic.Bool
-	blocked    atomic.Bool  // follower: in flight reached the window
-	baseRTT    atomic.Int64 // follower: see SetBaseRTT
+	blocked    atomic.Bool  // in flight reached the window
+	baseRTT    atomic.Int64 // see SetBaseRTT
 }
 
 // Rounds: what became of the packets sent in each of the session's rounds.
@@ -115,7 +86,7 @@ func (m *Meter) StartRound(id int64) { m.round.Store(id) }
 // Acked returns the bytes acknowledged so far.
 func (m *Meter) Acked() uint64 { return m.acked.Load() }
 
-// TakeBlocked reports whether a follower had as much in flight as it may
+// TakeBlocked reports whether the path had as much in flight as it may
 // have since the last call: the path was not delivering what it was given.
 func (m *Meter) TakeBlocked() bool { return m.blocked.Swap(false) }
 
@@ -163,43 +134,6 @@ func (m *Meter) roundOf(pn int64) *meterRound {
 	return nil
 }
 
-// ProbeGate serialises BBR PROBE_RTT among the connections sharing it (the
-// paths of one session): while one path has cut its window to 4 packets, the
-// others keep carrying the traffic.
-type ProbeGate struct {
-	holder atomic.Pointer[Meter]
-}
-
-func (g *ProbeGate) enter(m *Meter) bool {
-	return g.holder.CompareAndSwap(nil, m) || g.holder.Load() == m
-}
-
-// Release frees the gate if m holds it (e.g. when m's path is closed).
-func (g *ProbeGate) Release(m *Meter) { g.holder.CompareAndSwap(m, nil) }
-
-// SetProbeGate makes m take part in g.
-func (m *Meter) SetProbeGate(g *ProbeGate) { m.probeGate.Store(g) }
-
-func (m *Meter) gate(enter bool) bool {
-	g := m.probeGate.Load()
-	if g == nil {
-		return true
-	}
-	if enter {
-		return g.enter(m)
-	}
-	g.Release(m)
-	return true
-}
-
-// SetRateCap bounds the controller's bandwidth estimate to bytesPerSec (0
-// removes the bound); see bbr.Sender.RateCap.
-func (m *Meter) SetRateCap(bytesPerSec uint64) { m.rateCap.Store(bytesPerSec) }
-
-// Restart asks the controller to re-enter STARTUP (on its next ACK) if it is
-// in PROBE_BW; see bbr.Sender.Restart.
-func (m *Meter) Restart() { m.restart.Store(true) }
-
 // SetAppLimited tells the controller whether the application currently has
 // nothing to send on this connection.
 func (m *Meter) SetAppLimited(v bool) {
@@ -210,68 +144,29 @@ func (m *Meter) SetAppLimited(v bool) {
 
 var _ congestion.CongestionControlEx = (*Meter)(nil)
 
-// ParseProfile validates a congestion setting such as "bbr", "bbr-aggressive".
-func ParseProfile(s string) (bbr.Profile, error) {
-	s = strings.ToLower(strings.TrimSpace(s))
-	switch s {
-	case "", "bbr":
-		return bbr.ProfileStandard, nil
-	case "bbr-aggressive", "aggressive":
-		return bbr.ProfileAggressive, nil
-	case "bbr-conservative", "conservative":
-		return bbr.ProfileConservative, nil
-	case "cubic", "reno", "newreno":
-		return ProfileCubic, nil
-	}
-	return "", fmt.Errorf("unsupported congestion control %q (want bbr, bbr-aggressive, bbr-conservative, cubic)", s)
-}
-
-// ProfileCubic keeps quic-go's built-in CUBIC controller (for comparison).
-const ProfileCubic bbr.Profile = "cubic"
-
-// Install replaces the connection's congestion controller. With follow, the
-// path paces at the rate its session gives it (SetRate); otherwise it runs a
-// BBR of its own with the given profile. It returns nil (keeping quic-go's
-// built-in CUBIC) for ProfileCubic.
-func Install(conn *quic.Conn, profile bbr.Profile, follow bool) *Meter {
-	if profile == ProfileCubic {
-		return nil
-	}
+// Install replaces the connection's congestion controller with a follower
+// of the session's rate (SetRate).
+func Install(conn *quic.Conn) *Meter {
 	// Seed with the connection's own initial packet size (see quic-go's
 	// Conn.InitialPacketSize): it is what quic-go sends until path MTU
 	// discovery reports more, and all it sends with a fixed MTU.
 	m := &Meter{}
-	if follow {
-		m.s = newFollower(m, conn.InitialPacketSize())
-	} else {
-		b := bbr.NewBbrSender(bbr.DefaultClock{}, conn.InitialPacketSize(), profile)
-		b.AppLimitedHint = m.appLimited.Load
-		b.ProbeRTTGate = m.gate
-		b.RateCap = func() bbr.Bandwidth { return bbr.Bandwidth(m.rateCap.Load()) * bbr.BytesPerSecond }
-		m.s = b
-	}
+	m.s = newFollower(m, conn.InitialPacketSize())
 	conn.SetCongestionControl(m)
 	return m
 }
 
-// NewFollower returns a Meter with a follower that is not attached to a
-// connection (tests).
+// NewFollower returns a Meter that is not attached to a connection (tests).
 func NewFollower() *Meter {
 	m := &Meter{}
 	m.s = newFollower(m, congestion.InitialPacketSize)
 	return m
 }
 
-// SetRate sets the rate a follower paces at (bytes/s).
-func (m *Meter) SetRate(bytesPerSec uint64) {
-	m.rate.Store(bytesPerSec)
-	if m.Follows() { // what Snapshot reports must not wait for the next ACK
-		m.bw.Store(bytesPerSec)
-		m.pacing.Store(bytesPerSec)
-	}
-}
+// SetRate sets the rate the path paces at (bytes/s).
+func (m *Meter) SetRate(bytesPerSec uint64) { m.rate.Store(bytesPerSec) }
 
-// SetBaseRTT tells a follower the path's round-trip time without queues,
+// SetBaseRTT tells the follower the path's round-trip time without queues,
 // which bounds what it may have in flight (0: the connection's minimum).
 func (m *Meter) SetBaseRTT(d time.Duration) {
 	if m.baseRTT.Load() != int64(d) {
@@ -282,53 +177,21 @@ func (m *Meter) SetBaseRTT(d time.Duration) {
 // Rate returns the rate set with SetRate.
 func (m *Meter) Rate() uint64 { return m.rate.Load() }
 
-// Follows reports whether the path's rate is the session's to set.
-func (m *Meter) Follows() bool { _, ok := m.s.(*follower); return ok }
-
 // Snapshot returns the latest metrics.
 func (m *Meter) Snapshot() Metrics {
 	return Metrics{
-		Bandwidth: m.bw.Load(),
-		Cwnd:      m.cwnd.Load(),
-		InFlight:  m.inflight.Load(),
-		MinRTT:    time.Duration(m.minRTT.Load()),
-		Pacing:    m.pacing.Load(),
-		Mode:      m.modeName(),
-
+		Rate:        uint64(m.s.rate()),
+		Cwnd:        m.cwnd.Load(),
+		InFlight:    m.inflight.Load(),
 		PacketsSent: m.sentPkts.Load(),
 		PacketsLost: m.lostPkts.Load(),
-		StaleResets: m.stale.Load(),
 	}
 }
 
-func (m *Meter) modeName() string {
-	if v, ok := m.mode.Load().(string); ok {
-		return v
-	}
-	return ""
-}
-
-func (m *Meter) publish() {
-	// stored only when it changes: boxing the string allocates, and this
-	// runs for every ACK
-	if name := m.s.ModeName(); name != m.lastMode {
-		m.lastMode = name
-		m.mode.Store(name)
-	}
-	m.bw.Store(m.s.BandwidthEstimate())
-	m.cwnd.Store(uint64(m.s.GetCongestionWindow()))
-	if b, ok := m.s.(*bbr.Sender); ok {
-		m.stale.Store(b.StaleResets)
-	}
-	if m.hasRTT.Load() {
-		m.minRTT.Store(int64(m.s.MinRTT()))
-		m.pacing.Store(m.s.PacingRateBytes())
-	}
-}
+func (m *Meter) publish() { m.cwnd.Store(uint64(m.s.GetCongestionWindow())) }
 
 func (m *Meter) SetRTTStatsProvider(p congestion.RTTStatsProvider) {
 	m.s.SetRTTStatsProvider(p)
-	m.hasRTT.Store(true)
 	m.publish()
 }
 func (m *Meter) TimeUntilSend(b congestion.ByteCount) monotime.Time { return m.s.TimeUntilSend(b) }
@@ -350,9 +213,6 @@ func (m *Meter) OnCongestionEvent(pn congestion.PacketNumber, lost, prior conges
 	m.s.OnCongestionEvent(pn, lost, prior)
 }
 func (m *Meter) OnCongestionEventEx(prior congestion.ByteCount, t monotime.Time, acked []congestion.AckedPacketInfo, lost []congestion.LostPacketInfo) {
-	if m.restart.Load() && m.restart.CompareAndSwap(true, false) {
-		m.s.Restart()
-	}
 	m.s.OnCongestionEventEx(prior, t, acked, lost)
 	var a, l congestion.ByteCount
 	at := max(int64(t), 1) // the connection's clock: only differences count

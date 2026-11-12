@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"mpquic/internal/cc"
 )
 
 var errSessionClosed = errors.New("session closed")
@@ -45,7 +43,6 @@ type Session struct {
 	rrIdx     int
 	unacked   map[*Stream]struct{}
 	reinjectQ []*chunk
-	probeGate cc.ProbeGate // one path at a time in BBR PROBE_RTT
 	backlog   int64
 	ackDirty  map[*Stream]struct{}
 	ackAllIDs []uint64
@@ -177,12 +174,10 @@ func (s *Session) addPath(p *Path, nonce *[8]byte) error {
 	p.id = s.nextPID
 	p.state = stateActive
 	s.paths = append(s.paths, p)
-	if s.coupled() {
-		// Its share of the session rate now, not at the next tick (which
-		// is up to 100 ms away in an idle session: a new session's first
-		// data would crawl until then).
-		s.cpShareLocked(s.rateLimitLocked())
-	}
+	// Its share of the session rate now, not at the next tick (which is up
+	// to 100 ms away in an idle session: a new session's first data would
+	// crawl until then).
+	s.cpShareLocked(s.rateLimitLocked())
 	// On every path's control stream (reliable); older peers ignore it.
 	// Also without a limit: the peer may remember one from before this end
 	// was restarted without it.
@@ -202,9 +197,6 @@ func (s *Session) removePath(p *Path, err error) {
 		return
 	}
 	p.state = stateDead
-	if p.meter != nil {
-		s.probeGate.Release(p.meter)
-	}
 	for i, q := range s.paths {
 		if q == p {
 			s.paths = append(s.paths[:i], s.paths[i+1:]...)
@@ -214,7 +206,6 @@ func (s *Session) removePath(p *Path, err error) {
 	if len(s.paths) == 0 {
 		s.noPathAt = time.Now()
 	}
-	s.updateBenchedLocked()
 	s.requeueLocked(time.Now())
 	s.wakeAllLocked()
 	s.log.Info("path down", "path", p.name, "err", errString(err), "count", s.activeCountLocked())
@@ -250,20 +241,6 @@ func (s *Session) activeCountLocked() int {
 }
 
 func (s *Session) wakeAll() { s.wakeAllLocked() }
-
-// updateBenchedLocked recomputes which paths sit out (see Path.benchedLocked).
-func (s *Session) updateBenchedLocked() {
-	changed := false
-	for _, p := range s.paths {
-		if b := p.benchedLocked(); b != p.benched {
-			p.benched = b
-			changed = true
-		}
-	}
-	if changed {
-		s.wakeAllLocked()
-	}
-}
 
 func (s *Session) wakeAllLocked() {
 	for _, p := range s.paths {
@@ -620,16 +597,11 @@ func (s *Session) tick(now time.Time) bool {
 	active := len(s.streams) > 0
 	changed := false
 	for _, p := range s.paths {
-		prevMode := p.ccMode
 		p.refreshStatsLocked()
-		if debugWindows && p.ccMode != prevMode {
-			fmt.Fprintf(os.Stderr, "%s CCMODE %s %s -> %s\n", now.Format("15:04:05.000"), p.name, prevMode, p.ccMode)
-		}
 		if p.tickLocked(now, active) {
 			changed = true
 		}
 	}
-	s.updateBenchedLocked()
 	s.ackWait = s.ackEveryLocked()
 	s.couplingTickLocked(now)
 	if debugWindows {
@@ -807,23 +779,16 @@ type PathStat struct {
 	State     string
 	SRTT      time.Duration
 	MinRTT    time.Duration
-	Bandwidth uint64 // bytes/s (BBR estimate)
+	Bandwidth uint64 // the rate the path paces at: its share of the session rate (bytes/s)
 	Cwnd      uint64
-	Pacing    uint64 // bytes/s
-	CCMode    string
 	SentBytes uint64
 	RecvBytes uint64
 	LostBytes uint64
 	Loss      float64 // estimated packet loss rate
-	// StaleResets: BBR bandwidth estimates reset after a rate drop
-	StaleResets uint64
 	// ReinjectBytes / DupBytes: chunk bytes sent again on this path, as
 	// reinjections (rescues of late or lost data, insurance copies) and
 	// opportunistic or eager duplicates. Included in SentBytes.
 	ReinjectBytes, DupBytes uint64
-	// SharedCap: the path's share of the session rate (bytes/s), which caps
-	// its estimate; 0: not capped (its own estimate is below its share).
-	SharedCap uint64
 }
 
 // Stats returns per-path statistics.
@@ -846,10 +811,7 @@ func (s *Session) statsStringLocked() string {
 		st := p.statLocked()
 		fmt.Fprintf(&b, "%s[%s rtt=%v bw=%.1fMbit/s tx=%dMB rx=%dMB lost=%dKB", st.Name, st.State,
 			st.SRTT.Round(time.Millisecond), float64(st.Bandwidth)*8/1e6, st.SentBytes>>20, st.RecvBytes>>20, st.LostBytes>>10)
-		if st.StaleResets > 0 {
-			fmt.Fprintf(&b, " rate_drops=%d", st.StaleResets)
-		}
-		if l := p.cps.rawBw; l > 0 && st.SharedCap >= l/100*99 {
+		if l := p.cps.rawBw; l > 0 && st.Bandwidth >= l/100*99 {
 			// held to what it carries on its own, below an equal share
 			fmt.Fprintf(&b, " own=%.1fMbit/s", float64(l)*8/1e6)
 		}

@@ -118,15 +118,12 @@ Common options (shadowsocks-compatible):
                     (-s = the local's address and relays forwarding to it)
 
 mpquic options:
-  --congestion CC   with --no-coupling: bbr (default), bbr-aggressive,
-                    bbr-conservative; or cubic (bypasses the session rate)
   --window SIZE     max per-stream window, auto-tuned from 4MB (default 64MB)
   --chunk SIZE      scheduling chunk size (default 16KB)
   --stats SECONDS   log path statistics periodically
   --no-dup          disable opportunistic duplication on idle faster paths
   --up RATE         this endpoint's uplink rate, if known (e.g. 20mbit): never send more
   --down RATE       this endpoint's downlink rate (e.g. 100mbit): the peer never sends more
-  --no-coupling     no session rate: every path runs a BBR of its own
   --mtu BYTES       path MTU (IP packet size) of every path: fixed QUIC packet
                     size, no MTU discovery (default: start at 1200-byte
                     packets and discover each path's MTU)
@@ -224,13 +221,13 @@ func parseCommon(name string, args []string) (*commonFlags, error) {
 	fs.IntVar(&f.timeout, "t", 0, "timeout seconds")
 	fs.StringVar(&f.tunnel, "L", "", "tunnel target")
 	fs.BoolVar(&f.verbose, "v", false, "verbose")
-	fs.StringVar(&f.congestion, "congestion", "", "congestion control")
+	fs.StringVar(&f.congestion, "congestion", "", "ignored (removed: the session has one rate controller)")
 	fs.StringVar(&f.window, "window", "", "stream window")
 	fs.StringVar(&f.chunk, "chunk", "", "chunk size")
 	fs.IntVar(&f.stats, "stats", 0, "stats interval seconds")
 	fs.IntVar(&f.mtu, "mtu", 0, "path MTU")
 	fs.BoolVar(&f.noDup, "no-dup", false, "disable opportunistic duplication")
-	fs.BoolVar(&f.noCoupling, "no-coupling", false, "no session rate: every path runs a BBR of its own")
+	fs.BoolVar(&f.noCoupling, "no-coupling", false, "ignored (removed)")
 	fs.StringVar(&f.up, "up", "", "uplink rate of this endpoint (e.g. 20mbit)")
 	fs.StringVar(&f.down, "down", "", "downlink rate of this endpoint (e.g. 100mbit)")
 	fs.BoolVar(&f.race, "race-connect", false, "race staggered outbound TCP connection attempts (remote)")
@@ -308,8 +305,9 @@ func (f *commonFlags) load() (*config.Config, error) {
 	if f.tunnel != "" {
 		cfg.TunnelAddress = f.tunnel
 	}
-	if f.congestion != "" {
-		cfg.Congestion = f.congestion
+	if f.congestion != "" || f.noCoupling {
+		// accepted so that old command lines still start
+		fmt.Fprintln(os.Stderr, "warning: --congestion and --no-coupling are ignored: the session has one rate controller for all paths")
 	}
 	if f.window != "" {
 		v, err := config.ParseSize(f.window)
@@ -336,9 +334,6 @@ func (f *commonFlags) load() (*config.Config, error) {
 	}
 	if f.noDup {
 		cfg.NoDup = true
-	}
-	if f.noCoupling {
-		cfg.NoCoupling = true
 	}
 	for _, x := range []struct {
 		v   string

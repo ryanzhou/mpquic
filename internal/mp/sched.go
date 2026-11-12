@@ -99,9 +99,6 @@ func (s *Session) nextChunk(p *Path) (*chunk, int64, int, []uint64, error) {
 			p.busySince = now
 			p.busyLen = len(c.data)
 			p.busyChunk = c
-			if !c.small && p.burstAt.IsZero() {
-				p.burstAt = now
-			}
 			c.st.lastActive = now
 			if !s.opt.NoDup && len(c.sends) == 1 && c.small {
 				s.wakeAllLocked() // let an idle path consider a redundant copy
@@ -381,11 +378,6 @@ func (s *Session) lookaheadLocked(p *Path, size int, now time.Time) uint64 {
 		margin := 2*q.rttvar.Seconds() + 0.005
 		if q.lossy() {
 			margin = max(margin, q.srttOrDefault().Seconds()+q.reorderWindow().Seconds()+lag)
-		}
-		if q.ccMode == "startup" && q.burstSeen {
-			// STARTUP overshoots: the queue (and the delay of what is sent
-			// now) may grow by up to about one more RTT before BBR backs off.
-			margin += q.srttOrDefault().Seconds()
 		}
 		return e + margin
 	}
@@ -739,15 +731,6 @@ func (s *Session) dupCandidateLocked(p *Path, now time.Time) *chunk {
 // on every path they were sent on (bulk mode, where no path is idle).
 func (s *Session) reinjectOverdueLocked(now time.Time) bool {
 	any := false
-	// A chunk stuck in the send queue of a path that entered BBR ProbeRTT
-	// (window cut to 4 packets for ~200 ms) is sent elsewhere right away.
-	for _, p := range s.paths {
-		if c := p.busyChunk; c != nil && p.benched && p.probingRTT() && !c.acked && !c.queued && c.st.err == nil {
-			c.queued, c.queuedAt = true, now
-			s.reinjectQ = append(s.reinjectQ, c)
-			any = true
-		}
-	}
 	for st := range s.unacked {
 		lim := min(len(st.sendBuf), 4096)
 		cand := 0

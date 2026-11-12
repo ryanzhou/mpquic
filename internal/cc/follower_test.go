@@ -83,7 +83,7 @@ func TestFollowerWindow(t *testing.T) {
 	if w, want := m.GetCongestionWindow(), congestion.ByteCount(32*congestion.InitialPacketSize); w != want {
 		t.Errorf("window %d, want the minimum %d", w, want)
 	}
-	if s := m.Snapshot(); s.Mode != "follow" || s.Bandwidth != 10<<20 {
+	if s := m.Snapshot(); s.Rate != 10<<20 {
 		t.Errorf("snapshot %+v", s)
 	}
 }
