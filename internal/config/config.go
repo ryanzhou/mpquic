@@ -232,8 +232,11 @@ func (f *Fraction) UnmarshalJSON(b []byte) error {
 }
 
 // MarshalJSON writes the fraction as a percentage.
-func (f Fraction) MarshalJSON() ([]byte, error) {
-	return json.Marshal(strconv.FormatFloat(math.Round(float64(f)*1e6)/1e4, 'f', -1, 64) + "%")
+func (f Fraction) MarshalJSON() ([]byte, error) { return json.Marshal(f.String()) }
+
+// String is the fraction as a percentage ("10%"), as ParseFraction reads it.
+func (f Fraction) String() string {
+	return strconv.FormatFloat(math.Round(float64(f)*1e6)/1e4, 'f', -1, 64) + "%"
 }
 
 // ParseFraction parses "10%" or "0.1".
@@ -271,15 +274,24 @@ func (r *Rate) UnmarshalJSON(b []byte) error {
 
 // MarshalJSON writes round rates as strings ("20mbit") and others as numbers.
 func (r Rate) MarshalJSON() ([]byte, error) {
+	if s := r.String(); strings.HasSuffix(s, "bit") {
+		return json.Marshal(s)
+	}
+	return json.Marshal(uint64(r))
+}
+
+// String is the rate as ParseRate reads it: "20mbit" for round rates,
+// otherwise the number of bit/s.
+func (r Rate) String() string {
 	for _, u := range []struct {
 		mult   uint64
 		suffix string
 	}{{1e9, "gbit"}, {1e6, "mbit"}, {1e3, "kbit"}} {
 		if r != 0 && uint64(r)%u.mult == 0 {
-			return json.Marshal(strconv.FormatUint(uint64(r)/u.mult, 10) + u.suffix)
+			return strconv.FormatUint(uint64(r)/u.mult, 10) + u.suffix
 		}
 	}
-	return json.Marshal(uint64(r))
+	return strconv.FormatUint(uint64(r), 10)
 }
 
 // BytesPerSecond converts the rate for mp.Options.
