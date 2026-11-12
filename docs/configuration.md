@@ -130,9 +130,10 @@ the deployment.
   ```
 
   The top-level key applies to every path of the endpoint. Either end's
-  setting covers both directions of a path. A tolerance is also what a
-  policer or a full buffer on that path may take before the path slows
-  down, so keep it near the path's real loss rate; above about 20% loss
+  setting covers both directions of a path. Set it to about twice the
+  path's loss rate (what is lost in one round trip varies), and only on
+  paths that need it: a tolerance is also what a policer or a full buffer
+  on that path may take before the path slows down. Above about 20% loss
   it no longer helps. See
   [loss tolerance](design/congestion.md#loss-tolerance).
 * `stats_interval` (`--stats N`): logs the session rate (`rate=`, `limit=`)

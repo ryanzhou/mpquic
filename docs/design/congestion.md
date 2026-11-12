@@ -100,9 +100,12 @@ Each of these is marked in the code.
 ### What the session tells a path's controller
 
 * **Whether the application has data** (`AppLimitedHint`). A path that the
-  scheduler leaves idle carries only ACKs and pings. BBR must not take the
-  low delivery rate of those for the path's capacity, and quic-go does not
-  tell its congestion controller whether there was data to send.
+  scheduler leaves idle carries only ACKs and pings, and one that it feeds
+  with gaps delivers less than it could. BBR must not take either for the
+  path's capacity, and quic-go does not tell its congestion controller
+  whether there was data to send. Every moment in which the scheduler has
+  nothing for a path counts, however short, as a TCP sender notes the
+  moment its send buffer runs empty.
 * **When it may enter ProbeRTT** (`ProbeRTTGate`): one path of a session
   at a time, so that the others carry the traffic meanwhile. A path whose
   turn it is not enters when the gate is free.
@@ -141,7 +144,8 @@ queue or loss is that path's business.
   which the paths had no data to send), and counting such rounds would let
   *B* sink whenever the paths happen to send a little less than their
   shares. Rounds in which *every* path delivered clearly less than it sent
-  (below 0.98) show what a bottleneck that all of them pass carries, and
+  (below 0.98, less its loss tolerance: a path's known loss is no sign of
+  a bottleneck) show what a bottleneck that all of them pass carries, and
   *B* is the maximum of the last ten of those.
 * **Shares.** *B* is shared out max-min fairly as a cap on each path's
   estimate: a path whose own estimate is below an equal share keeps it,
@@ -231,12 +235,21 @@ It is set per endpoint (`loss_tolerance`, `--loss-tolerance`) or per path
 for a path to the other, and a path uses the larger of the two, so one
 entry covers both directions.
 
-Two things to know:
+Three things to know:
 
+* **Set it to about twice the path's loss rate.** Loss is judged over one
+  round trip, a few hundred packets, and what is lost of those varies
+  around the path's average. A tolerance just above the average is
+  exceeded now and then, and each time costs rate. Four paths of 50 Mbit/s with 20, 10, 5 and 1 % loss carried
+  44 Mbit/s without tolerances, 70 to 105 with 25, 15 and 10 %, and 140 to
+  170 with 40, 30 and 20 % (the earlier controller, which ignored loss:
+  145 to 153).
 * **The tolerance is what a policer or a full buffer may also take.** A
   path with a tolerance of 10 % that is limited by a policer loses up to
-  10 % there before its controller gives way. Set it only on paths that
-  need it, and not much above their loss rate.
+  10 % there before its controller gives way, and the session rate does
+  not count that loss either. Set it only on paths that need it. With 100 % on all five paths
+  of the policer example above: 288 Mbit/s with 11.6 % dropped, instead
+  of about 400 with 2 %.
 * **It helps up to about 20 % loss.** BBR finds a rate by sending 1.25
   times its estimate and seeing more delivered. With more than 20 % loss
   even the probe delivers less than the estimate, and the estimate decays
@@ -245,7 +258,8 @@ Two things to know:
 ## Limitations
 
 * **Random loss above 2 %, or reordering, without a tolerance** collapses
-  a path's rate (LOSSNUMBERS). BBRv1 did not care; that is the price of
+  a path's rate (one path of 100 Mbit/s at 150 ms: 41 Mbit/s at 2 % loss, 4 at 5 %, 1 at
+  10 %, and 20 with 2 % of the packets reordered). BBRv1 did not care; that is the price of
   obeying policers. Use `loss_tolerance`.
 * **The session rate treats all paths of a session alike.** If only some
   of them share a bottleneck while another has spare capacity of its own,
