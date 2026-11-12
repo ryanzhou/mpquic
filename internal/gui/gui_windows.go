@@ -69,7 +69,7 @@ type ui struct {
 	pathsTE, relaysTE, logTE               *walk.TextEdit
 	portLE, pwLE, laddrLE, lportLE         *walk.LineEdit
 	tunnelLE, windowLE, chunkLE, timeoutLE *walk.LineEdit
-	mtuLE                                  *walk.LineEdit
+	mtuLE, upLE, downLE, lossLE            *walk.LineEdit
 	statsLE, certLE, keyLE, sniLE          *walk.LineEdit
 	tabs                                   *walk.TabWidget
 	applyPB, startPB, stopPB, restartPB    *walk.PushButton
@@ -209,7 +209,7 @@ func (u *ui) create() error {
 						label("Password:", nil),
 						Composite{Layout: HBox{MarginsZero: true}, Children: []Widget{
 							LineEdit{AssignTo: &u.pwLE, PasswordMode: true},
-							CheckBox{AssignTo: &u.showPwCB, Text: "Show", OnCheckedChanged: func() { u.pwLE.SetPasswordMode(!u.showPwCB.Checked()) }},
+							CheckBox{AssignTo: &u.showPwCB, Text: "Show", OnCheckedChanged: u.showPassword},
 							PushButton{Text: "Generate", OnClicked: u.generatePassword},
 						}},
 						label("", nil),
@@ -240,6 +240,12 @@ func (u *ui) create() error {
 						LineEdit{AssignTo: &u.timeoutLE, CueBanner: "300", ColumnSpan: 2},
 						Label{Text: "Path MTU:", TextAlignment: AlignFar},
 						LineEdit{AssignTo: &u.mtuLE, CueBanner: "auto (e.g. 1280 for a 1280-byte tunnel)", ColumnSpan: 2},
+						Label{Text: "Uplink rate:", TextAlignment: AlignFar},
+						LineEdit{AssignTo: &u.upLE, CueBanner: "measured (if known, e.g. 19mbit: a little below this end's uplink)", ColumnSpan: 2},
+						Label{Text: "Downlink rate:", TextAlignment: AlignFar},
+						LineEdit{AssignTo: &u.downLE, CueBanner: "measured (if known, e.g. 95mbit: a little below this end's downlink)", ColumnSpan: 2},
+						Label{Text: "Loss tolerance:", TextAlignment: AlignFar},
+						LineEdit{AssignTo: &u.lossLE, CueBanner: "2% (e.g. 10% for paths that lose packets at random: about twice their loss)", ColumnSpan: 2},
 						Label{},
 						CheckBox{AssignTo: &u.noDupCB, Text: "Disable redundant copies on idle paths", ColumnSpan: 2},
 						Label{Text: "TLS certificate:", TextAlignment: AlignFar},
@@ -336,6 +342,9 @@ func (u *ui) setForm(f Form) {
 	u.chunkLE.SetText(f.Chunk)
 	u.timeoutLE.SetText(f.Timeout)
 	u.mtuLE.SetText(f.MTU)
+	u.upLE.SetText(f.Up)
+	u.downLE.SetText(f.Down)
+	u.lossLE.SetText(f.LossTolerance)
 	u.statsLE.SetText(f.Stats)
 	u.noDupCB.SetChecked(f.NoDup)
 	u.raceCB.SetChecked(f.RaceConnect)
@@ -376,6 +385,8 @@ func (u *ui) readForm() Form {
 		Chunk:       strings.TrimSpace(u.chunkLE.Text()),
 		Timeout:     strings.TrimSpace(u.timeoutLE.Text()),
 		MTU:         strings.TrimSpace(u.mtuLE.Text()),
+		Up:          strings.TrimSpace(u.upLE.Text()),
+		Down:        strings.TrimSpace(u.downLE.Text()),
 		Stats:       strings.TrimSpace(u.statsLE.Text()),
 		ReliableUDP: u.reliableCB.Checked(),
 		NoDup:       u.noDupCB.Checked(),
@@ -384,7 +395,18 @@ func (u *ui) readForm() Form {
 		Key:         strings.TrimSpace(u.keyLE.Text()),
 		SNI:         strings.TrimSpace(u.sniLE.Text()),
 		LogLevel:    level,
+
+		LossTolerance: strings.TrimSpace(u.lossLE.Text()),
 	}
+}
+
+// showPassword shows the password in clear text, or as dots, as the "Show"
+// box says. The edit control only draws its text again when asked to: the
+// change of the password character alone left the old picture on screen
+// until the field got the focus.
+func (u *ui) showPassword() {
+	u.pwLE.SetPasswordMode(!u.showPwCB.Checked())
+	u.pwLE.Invalidate()
 }
 
 func (u *ui) dirty() bool { return !reflect.DeepEqual(u.readForm(), u.loaded) }
@@ -416,13 +438,13 @@ func (u *ui) updateRole() {
 	listens := (local && rev) || (role == "remote" && !rev)
 	switch {
 	case local && !rev:
-		u.pathsLbl.SetText("Paths to the remote, one per line: its address and each relay (host[:port]):")
+		u.pathsLbl.SetText("Paths to the remote, one per line: its address and each relay (host[:port]).\r\nFor a path that loses packets at random, add its loss tolerance: host:port loss=10%")
 	case local && rev:
 		u.pathsLbl.SetText("QUIC listen addresses, one per line (empty: all interfaces):")
 	case role == "remote" && !rev:
 		u.pathsLbl.SetText("Listen addresses, one per line (empty: all interfaces):")
 	case role == "remote" && rev:
-		u.pathsLbl.SetText("Paths to the local instance, one per line: its address and each relay (host[:port]):")
+		u.pathsLbl.SetText("Paths to the local instance, one per line: its address and each relay (host[:port]).\r\nFor a path that loses packets at random, add its loss tolerance: host:port loss=10%")
 	}
 	if listens {
 		u.portLbl.SetText("Listen port (UDP):")
@@ -727,6 +749,8 @@ func (u *ui) smokeTest() error {
 	for _, js := range []*config.Config{
 		{Role: "local", Server: config.StringList{"203.0.113.10", "relay:9000"}, ServerPort: 8443, Password: "pw", Mode: "tcp_and_udp",
 			LocalAddress: "0.0.0.0", LocalPort: 1081, Window: 32 << 20, Timeout: 60, LogLevel: "debug", StatsInterval: 30},
+		{Role: "local", Servers: []config.ServerEntry{{Server: "203.0.113.10"}, {Server: "relay:9000", LossTolerance: 0.1}}, Password: "pw",
+			Congestion: "cubic", Up: 19e6, Down: 95e6, LossTolerance: 0.05, MTU: 1280},
 		{Role: "tunnel", Server: config.StringList{"a:1"}, Password: "pw", TunnelAddress: "10.0.0.1:22", ChunkSize: 8 << 10, NoDup: true},
 		{Role: "remote", Reverse: true, Server: config.StringList{"198.51.100.7:8388"}, Password: "pw", Cert: `C:\c.pem`, Key: `C:\k.pem`, SNI: "x", RaceConnect: true},
 		{Role: "relay", Relays: []config.RelayConfig{{Listen: ":9000", Target: "h:8388", Link: "delay=40ms", Rev: "loss=1%"}}, LogLevel: "warn"},
@@ -743,6 +767,13 @@ func (u *ui) smokeTest() error {
 		}
 		if !reflect.DeepEqual(cfg, js) {
 			return fmt.Errorf("config round trip for %s:\n got %+v\nwant %+v", js.Role, cfg, js)
+		}
+	}
+	// "Show" switches the password field between dots and clear text.
+	for _, show := range []bool{true, false, true} {
+		u.showPwCB.SetChecked(show)
+		if u.pwLE.PasswordMode() == show {
+			return fmt.Errorf("password field: Show=%v, but password mode is %v", show, u.pwLE.PasswordMode())
 		}
 	}
 	u.tabs.SetCurrentIndex(logTab)

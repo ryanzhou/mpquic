@@ -40,6 +40,15 @@ Windows 11 24H2 and later, double-clicking opens no console window. On
 earlier versions, a console window flashes briefly before the configurator
 appears.
 
+In the configurator, the rates of this end's line (`up` / `down`) and the
+loss tolerance of all paths are on the *Advanced* page. A single path's
+loss tolerance is written after its address in the list of paths:
+
+```
+remote.example.com:8388
+relay-a.example.net:9000 loss=10%
+```
+
 The configurator keeps a `wireguard` section it finds in the config but does
 not edit it (edit the JSON file); the service installer opens the WireGuard
 UDP port in the firewall. The TUN interface is not available on Windows.

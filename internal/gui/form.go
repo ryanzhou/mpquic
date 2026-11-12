@@ -17,9 +17,11 @@ import (
 
 // Form is the editable state of the configurator.
 type Form struct {
-	Role     string // local, tunnel, remote, relay
-	Reverse  bool
-	Paths    string // one address per line
+	Role    string // local, tunnel, remote, relay
+	Reverse bool
+	// Paths: one address per line. On the dialing side a line may end in
+	// "loss=10%", the path's loss tolerance.
+	Paths    string
 	Port     string
 	Password string
 	UDP      bool
@@ -35,7 +37,11 @@ type Form struct {
 	Timeout     string
 	MTU         string
 	Stats       string
-	NoDup       bool
+	// Up, Down: the rates of this end's line, if known ("20mbit").
+	Up, Down string
+	// LossTolerance of every path ("10%"); a path's own is in Paths.
+	LossTolerance string
+	NoDup         bool
 	// RaceConnect (remote): race staggered outbound TCP connection attempts.
 	RaceConnect bool
 	Cert, Key   string
@@ -55,12 +61,34 @@ func GeneratePassword() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// entryPath is how a "servers" entry shows in the form's list of paths.
+// entryPath is how a "servers" entry shows in the form's list of paths:
+// its address, and its loss tolerance if it has one.
 func entryPath(e config.ServerEntry) string {
+	addr := e.Server
 	if e.ServerPort != 0 {
-		return config.JoinHostPort(e.Server, e.ServerPort)
+		addr = config.JoinHostPort(e.Server, e.ServerPort)
 	}
-	return e.Server
+	if e.LossTolerance > 0 {
+		addr += " loss=" + e.LossTolerance.String()
+	}
+	return addr
+}
+
+// parsePath reads a line of the form's list of paths: "host[:port]" and,
+// optionally, "loss=10%" (or "loss_tolerance=10%").
+func parsePath(line string) (addr string, tolerance config.Fraction, err error) {
+	fields := strings.Fields(line)
+	addr = fields[0]
+	for _, f := range fields[1:] {
+		k, v, _ := strings.Cut(f, "=")
+		if k != "loss" && k != "loss_tolerance" {
+			return "", 0, fmt.Errorf("path %q: unknown option %q (a path is host[:port], optionally followed by loss=10%%)", addr, f)
+		}
+		if tolerance, err = config.ParseFraction(v); err != nil {
+			return "", 0, fmt.Errorf("path %q: loss tolerance: %w", addr, err)
+		}
+	}
+	return addr, tolerance, nil
 }
 
 // FormFromConfig fills a form from a config.
@@ -102,13 +130,31 @@ func FormFromConfig(c *config.Config) Form {
 		Timeout:     itoa(c.Timeout),
 		MTU:         itoa(c.MTU),
 		Stats:       itoa(c.StatsInterval),
+		Up:          rate(c.Up),
+		Down:        rate(c.Down),
 		NoDup:       c.NoDup,
 		RaceConnect: c.RaceConnect,
 		Cert:        c.Cert,
 		Key:         c.Key,
 		SNI:         c.SNI,
 		LogLevel:    logLevel,
+
+		LossTolerance: fraction(c.LossTolerance),
 	}
+}
+
+func rate(r config.Rate) string {
+	if r == 0 {
+		return ""
+	}
+	return r.String()
+}
+
+func fraction(f config.Fraction) string {
+	if f == 0 {
+		return ""
+	}
+	return f.String()
 }
 
 func itoa(n int) string {
@@ -183,18 +229,25 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		}
 	} else {
 		c.Reverse = f.Reverse
-		// A path keeps the loss tolerance that the configuration file
-		// gives it (the form has no field for it).
-		tol := map[string]config.Fraction{}
-		for _, e := range c.Servers {
-			tol[entryPath(e)] = e.LossTolerance
-		}
+		// Plain addresses are the "server" list. If a path has a loss
+		// tolerance, all of them are "servers" entries, which keeps the
+		// paths in the order of the form.
 		c.Server, c.Servers = nil, nil
+		var entries []config.ServerEntry
+		own := false
 		for _, l := range lines(f.Paths) {
-			if t := tol[l]; t > 0 {
-				c.Servers = append(c.Servers, config.ServerEntry{Server: l, LossTolerance: t})
-			} else {
-				c.Server = append(c.Server, l)
+			addr, tol, e := parsePath(l)
+			if e != nil && err == nil {
+				err = e
+			}
+			entries = append(entries, config.ServerEntry{Server: addr, LossTolerance: tol})
+			own = own || tol > 0
+		}
+		if own {
+			c.Servers = entries
+		} else {
+			for _, e := range entries {
+				c.Server = append(c.Server, e.Server)
 			}
 		}
 		num("Port", f.Port, &c.ServerPort)
@@ -215,6 +268,22 @@ func (f Form) Apply(base *config.Config) (*config.Config, error) {
 		sz("Chunk size", f.Chunk, &c.ChunkSize)
 		num("Idle timeout", f.Timeout, &c.Timeout)
 		num("Path MTU", f.MTU, &c.MTU)
+		c.Up, c.Down, c.LossTolerance = 0, 0, 0
+		if v := strings.TrimSpace(f.Up); v != "" && err == nil {
+			if c.Up, err = config.ParseRate(v); err != nil {
+				err = fmt.Errorf("Uplink rate: %q is not a valid rate (e.g. 20mbit)", v)
+			}
+		}
+		if v := strings.TrimSpace(f.Down); v != "" && err == nil {
+			if c.Down, err = config.ParseRate(v); err != nil {
+				err = fmt.Errorf("Downlink rate: %q is not a valid rate (e.g. 100mbit)", v)
+			}
+		}
+		if v := strings.TrimSpace(f.LossTolerance); v != "" && err == nil {
+			if c.LossTolerance, err = config.ParseFraction(v); err != nil {
+				err = fmt.Errorf("Loss tolerance: %q is not a valid share (e.g. 10%%)", v)
+			}
+		}
 		c.NoDup = f.NoDup
 		c.RaceConnect = f.RaceConnect
 		c.Cert = strings.TrimSpace(f.Cert)

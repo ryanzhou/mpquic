@@ -16,7 +16,7 @@ func TestRoundTrip(t *testing.T) {
 		`{"role":"tunnel","server":["a:1"],"password":"pw","tunnel_address":"10.0.0.1:22","chunk_size":"8KB"}`,
 		`{"role":"tunnel","server":["a:1"],"password":"pw","tunnel_address":"10.0.0.1:53","mode":"tcp_and_udp","reliable_udp":true}`,
 		`{"role":"local","reverse":true,"password":"pw","local_port":1081}`,
-		`{"role":"local","server":["a:1"],"servers":[{"server":"b:2","loss_tolerance":"20%"}],"password":"pw","loss_tolerance":"5%","up":"20mbit"}`,
+		`{"role":"local","servers":[{"server":"a:1"},{"server":"b:2","loss_tolerance":"20%"}],"password":"pw","loss_tolerance":"5%","up":"20mbit","down":95500000}`,
 		`{"role":"relay","relays":[{"listen":":9000","target":"h:8388"},{"listen":"0.0.0.0:9001","target":"h:8388","link":"delay=30ms,loss=0.5%","rev":"rate=10mbit"}]}`,
 	} {
 		var c config.Config
@@ -59,7 +59,31 @@ func TestApplyEdits(t *testing.T) {
 	if len(base.Servers) != 2 || base.Server != nil {
 		t.Fatal("base was modified")
 	}
+	// rates, the loss tolerance of all paths and of one path
+	f.Up, f.Down, f.LossTolerance = "19 mbit", "", "5%"
+	f.Paths = "1.2.3.4:443\nrelay loss=10%\n10.0.0.1:9000 loss_tolerance=0.25"
+	c, err = f.Apply(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []config.ServerEntry{{Server: "1.2.3.4:443"}, {Server: "relay", LossTolerance: 0.1}, {Server: "10.0.0.1:9000", LossTolerance: 0.25}}
+	if c.Up != 19e6 || c.Down != 0 || c.LossTolerance != 0.05 || c.Server != nil || !reflect.DeepEqual(c.Servers, want) {
+		t.Fatalf("applied = up %v down %v tolerance %v server %v servers %+v", c.Up, c.Down, c.LossTolerance, c.Server, c.Servers)
+	}
+	if tol := c.PathLossTolerances(); len(tol) != 3 || tol[0] != 0 || tol[1] != 0.1 || tol[2] != 0.25 {
+		t.Fatalf("path tolerances %v", tol)
+	}
+	// ... and back into the form as it was written
+	if g := FormFromConfig(c); g.Up != "19mbit" || g.LossTolerance != "5%" || g.Paths != "1.2.3.4:443\nrelay loss=10%\n10.0.0.1:9000 loss=25%" {
+		t.Fatalf("form = up %q tolerance %q paths %q", g.Up, g.LossTolerance, g.Paths)
+	}
+	f = FormFromConfig(base)
 	for _, bad := range []func(*Form){
+		func(f *Form) { f.Up = "fast" },
+		func(f *Form) { f.Down = "-1mbit" },
+		func(f *Form) { f.LossTolerance = "30" },
+		func(f *Form) { f.Paths = "relay loss=lots" },
+		func(f *Form) { f.Paths = "relay weight=2" },
 		func(f *Form) { f.Port = "x" },
 		func(f *Form) { f.Window = "lots" },
 		func(f *Form) { f.Password = "" },
