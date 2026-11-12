@@ -39,7 +39,7 @@ rate for a path whose relay is slower than its share.
 |---|---|---|
 | **rate** | *B* is the highest rate at which the session's data was delivered in one of the last ten rounds | BBR's bandwidth estimate |
 | **start-up** | send twice what is acknowledged, until *B* stops growing, the round trips rise, or loss shows | slow start; BBR's "full pipe"; HyStart++; BBRv2 |
-| **probe** | every eight rounds one round at 1.25·*B*, then as much less; a probe that was delivered is followed at once by a larger one | BBR's probe cycle |
+| **probe** | every eight rounds one round at 1.25·*B*, one at *B*, then one as much less; a probe that was delivered is followed at once by a larger one | BBR's probe cycle |
 | **drain** | after a start-up, a probe or a cut: send less until no more is in flight than *B* needs | BBR's drain |
 | **loss** | two rounds that lose beyond the paths' baselines, on all paths: *B* comes down by the share that was lost; probes that are answered by loss become rare | BBRv2's loss bound; exponential back-off |
 | **paths** | a path paces at its share and may have two round trips' worth of it in flight | BBR's window |
@@ -84,10 +84,13 @@ congestion. What tells the two apart is that congestion loss comes with the
 rate and random loss does not. So every path has a **baseline**: the share
 it loses when the pipe is clearly not full. A round shows that if the
 session, and the path, sent less than 0.9 of what they put out two rounds
-later (the round after a probe; a start-up's rounds while the rate still
-doubles). The baseline is the loss of such rounds together, later ones
-counting more, and it is known once they add up to 200 packets: one small
-round says little (two lost of a hundred is as likely as none).
+later: the round after a probe, the round at half rate after a cut for loss
+(so loss that does not come with the rate is in the baseline two rounds
+after it was taken for the pipe's, and is not acted on again), and a
+start-up's rounds while the rate still doubles. The baseline is the loss of
+such rounds together, later ones counting more, and it is known once they
+add up to 200 packets: one small round says little (two lost of a hundred
+is as likely as none).
 
 A path's round is **lossy** if it lost more than the baseline by 2% of what
 it sent (BBRv2's loss threshold), and by more than chance explains: three
@@ -111,8 +114,10 @@ rate doubles every round trip, as slow start does with its window. It ends
   moment;
 * or when the last two rounds are lossy on all paths, by at least 32
   packets: BBRv2 ends its start-up on loss in the same way, and asks for
-  eight loss events, so that one burst of random loss before the baselines
-  are known does not end it.
+  eight loss events, so that one burst of random loss does not end it. Only
+  paths whose baselines are known count: the first rounds, while the pipe
+  is not full, show them, and until then a path's random loss cannot be
+  told from the pipe's.
 
 The last two are checked at every tick, not only at the end of a round: a
 round at twice the pipe's rate queues or loses a round's worth. *B* is then
@@ -133,18 +138,19 @@ not age the others: *B* is not forgotten while the application is idle.)
 When the capacity drops, *B* follows after ten rounds at the latest;
 meanwhile the paths' windows hold what queues to a round trip's worth.
 
-**Probes.** Every eight rounds one round sends 1.25·*B*, and the next one
-as much less, so that what the probe queued is gone again: BBR's cycle.
-Three rounds later, when the probe's packets have been acknowledged and
-their losses are known, the session judges it:
+**Probes.** Every eight rounds one round sends 1.25·*B*, the next sends
+*B*, and the one after that as much less as the probe sent more, so that
+what the probe queued is gone again: BBR's cycle, with a round in between.
+A probe's packets are acknowledged partly in its own round and partly in
+the next (paths differ in delay), so the two rounds together show what it
+delivered, and the round in between must not change anything else. When
+their losses are known, the session judges the probe:
 
-* If *B* has risen by at least a quarter of what the probe added, there is
-  more. The next probe follows at once and asks for twice as much more
-  (1.5, then 2): a capacity that is far away is found in a few steps, as in
-  slow start. (Why a quarter: paths differ in delay, so a probe's packets
-  reach the receiver interleaved with those of the rounds around it, and
-  only part of what a delivered probe added shows in any one round, a third
-  at least.)
+* If the two rounds together delivered more than *B* by at least a quarter
+  of what the probe added, there is more (all of it would show as half).
+  The next probe follows at once and asks for twice as much more (1.5, then
+  2): a capacity that is far away is found in a few steps, as in slow
+  start.
 * If not, *B* is what it was before the probe. A rate that kept every
   slightly higher sample would creep above what the pipe carries and keep a
   queue there.
@@ -221,15 +227,19 @@ and probed by the same code (`cpRate`).
 * Only rounds in which the path's **window held it back** count (and rounds
   in which it delivered more than its rate): a path that delivers what it
   is given has shown no limit, and holding it to what it happened to carry
-  would freeze whatever split the paths began with. The rate is known after
-  three such rounds: acknowledgements that stall for a moment hold a path
-  back, too.
+  would freeze whatever split the paths began with. Such rounds count
+  whatever the path lost in them: a relay whose buffer overflows passes
+  what it carries. The rate is known after three such rounds:
+  acknowledgements that stall for a moment hold a path back, too.
 * **Loss**: a path that is lossy for two rounds at its plain share, while
-  the session is not, has its rate come down by what it lost, like *B*.
+  the session is not (that is *B*'s business), has its rate come down by
+  what it lost, like *B*, and gets half of it until what queued at the
+  relay is gone. This needs the path's baseline: a relay that polices is
+  found this way, a path with random loss is not.
 * **Probes**: every eight rounds a path that is held to its own rate gets a
-  quarter more for a round and then as much less until what that queued is
-  gone, with the same judgement and the same back-off as the session's
-  probes (if a quarter more is still within an equal share of *B*; a path
+  quarter more for a round, its rate for the next, and then as much less
+  until what that queued is gone, with the same judgement and the same
+  back-off as the session's probes (if a quarter more is still within an equal share of *B*; a path
   that gets about an equal share is probed with the session). The other paths get that much less and more, so the probe costs a
   common bottleneck nothing, and it shows what the path carries even when
   the common bottleneck is full.
