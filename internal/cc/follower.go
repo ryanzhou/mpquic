@@ -9,28 +9,34 @@ import (
 	"mpquic/internal/cc/common"
 )
 
-// follower is the congestion controller of a path whose rate is decided
-// elsewhere: by the session, for all its paths together (see Meter.SetRate).
-// It has no start-up or probing of its own, and its rate is not its
-// decision. It paces at the rate it is given, and it bounds what is in
-// flight to what the path itself delivers in two round trips, so a path
-// that delivers less than it is given (a slow relay) queues one round trip's
-// worth and no more, and a path that stops delivering stops sending.
-// (Hysteria's Brutal paces at a configured rate in the same way; the window
-// is BBR's.)
+// follower is the congestion controller of a path. The path's rate is not
+// its decision: the session decides it for all its paths together (see
+// Meter.SetRate), and the follower has no start-up or probing of its own.
+// It does two things:
+//
+//   - It paces at the rate it is given. (Hysteria's Brutal paces at a
+//     configured rate in the same way.)
+//   - It bounds what is in flight to what the path's share of the session
+//     rate needs over two round trips without a queue. This is BBR's
+//     window: a path that carries its share has one round trip's worth in
+//     flight, so the second is room for a queue of one round trip (and for
+//     acknowledgements that come in bunches). A path that carries less
+//     than it is given (a slow relay, a bottleneck whose capacity dropped)
+//     queues that much and no more, and a path that stops delivering stops
+//     sending. The session hears when the window held the path back
+//     (Meter.TakeBlocked).
+//
+// The window is for the share, not for the rate of the moment (as BBR's is
+// for its bandwidth estimate, not its pacing rate): a round that sends less
+// to drain a queue must not find its window shrunk below what is in flight.
+// And it is for what the path is given, not for what it delivers: a window
+// that follows the delivery rate shrinks when the path delivers less because
+// the window holds it back, and so shrinks itself.
 type follower struct {
 	m     *Meter
 	rtt   congestion.RTTStatsProvider
 	pacer *common.Pacer
 	mds   congestion.ByteCount
-
-	// The path's delivery rate: bytes acknowledged per second, the highest
-	// of the last followWindows measuring windows in which the path had
-	// data to send (a window in which it had none says nothing).
-	winAt    monotime.Time
-	winBytes congestion.ByteCount
-	winIdle  bool
-	rates    [followWindows]float64
 }
 
 const (
@@ -40,18 +46,13 @@ const (
 	followMinRate = 8 << 10
 	// followInitial is the rate before the session has assigned one.
 	followInitial = 64 << 10
-	// A path may have in flight what it delivers in two round trips, and at
-	// least what it delivers in followSlack on top of one (short paths:
-	// acknowledgements come in bunches), and never less than
-	// followMinWindow packets (the start, and a path that carried little).
+	// On a short path the second round trip is too little room:
+	// acknowledgements come every few milliseconds at best, and in bunches.
+	// The window is at least what the rate needs over one round trip and
+	// followSlack (quic-go's maximum ACK delay), and never less than
+	// followMinWindow packets (quic-go's initial window).
 	followSlack     = 25 * time.Millisecond
-	followMinWindow = 32 // packets
-	followWindows   = 4
-	// The window bounds a path that delivers less than this much of its
-	// rate (see window).
-	followCarries = 0.9
-	// A measuring window is a round trip long, and at least this.
-	followMinMeasure = 25 * time.Millisecond
+	followMinWindow = 32
 )
 
 func newFollower(m *Meter, mds congestion.ByteCount) *follower {
@@ -70,9 +71,9 @@ func (f *follower) rate() congestion.ByteCount {
 }
 
 // baseRTT is the path's round trip without queues: the session's figure if
-// it has one. The connection's minimum is for its lifetime, and a path
-// whose round trip got longer (a new route, a queue that is not ours) would
-// be held back by it.
+// it has one (the lowest of the last ten seconds). The connection's minimum
+// is for its lifetime, and a path whose round trip got longer (a new route)
+// would be held back by it for good.
 func (f *follower) baseRTT() time.Duration {
 	rtt := time.Duration(f.m.baseRTT.Load())
 	if rtt <= 0 && f.rtt != nil {
@@ -81,58 +82,13 @@ func (f *follower) baseRTT() time.Duration {
 	return rtt
 }
 
-// delivered is the path's delivery rate (bytes/s, 0: not known yet).
-func (f *follower) delivered() float64 {
-	var r float64
-	for _, v := range f.rates {
-		r = max(r, v)
-	}
-	return r
-}
-
-// onAcked counts n bytes acknowledged at t.
-func (f *follower) onAcked(t monotime.Time, n congestion.ByteCount) {
-	if f.winAt == 0 {
-		f.winAt = t
-	}
-	f.winBytes += n
-	f.winIdle = f.winIdle || f.m.appLimited.Load()
-	d := t.Sub(f.winAt)
-	w := max(f.baseRTT(), followMinMeasure)
-	if d < w {
-		// More than is known shows before the window is over (a start-up:
-		// the rate doubles every round trip, and so must the window).
-		if r := float64(f.winBytes) / d.Seconds(); d >= w/2 && r > f.rates[0] {
-			f.rates[0] = r
-		}
-		return
-	}
-	// A window in which the path had nothing to send for a while only
-	// counts if it shows more than is known.
-	if r := float64(f.winBytes) / d.Seconds(); !f.winIdle || r > f.delivered() {
-		copy(f.rates[1:], f.rates[:])
-		f.rates[0] = r
-	}
-	f.winAt, f.winBytes, f.winIdle = t, 0, false
-}
-
 func (f *follower) window() congestion.ByteCount {
 	floor := followMinWindow * f.mds
 	rtt := f.baseRTT()
 	if rtt <= 0 {
 		return floor
 	}
-	d := max(2*rtt, rtt+followSlack)
-	del := f.delivered()
-	w := del * d.Seconds()
-	// A path that delivers what it is given is not held back, however long
-	// its round trips are: they also grow with queues that are not this
-	// path's, or not this direction's (the acknowledgements of a download
-	// behind an upload's queue), and a window of two base round trips
-	// would then keep the path below its rate.
-	if r := float64(f.rate()); del >= followCarries*r && f.rtt != nil {
-		w = max(w, r*(f.rtt.SmoothedRTT()+d).Seconds())
-	}
+	w := float64(f.m.share.Load()) * max(2*rtt, rtt+followSlack).Seconds()
 	return max(congestion.ByteCount(w), floor)
 }
 
@@ -156,14 +112,7 @@ func (f *follower) OnPacketAcked(congestion.PacketNumber, congestion.ByteCount, 
 }
 func (f *follower) OnCongestionEvent(congestion.PacketNumber, congestion.ByteCount, congestion.ByteCount) {
 }
-func (f *follower) OnCongestionEventEx(_ congestion.ByteCount, t monotime.Time, acked []congestion.AckedPacketInfo, _ []congestion.LostPacketInfo) {
-	var n congestion.ByteCount
-	for _, p := range acked {
-		n += p.BytesAcked
-	}
-	if n > 0 {
-		f.onAcked(t, n)
-	}
+func (f *follower) OnCongestionEventEx(congestion.ByteCount, monotime.Time, []congestion.AckedPacketInfo, []congestion.LostPacketInfo) {
 }
 func (f *follower) OnRetransmissionTimeout(bool) {}
 func (f *follower) SetMaxDatagramSize(s congestion.ByteCount) {

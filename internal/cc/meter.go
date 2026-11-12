@@ -30,18 +30,18 @@ type Metrics struct {
 type Meter struct {
 	s      *follower
 	rate   atomic.Uint64 // bytes/s (see SetRate)
+	share  atomic.Uint64 // bytes/s (see SetRate)
 	round  atomic.Int64
 	rounds [meterRounds]meterRound
 
 	cwnd     atomic.Uint64
 	inflight atomic.Uint64
 
-	appLimited atomic.Bool
-	sentPkts   atomic.Uint64
-	lostPkts   atomic.Uint64
-	acked      atomic.Uint64
-	blocked    atomic.Bool  // in flight reached the window
-	baseRTT    atomic.Int64 // see SetBaseRTT
+	sentPkts atomic.Uint64
+	lostPkts atomic.Uint64
+	acked    atomic.Uint64
+	blocked  atomic.Bool  // in flight reached the window
+	baseRTT  atomic.Int64 // see SetBaseRTT
 }
 
 // Rounds: what became of the packets sent in each of the session's rounds.
@@ -134,14 +134,6 @@ func (m *Meter) roundOf(pn int64) *meterRound {
 	return nil
 }
 
-// SetAppLimited tells the controller whether the application currently has
-// nothing to send on this connection.
-func (m *Meter) SetAppLimited(v bool) {
-	if m.appLimited.Load() != v {
-		m.appLimited.Store(v)
-	}
-}
-
 var _ congestion.CongestionControlEx = (*Meter)(nil)
 
 // Install replaces the connection's congestion controller with a follower
@@ -163,8 +155,14 @@ func NewFollower() *Meter {
 	return m
 }
 
-// SetRate sets the rate the path paces at (bytes/s).
-func (m *Meter) SetRate(bytesPerSec uint64) { m.rate.Store(bytesPerSec) }
+// SetRate sets the rate the path paces at, and the rate its window is for:
+// its share of the session rate as that was measured (bytes/s). The two
+// differ while the session sends less than its rate for a round (a drain),
+// and before the session has measured a rate (share 0: the initial window).
+func (m *Meter) SetRate(pace, share uint64) {
+	m.rate.Store(pace)
+	m.share.Store(share)
+}
 
 // SetBaseRTT tells the follower the path's round-trip time without queues,
 // which bounds what it may have in flight (0: the connection's minimum).

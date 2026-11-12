@@ -20,70 +20,49 @@ func (r fixedRTT) UpdateRTT(_, _ time.Duration) {}
 func (r fixedRTT) SetMaxAckDelay(time.Duration) {}
 func (r fixedRTT) SetInitialRTT(time.Duration)  {}
 
-// A follower may have in flight what the path delivers in two round trips
-// (or in one round trip and 25 ms, if that is more), whatever rate it is
-// given; and it says when that held it back.
+// A follower may have in flight what its rate needs over two round trips
+// without a queue (or over one round trip and 25 ms, if that is more), and
+// it says when that held it back.
 func TestFollowerWindow(t *testing.T) {
 	m := NewFollower()
-	m.SetRTTStatsProvider(fixedRTT(100 * time.Millisecond))
-	m.SetRate(10 << 20)
-	at := func(ms int) monotime.Time { return monotime.Time(int64(time.Hour) + int64(ms)*int64(time.Millisecond)) }
-	ack := func(ms int, n congestion.ByteCount) {
-		m.OnCongestionEventEx(0, at(ms), []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: n}}, nil)
-	}
-	// nothing delivered yet: the initial window
+	// no round trip known yet: the initial window
 	if w := m.GetCongestionWindow(); w != 32*congestion.InitialPacketSize {
 		t.Errorf("initial window %d", w)
 	}
-	// the path delivers 1 MB/s (100 KB every 100 ms), a tenth of its rate
-	for i := 0; i <= 5; i++ {
-		ack(i*100, 100<<10)
+	// ... and with a rate to pace at, but no share of a measured session
+	// rate yet
+	m.SetRTTStatsProvider(fixedRTT(100 * time.Millisecond))
+	m.SetRate(10<<20, 0)
+	if w := m.GetCongestionWindow(); w != 32*congestion.InitialPacketSize {
+		t.Errorf("window %d before the session has a rate", w)
 	}
-	if w, want := m.GetCongestionWindow(), congestion.ByteCount(200<<10); w < want*95/100 || w > want*105/100 {
-		t.Errorf("window %d, want about %d (two round trips of what it delivers)", w, want)
+	m.SetRate(1<<20, 1<<20)
+	if w, want := m.GetCongestionWindow(), congestion.ByteCount((1<<20)/5); w < want*99/100 || w > want*101/100 {
+		t.Errorf("window %d, want %d (two round trips at its rate)", w, want)
 	}
-	// A path that delivers what it is given is not held back by long round
-	// trips (another direction's queue): its rate for a smoothed round
-	// trip, on top of the two.
-	m.SetRate(1 << 20)
-	if w, want := m.GetCongestionWindow(), congestion.ByteCount(300<<10); w < want*95/100 || w > want*105/100 {
-		t.Errorf("window %d, want about %d (it carries its rate)", w, want)
-	}
-	m.SetRate(10 << 20)
 	if !m.CanSend(100<<10) || m.TakeBlocked() {
 		t.Error("blocked below the window")
 	}
 	if m.CanSend(300<<10) || !m.Blocked() || !m.TakeBlocked() || m.TakeBlocked() {
 		t.Error("not blocked (once) at the window")
 	}
-	// It delivers less for a while because it has less to send: that is
-	// not the path's doing, and the window stays.
-	m.SetAppLimited(true)
-	for i := 6; i <= 15; i++ {
-		ack(i*100, 10<<10)
-	}
-	if w := m.GetCongestionWindow(); w < 190<<10 {
-		t.Errorf("window %d after an idle spell", w)
-	}
-	// It delivers less with data to send: the window follows.
-	m.SetAppLimited(false)
-	for i := 16; i <= 25; i++ {
-		ack(i*100, 50<<10)
-	}
-	if w, want := m.GetCongestionWindow(), congestion.ByteCount(100<<10); w < want*95/100 || w > want*105/100 {
-		t.Errorf("window %d, want about %d", w, want)
-	}
 	// the session's base RTT counts, not the connection's lifetime minimum
 	m.SetBaseRTT(200 * time.Millisecond)
-	if w, want := m.GetCongestionWindow(), congestion.ByteCount(200<<10); w < want*95/100 || w > want*105/100 {
-		t.Errorf("window %d, want about %d (the session's base RTT)", w, want)
+	if w, want := m.GetCongestionWindow(), congestion.ByteCount((1<<20)*2/5); w < want*99/100 || w > want*101/100 {
+		t.Errorf("window %d, want %d (the session's base RTT)", w, want)
 	}
 	// a short path: one round trip and 25 ms
 	m.SetBaseRTT(10 * time.Millisecond)
+	m.SetRate(4<<20, 4<<20)
+	if w, want := m.GetCongestionWindow(), congestion.ByteCount((4<<20)*35/1000); w < want*95/100 || w > want*105/100 {
+		t.Errorf("window %d, want about %d (a round trip and 25 ms)", w, want)
+	}
+	// a slow one: never less than the minimum
+	m.SetRate(64<<10, 64<<10)
 	if w, want := m.GetCongestionWindow(), congestion.ByteCount(32*congestion.InitialPacketSize); w != want {
 		t.Errorf("window %d, want the minimum %d", w, want)
 	}
-	if s := m.Snapshot(); s.Rate != 10<<20 {
+	if s := m.Snapshot(); s.Rate != 64<<10 {
 		t.Errorf("snapshot %+v", s)
 	}
 }

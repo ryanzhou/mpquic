@@ -69,9 +69,6 @@ func (s *Session) nextChunk(p *Path) (*chunk, int64, int, []uint64, error) {
 		p.closeIDs = nil
 		now := time.Now()
 		c, recheck, why := s.pickLocked(p, now)
-		if p.meter != nil {
-			p.meter.SetAppLimited(c == nil)
-		}
 		if c != nil {
 			if traceSched {
 				s.trace(p, c, why, now)
