@@ -56,7 +56,7 @@ func (s *Session) shareLimitLocked() {
 		fair := left / float64(len(open))
 		k := 0
 		for _, p := range open {
-			if use := limitDemandGain * float64(p.bw); p.ccMode != "startup" && use <= fair {
+			if use := max(limitDemandGain*float64(p.bw), limitMinShare); p.ccMode != "startup" && use <= fair {
 				p.setRateCapLocked(use)
 				left -= use
 				changed = true

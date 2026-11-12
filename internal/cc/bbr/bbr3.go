@@ -307,6 +307,9 @@ func (b *Sender) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTi
 	}
 
 	// GenerateRateSample
+	if b.rttStats != nil {
+		b.sampler.minRTT = b.rttStats.MinRTT() // C.min_rtt
+	}
 	ackedBefore := b.sampler.TotalBytesAcked()
 	sample := b.sampler.OnCongestionEvent(eventTime, ackedPackets, lostPackets, b.maxBw, infBandwidth, roundTripCount(b.roundCount))
 	rs := rateSample{rtt: sample.sampleRtt}
@@ -375,9 +378,9 @@ func (b *Sender) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTi
 		b.sampler.RemoveObsoletePackets(lostPackets[len(lostPackets)-1].PacketNumber + 1)
 	}
 	if b.debug {
-		b.debugPrint("%s bw=%s max=%s short=%s cwnd=%d inflight=%d long=%s short=%s minrtt=%v pacing=%.2f round=%d lost=%d",
-			b.st.detail(), formatSpeed(b.bw), formatSpeed(b.maxBw), formatSpeed(b.bwShort), b.cwnd, b.inflight,
-			fmtBytes(b.inflightLong), fmtBytes(b.inflightShort), b.minRTT, b.pacingGain, b.roundCount, rs.newlyLost)
+		b.debugPrint("%s bw=%s max=%s short=%s rate=%s cwnd=%d inflight=%d long=%s short=%s minrtt=%v rtt=%v pacing=%.2f round=%d acked=%d lost=%d",
+			b.st.detail(), formatSpeed(b.bw), formatSpeed(b.maxBw), formatSpeed(b.bwShort), formatSpeed(rs.deliveryRate), b.cwnd, b.inflight,
+			fmtBytes(b.inflightLong), fmtBytes(b.inflightShort), b.minRTT, rs.rtt, b.pacingGain, b.roundCount, rs.newlyAcked, rs.newlyLost)
 	}
 }
 
@@ -401,8 +404,8 @@ func (b *Sender) resetFullBW() {
 }
 
 func (b *Sender) checkFullBWReached() {
-	if b.fullBwNow || !b.roundStart || b.rs.isAppLimited {
-		return // no need to check for a full pipe now
+	if b.fullBwNow || !b.roundStart || b.rs.isAppLimited || b.rs.deliveryRate == 0 {
+		return // no need to check for a full pipe now (or no rate sample)
 	}
 	if float64(b.rs.deliveryRate) >= float64(b.fullBw)*startupGrowth {
 		b.resetFullBW() // bw is still growing

@@ -57,17 +57,18 @@ func TestRateLimitShares(t *testing.T) {
 	}
 	s.paths[0].bw, s.paths[1].bw, s.paths[2].bw = mbit(2), mbit(9.9), mbit(9.9)
 	each, sum = caps(s)
-	if !near(each[0], mbit(2.5)) || !near(each[1], mbit(13.75)) || !near(each[2], mbit(13.75)) {
-		t.Fatalf("bounds %v, want 2.5 + 13.75 + 13.75 Mbit/s", each)
+	if !near(each[0], mbit(2.5)) || !near(each[1], mbit(12.375)) || !near(each[2], mbit(12.375)) {
+		t.Fatalf("bounds %v, want 2.5 + 12.375 + 12.375 Mbit/s (1.25 times the estimates)", each)
 	}
 	if sum > limit+3 {
 		t.Fatalf("bounds add up to %d, limit %d", sum, limit)
 	}
 
-	// As the others' estimates follow, nothing changes; when the slow path
-	// turns out to carry more, it grows up to an equal share.
+	// As the others' estimates grow, so do their bounds, up to equal shares
+	// of what the slow path leaves; when the slow path turns out to carry
+	// more, it grows up to an equal share of everything.
 	s.paths[1].bw, s.paths[2].bw = mbit(13.6), mbit(13.6)
-	if each, _ = caps(s); !near(each[1], mbit(13.75)) {
+	if each, _ = caps(s); !near(each[1], mbit(13.75)) || !near(each[2], mbit(13.75)) {
 		t.Fatalf("bounds %v, want 2.5 + 13.75 + 13.75 Mbit/s", each)
 	}
 	s.paths[0].bw = mbit(20)
